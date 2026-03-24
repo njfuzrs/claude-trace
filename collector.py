@@ -12,6 +12,7 @@ collector.py — 统一 Hook 采集脚本，所有事件共用一个入口
 
 import json
 import os
+import re
 import sys
 import urllib.request
 from datetime import datetime
@@ -20,6 +21,9 @@ from pathlib import Path
 EVENTS_DIR = Path.home() / ".claude" / "trajectory_events"
 PROXY_PORT = os.environ.get("CLAUDE_PROXY_PORT", "4000")
 PROXY_BASE = f"http://127.0.0.1:{PROXY_PORT}"
+
+# P0 #5: session_id 只允许字母数字和连字符，防止路径遍历
+_SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
 def notify_proxy(endpoint: str, data: dict):
@@ -47,6 +51,10 @@ def main():
     event_name = input_data.get("hook_event_name", "unknown")
     session_id = input_data.get("session_id", "unknown")
     timestamp = datetime.now().isoformat()
+
+    # P0 #5: 校验 session_id 防止路径遍历
+    if not session_id or not _SAFE_ID_RE.match(session_id):
+        session_id = "unknown"
 
     # 构建基础事件记录
     event: dict = {
@@ -118,6 +126,13 @@ def main():
 
     elif event_name == "StopFailure":
         event["error"] = input_data.get("error")
+
+    else:
+        # P2 #19: 未知事件类型，保存完整 input_data 作为兜底
+        event["raw_input"] = {
+            k: v for k, v in input_data.items()
+            if k not in ("hook_event_name", "session_id", "cwd", "permission_mode")
+        }
 
     # 追加写入事件文件（按 session_id 分文件）
     EVENTS_DIR.mkdir(parents=True, exist_ok=True)

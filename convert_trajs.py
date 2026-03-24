@@ -16,6 +16,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Dict, List
+from xml.sax.saxutils import escape as xml_escape
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("convert")
@@ -35,9 +36,9 @@ def traj_to_messages_xml(traj: dict) -> List[Dict]:
             tool_input = step.get("tool_input", {})
 
             if tool_name and tool_name != "final_answer":
-                # 构建 XML 格式的工具调用
+                # P2 #12: 构建 XML 格式的工具调用，对参数值进行 XML 转义
                 params = "".join(
-                    f"<parameter={k}>{json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v}</parameter>"
+                    f"<parameter={k}>{xml_escape(json.dumps(v, ensure_ascii=False)) if isinstance(v, (dict, list)) else xml_escape(str(v))}</parameter>"
                     for k, v in tool_input.items()
                     if not k.startswith("_")  # 跳过内部标记字段（如 _parse_error）
                 )

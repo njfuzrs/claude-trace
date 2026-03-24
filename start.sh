@@ -81,12 +81,21 @@ else
     PROXY_PID=$!
     echo "代理 PID: $PROXY_PID"
 
-    # 等待代理就绪
-    sleep 1
-    if ! kill -0 "$PROXY_PID" 2>/dev/null; then
-        echo "❌ 代理启动失败"
-        exit 1
-    fi
+    # P2 #15: 等待代理端口就绪（轮询替代固定 sleep）
+    echo -n "等待代理就绪..."
+    for i in $(seq 1 20); do
+        if curl -s -o /dev/null "http://127.0.0.1:$PORT" 2>/dev/null; then
+            echo " 就绪"
+            break
+        fi
+        if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+            echo ""
+            echo "❌ 代理启动失败"
+            exit 1
+        fi
+        echo -n "."
+        sleep 0.5
+    done
 
     # 5. 启动 Claude Code
     echo ""

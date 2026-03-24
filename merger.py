@@ -165,7 +165,7 @@ class DataMerger:
         )
 
         # 5. 将 RawPair 适配为 builder 期望的格式
-        adapted_pairs = [_adapt_raw_pair(p) for p in raw_pairs]
+        adapted_pairs = [_adapt_raw_pair(p, i + 1) for i, p in enumerate(raw_pairs)]
 
         # 6. 构建轨迹
         traj = build_trajectory(session_id, adapted_pairs, metadata)
@@ -214,7 +214,10 @@ class DataMerger:
 
 @dataclass
 class _AdaptedPair:
-    """将 RawPair 适配为 builder.build_trajectory 期望的 pair 格式"""
+    """将 RawPair 适配为 builder.build_trajectory 期望的 pair 格式
+
+    P1 #9: 补充 index 和 new_messages 字段，与 proxy.py 的 RequestResponsePair 接口一致。
+    """
     timestamp: str
     request_body: Dict
     response_body: Dict
@@ -222,9 +225,15 @@ class _AdaptedPair:
     stop_reason: str
     is_partial: bool
     model: str
+    index: int = 0
+    new_messages: List[Dict] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.new_messages is None:
+            self.new_messages = []
 
 
-def _adapt_raw_pair(raw: RawPair) -> _AdaptedPair:
+def _adapt_raw_pair(raw: RawPair, index: int) -> _AdaptedPair:
     return _AdaptedPair(
         timestamp=raw.timestamp,
         request_body=raw.request_body,
@@ -233,6 +242,7 @@ def _adapt_raw_pair(raw: RawPair) -> _AdaptedPair:
         stop_reason=raw.stop_reason,
         is_partial=raw.is_partial,
         model=raw.model,
+        index=index,
     )
 
 

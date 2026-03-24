@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -40,11 +41,20 @@ def _log_task_exception(task: asyncio.Task):
         logger.error("后台任务异常: %s", task.exception(), exc_info=task.exception())
 
 
+def _log_future_exception(future: asyncio.Future):
+    """run_in_executor 返回的 Future 异常回调"""
+    if not future.cancelled() and future.exception():
+        logger.error("线程池任务异常: %s", future.exception(), exc_info=future.exception())
+
+
 # ─────────────────────────────────────────────
-# 安全：请求头脱敏
+# 安全：请求头脱敏 + 路径校验
 # ─────────────────────────────────────────────
 
 SENSITIVE_HEADERS = {"x-api-key", "authorization", "proxy-authorization"}
+
+# P0 #5: session_id 只允许字母数字和连字符，防止路径遍历
+_SAFE_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
 def sanitize_headers_for_storage(headers: Dict[str, str]) -> Dict[str, str]:
@@ -60,6 +70,18 @@ def sanitize_headers_for_storage(headers: Dict[str, str]) -> Dict[str, str]:
         else:
             sanitized[k] = v
     return sanitized
+
+
+def _sanitize_session_id(session_id: str) -> str:
+    """P0 #5: 校验 session_id 防止路径遍历攻击
+
+    如果 session_id 包含非法字符（如 ../），替换为安全的 UUID。
+    """
+    if session_id and _SAFE_SESSION_ID_RE.match(session_id):
+        return session_id
+    safe_id = str(uuid.uuid4())
+    logger.warning("session_id 包含非法字符，已替换: %r → %s", session_id[:20], safe_id[:8])
+    return safe_id
 
 
 # ─────────────────────────────────────────────
@@ -109,10 +131,11 @@ class Session:
     def is_continuation(self, messages: List[Dict]) -> bool:
         """对话内容连续性匹配（Hooks 未配置时的兜底）
         P2 #11: 使用独立的 _msg_hash 函数，不再耦合 DataCollector
+        P1 #7: 增加前缀校验数量到 5 条，降低 compaction 误判概率
         """
         if not self.prev_msg_hashes or not messages:
             return False
-        check = min(3, self.prev_msg_count, len(messages))
+        check = min(5, self.prev_msg_count, len(messages))
         return all(
             _msg_hash(messages[i]) == self.prev_msg_hashes[i]
             for i in range(check)
@@ -132,9 +155,24 @@ class SessionManager:
 
     def register_session_from_hook(self, session_id: str, metadata: dict):
         """由 /_internal/session-register 路由调用，Hooks 主动通知"""
+        session_id = _sanitize_session_id(session_id)
         if session_id not in self.active_sessions:
+            metadata["_registered_at"] = datetime.now().isoformat()
             self._pending_sessions[session_id] = metadata
             logger.info("Hook 注册会话: %s (model=%s)", session_id[:8], metadata.get("model", ""))
+
+    def _create_session_from_pending(self, session_id: str, metadata: dict, match_type: str) -> Session:
+        """从 pending 队列创建 Session 的公共方法"""
+        self._pending_sessions.pop(session_id, None)
+        session = Session(
+            id=session_id,
+            model=metadata.get("model", ""),
+            source=metadata.get("source", ""),
+            cwd=metadata.get("cwd", ""),
+        )
+        self.active_sessions[session_id] = session
+        logger.info("会话关联（%s）: %s", match_type, session_id[:8])
+        return session
 
     def match_session(self, request_body: Dict) -> Session:
         """双通道会话匹配"""
@@ -142,32 +180,27 @@ class SessionManager:
         # 策略 1：Hooks 注册的 pending 队列（确定性关联）
         if len(self._pending_sessions) == 1:
             session_id, metadata = next(iter(self._pending_sessions.items()))
-            self._pending_sessions.pop(session_id)
-            session = Session(
-                id=session_id,
-                model=metadata.get("model", ""),
-                source=metadata.get("source", ""),
-                cwd=metadata.get("cwd", ""),
-            )
-            self.active_sessions[session_id] = session
-            logger.info("会话关联（Hook 单实例）: %s", session_id[:8])
-            return session
+            return self._create_session_from_pending(session_id, metadata, "Hook 单实例")
 
-        # 多个 pending 时，用 model 字段辅助匹配
+        # P1 #6: 多个 pending 时，用 model + cwd 联合匹配，避免同 model 误关联
         if self._pending_sessions:
             request_model = request_body.get("model", "")
-            for sid, metadata in list(self._pending_sessions.items()):
-                if metadata.get("model") == request_model:
-                    self._pending_sessions.pop(sid)
-                    session = Session(
-                        id=sid,
-                        model=metadata.get("model", ""),
-                        source=metadata.get("source", ""),
-                        cwd=metadata.get("cwd", ""),
-                    )
-                    self.active_sessions[sid] = session
-                    logger.info("会话关联（Hook 多实例 model 匹配）: %s", sid[:8])
-                    return session
+            # 先尝试 model 精确匹配
+            model_matches = [
+                (sid, meta) for sid, meta in self._pending_sessions.items()
+                if meta.get("model") == request_model
+            ]
+            if len(model_matches) == 1:
+                sid, metadata = model_matches[0]
+                return self._create_session_from_pending(sid, metadata, "Hook model 匹配")
+            elif len(model_matches) > 1:
+                # 多个同 model 的 pending，warn 并取第一个（FIFO）
+                logger.warning(
+                    "多个 pending session 使用相同 model=%s，按 FIFO 关联（可能不准确）",
+                    request_model,
+                )
+                sid, metadata = model_matches[0]
+                return self._create_session_from_pending(sid, metadata, "Hook FIFO 兜底")
 
         # 策略 2：对话内容连续性匹配（Hooks 未配置时的兜底）
         messages = request_body.get("messages", [])
@@ -184,8 +217,10 @@ class SessionManager:
         return session
 
     def cleanup_expired(self, collector: Optional["DataCollector"] = None):
-        """清理超时会话，导出轨迹后再删除"""
+        """清理超时会话和过期 pending，导出轨迹后再删除"""
         now = datetime.now()
+
+        # 清理超时的活跃会话
         expired = []
         for sid, session in self.active_sessions.items():
             last = datetime.fromisoformat(session.last_activity)
@@ -198,6 +233,15 @@ class SessionManager:
                 collector.export_session(session)
             logger.info("会话超时清理: %s (pairs=%d)", sid[:8], len(session.pairs))
             del self.active_sessions[sid]
+
+        # P1 #10: 清理过期的 pending sessions（Hook 注册了但始终没有 API 请求到达）
+        stale_pending = [
+            sid for sid, meta in self._pending_sessions.items()
+            if (now - datetime.fromisoformat(meta.get("_registered_at", now.isoformat()))).total_seconds() > self._timeout
+        ]
+        for sid in stale_pending:
+            logger.info("Pending 会话超时清理: %s", sid[:8])
+            del self._pending_sessions[sid]
 
 
 # ─────────────────────────────────────────────
@@ -313,10 +357,11 @@ def reassemble_sse_response(raw_data: bytes) -> Dict:
 # ─────────────────────────────────────────────
 
 class DataCollector:
-    def __init__(self, output_dir: Path):
+    def __init__(self, output_dir: Path, save_raw: bool = True):
         self.output_dir = output_dir
         self.raw_dir = output_dir / "raw"
         self.traj_dir = output_dir / "traj"
+        self.save_raw = save_raw  # P2 #18: 控制是否保存原始 JSON 文件
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.traj_dir.mkdir(parents=True, exist_ok=True)
 
@@ -354,51 +399,26 @@ class DataCollector:
         return pair
 
     async def record_response_async(self, session: Session, pair: RequestResponsePair, response: Dict):
-        """异步记录重组后的响应，写入 raw/ 目录"""
+        """异步记录重组后的响应，写入 raw/ 目录
+
+        P0 #3: 所有文件 IO 移到线程池，避免 JSON 序列化 + 写入阻塞事件循环。
+        """
         pair.response_body = response
         pair.usage = response.get("usage", {})
         pair.stop_reason = response.get("stop_reason", "")
         pair.is_partial = not response.get("_complete", False)
 
-        session_dir = self.raw_dir / session.id
-        session_dir.mkdir(parents=True, exist_ok=True)
-
-        # P0 #1: 使用 record_request 时分配的稳定序号
         idx = pair.index
-        req_file = session_dir / f"{idx:03d}_request.json"
-        resp_file = session_dir / f"{idx:03d}_response.json"
-
-        req_data = {
-            "timestamp": pair.timestamp,
-            "model": pair.model,
-            "headers": pair.request_headers,  # 已脱敏
-            "body": pair.request_body,
-            "new_messages": pair.new_messages,
-        }
-        resp_data = {
-            "timestamp": datetime.now().isoformat(),
-            "usage": pair.usage,
-            "stop_reason": pair.stop_reason,
-            "is_partial": pair.is_partial,
-            "body": pair.response_body,
-        }
-
-        req_file.write_text(json.dumps(req_data, ensure_ascii=False, indent=2))
-        resp_file.write_text(json.dumps(resp_data, ensure_ascii=False, indent=2))
-
-        # P1 #6: 追加写入 raw JSONL（双格式并行输出）
-        jsonl_path = self.raw_dir / f"{session.id}.jsonl"
-        self._append_raw_jsonl(jsonl_path, pair)
-
-        # P1 #6: 增量重建 .traj 文件（每次响应后保持最新状态）
-        self._rebuild_traj(session)
-
         status = "⚠️ partial" if pair.is_partial else "✅"
         logger.info(
             "%s 记录 #%d | model=%s | stop=%s | tokens=%s",
             status, idx, pair.model, pair.stop_reason,
             pair.usage.get("output_tokens", "?"),
         )
+
+        # 将所有同步文件 IO 移到线程池
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._write_pair_files, session, pair)
 
     async def record_partial_response(self, session: Session, pair: RequestResponsePair, raw_chunks: bytes):
         """SSE 流中断时保存部分数据"""
@@ -416,8 +436,8 @@ class DataCollector:
     def _rebuild_traj(self, session: Session):
         """重建并覆盖 .traj 文件
 
-        注意：内部使用 asyncio.to_thread 将同步文件 IO 移出事件循环，
-        避免大轨迹的 JSON 序列化 + 写入阻塞代理转发。
+        P0 #1: 兼容事件循环内外两种调用场景。
+        P0 #2: run_in_executor 返回的 Future 添加异常回调。
         """
         try:
             from builder import SessionMetadata, build_trajectory, save_trajectory
@@ -430,9 +450,67 @@ class DataCollector:
             )
             traj = build_trajectory(session.id, session.pairs, metadata)
             traj_path = self.traj_dir / f"{session.id}.traj"
-            # 同步写入移到线程池，避免阻塞事件循环
-            loop = asyncio.get_running_loop()
-            loop.run_in_executor(None, save_trajectory, traj_path, traj)
+            try:
+                loop = asyncio.get_running_loop()
+                future = loop.run_in_executor(None, save_trajectory, traj_path, traj)
+                future.add_done_callback(_log_future_exception)
+            except RuntimeError:
+                # 非事件循环上下文（如优雅退出的 finally 块），直接同步写入
+                save_trajectory(traj_path, traj)
+        except Exception as e:
+            logger.warning("重建 .traj 失败: %s", e)
+
+    def _write_pair_files(self, session: Session, pair: RequestResponsePair):
+        """同步写入请求/响应文件 + JSONL + .traj（在线程池中执行）
+
+        P0 #3: 所有文件 IO 集中在此方法，由 run_in_executor 调用，不阻塞事件循环。
+        P2 #18: save_raw 控制是否写入单独的 JSON 文件。
+        """
+        session_dir = self.raw_dir / session.id
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        idx = pair.index
+
+        # P2 #18: 仅在 save_raw=True 时写入单独的 JSON 文件
+        if self.save_raw:
+            req_file = session_dir / f"{idx:03d}_request.json"
+            resp_file = session_dir / f"{idx:03d}_response.json"
+
+            req_data = {
+                "timestamp": pair.timestamp,
+                "model": pair.model,
+                "headers": pair.request_headers,  # 已脱敏
+                "body": pair.request_body,
+                "new_messages": pair.new_messages,
+            }
+            resp_data = {
+                "timestamp": datetime.now().isoformat(),
+                "usage": pair.usage,
+                "stop_reason": pair.stop_reason,
+                "is_partial": pair.is_partial,
+                "body": pair.response_body,
+            }
+
+            req_file.write_text(json.dumps(req_data, ensure_ascii=False, indent=2))
+            resp_file.write_text(json.dumps(resp_data, ensure_ascii=False, indent=2))
+
+        # 追加写入 raw JSONL（双格式并行输出）
+        jsonl_path = self.raw_dir / f"{session.id}.jsonl"
+        self._append_raw_jsonl(jsonl_path, pair)
+
+        # 增量重建 .traj 文件（直接同步写入，因为已在线程池中）
+        try:
+            from builder import SessionMetadata, build_trajectory, save_trajectory
+            metadata = SessionMetadata(
+                session_id=session.id,
+                start_time=session.start_time,
+                model=session.model,
+                working_directory=session.cwd,
+                start_source=session.source,
+            )
+            traj = build_trajectory(session.id, session.pairs, metadata)
+            traj_path = self.traj_dir / f"{session.id}.traj"
+            save_trajectory(traj_path, traj)
         except Exception as e:
             logger.warning("重建 .traj 失败: %s", e)
 
@@ -467,8 +545,8 @@ class DataCollector:
         if len(curr_messages) <= prev_count:
             return curr_messages
 
-        # 前缀指纹校验（防止 compaction 后长度恰好更长的误判）
-        check_count = min(3, prev_count)
+        # P1 #7: 前缀指纹校验，检查前 5 条降低 compaction 误判概率
+        check_count = min(5, prev_count)
         prefix_match = all(
             _msg_hash(curr_messages[i]) == prev_hashes[i]
             for i in range(check_count)
@@ -493,6 +571,7 @@ HOP_BY_HOP_REQUEST = {
 HOP_BY_HOP_RESPONSE = {
     "connection", "keep-alive", "transfer-encoding",
     "upgrade", "content-encoding",  # aiohttp 自动解压，不透传
+    "content-length",  # P2 #16: aiohttp 自动解压后 content-length 与实际 body 不匹配
 }
 
 
@@ -511,7 +590,11 @@ async def handle_streaming(
     pair: RequestResponsePair,
     collector: DataCollector,
 ) -> web.StreamResponse:
-    """SSE Tee 模式：逐 chunk 立即转发 + 后台收集"""
+    """SSE Tee 模式：逐 chunk 立即转发 + 后台收集
+
+    P0 #4: write_eof 只在正常路径调用一次，异常路径在 except 中处理，
+    避免 finally 中重复调用导致的不确定行为。
+    """
 
     response = web.StreamResponse(
         status=upstream_resp.status,
@@ -525,23 +608,28 @@ async def handle_streaming(
     await response.prepare(request)
 
     raw_chunks: List[bytes] = []
+    stream_interrupted = False
     try:
         async for chunk in upstream_resp.content.iter_any():
             raw_chunks.append(chunk)
             await response.write(chunk)  # 立即转发，零延迟
     except (aiohttp.ClientPayloadError, ConnectionResetError) as e:
+        stream_interrupted = True
         logger.warning("SSE 流中断: %s，保存部分数据", e)
         if raw_chunks:
             t = asyncio.create_task(
                 collector.record_partial_response(session, pair, b"".join(raw_chunks))
             )
             t.add_done_callback(_log_task_exception)
+
+    # write_eof 只调用一次（无论正常结束还是中断）
+    try:
+        await response.write_eof()
+    except Exception:
+        pass
+
+    if stream_interrupted:
         return response
-    finally:
-        try:
-            await response.write_eof()
-        except Exception:
-            pass
 
     # 流正常结束：重组 SSE 事件 → 异步记录
     full_data = b"".join(raw_chunks)
@@ -724,13 +812,14 @@ async def create_app(
     upstream_base: str,
     output_dir: Path,
     session_timeout: int,
+    save_raw: bool = True,
 ) -> web.Application:
     app = web.Application()
 
     # 共享状态
     app["upstream_base"] = upstream_base.rstrip("/")
     app["session_manager"] = SessionManager(session_timeout=session_timeout)
-    app["collector"] = DataCollector(output_dir)
+    app["collector"] = DataCollector(output_dir, save_raw=save_raw)
 
     # 应用启动时创建全局 ClientSession（连接池复用）
     async def on_startup(app):
@@ -775,6 +864,8 @@ def parse_args():
         help="上游 API 地址",
     )
     parser.add_argument("--session-timeout", type=int, default=300, help="会话超时时间（秒）")
+    parser.add_argument("--save-raw", action="store_true", default=True, help="保存原始请求/响应 JSON 文件")
+    parser.add_argument("--no-save-raw", dest="save_raw", action="store_false", help="不保存原始请求/响应 JSON 文件（只保留 JSONL + .traj）")
     parser.add_argument("--verbose", action="store_true", help="详细日志输出")
     return parser.parse_args()
 
@@ -792,6 +883,7 @@ async def main():
         upstream_base=args.upstream,
         output_dir=output_dir,
         session_timeout=args.session_timeout,
+        save_raw=args.save_raw,
     )
 
     runner = web.AppRunner(app)
@@ -829,7 +921,7 @@ async def main():
     finally:
         cleanup_task.cancel()
         # 优雅退出：导出所有活跃会话的轨迹
-        for sid, session in list(session_manager.active_sessions.items()):
+        for _sid, session in list(session_manager.active_sessions.items()):
             if session.pairs:
                 collector.export_session(session)
         await runner.cleanup()

@@ -13,10 +13,13 @@ Anthropic API → TAO 映射：
 """
 
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
+
+logger = logging.getLogger("builder")
 
 
 # ─────────────────────────────────────────────
@@ -57,6 +60,7 @@ def find_tool_result(pairs: List, tool_use_id: str, max_lookahead: int = 3) -> O
     Claude Code 每次请求都带完整对话历史，tool_result 出现在
     tool_use 之后的某个请求的 messages 里。
     P1 #8: 限制搜索范围为后续 max_lookahead 个 pairs，避免 O(n*m) 性能问题。
+    找不到时记录 warning，便于排查 sub-agent 插入导致的遗漏。
     """
     for pair in pairs[:max_lookahead]:
         messages = pair.request_body.get("messages", [])
@@ -72,6 +76,7 @@ def find_tool_result(pairs: List, tool_use_id: str, max_lookahead: int = 3) -> O
                         and block.get("tool_use_id") == tool_use_id
                     ):
                         return block
+    logger.debug("tool_result 未找到: tool_use_id=%s (lookahead=%d)", tool_use_id[:12], max_lookahead)
     return None
 
 
@@ -107,6 +112,43 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
 
         total_input_tokens += usage.get("input_tokens", 0)
         total_output_tokens += usage.get("output_tokens", 0)
+
+        # ── P2 #17: history 记录 system + user messages（首次请求） ──
+        if pair_idx == 0:
+            request_messages = pair.request_body.get("messages", [])
+            # 记录 system prompt（如果存在于 request_body 顶层）
+            system_content = pair.request_body.get("system")
+            if system_content:
+                if isinstance(system_content, list):
+                    # Anthropic 格式：system 是 content block 列表
+                    sys_text = "\n".join(
+                        b.get("text", "") for b in system_content if isinstance(b, dict)
+                    )
+                else:
+                    sys_text = str(system_content)
+                history.append({
+                    "role": "system",
+                    "content": sys_text,
+                    "agent": "primary",
+                })
+            # 记录首次请求中的 user messages
+            for msg in request_messages:
+                if msg.get("role") in ("user", "system"):
+                    history.append({
+                        "role": msg["role"],
+                        "content": msg.get("content", ""),
+                        "agent": "primary",
+                    })
+        else:
+            # 非首次请求：只记录增量 user messages（new_messages）
+            new_msgs = getattr(pair, "new_messages", None) or []
+            for msg in new_msgs:
+                if msg.get("role") == "user":
+                    history.append({
+                        "role": "user",
+                        "content": msg.get("content", ""),
+                        "agent": "primary",
+                    })
 
         # ── 提取 Thought ──────────────────────────────────
         thought_parts = []
