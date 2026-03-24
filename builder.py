@@ -138,10 +138,8 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
         })
 
         # ── Action 步骤（tool_use blocks） ────────────────
-        for block in content_blocks:
-            if block.get("type") != "tool_use":
-                continue
-
+        tool_use_blocks = [b for b in content_blocks if b.get("type") == "tool_use"]
+        for tool_idx, block in enumerate(tool_use_blocks):
             tool_name = block.get("name", "")
             tool_input = block.get("input", {})
             tool_use_id = block.get("id", "")
@@ -155,11 +153,15 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
 
             action_str = f"{tool_name}({json.dumps(tool_input, ensure_ascii=False)})"
 
+            # 只在第一个 tool_use 中关联 thought，避免多工具调用时重复
+            step_thought = thought if tool_idx == 0 else ""
+            content_str = (step_thought + f"\n\nTool: {tool_name}\nInput: {json.dumps(tool_input, ensure_ascii=False)}").strip()
+
             trajectory.append({
                 "message_type": "action",
                 "role": "assistant",
-                "content": (thought + f"\n\nTool: {tool_name}\nInput: {json.dumps(tool_input, ensure_ascii=False)}").strip(),
-                "thought": thought,
+                "content": content_str,
+                "thought": step_thought,
                 "action": action_str,
                 "agent": "primary",
                 "timestamp": pair.timestamp,
@@ -268,19 +270,3 @@ def save_trajectory(traj_path: Path, traj: Dict):
     """覆盖写入 .traj 文件（每次记录后调用，保持最新状态）"""
     traj_path.parent.mkdir(parents=True, exist_ok=True)
     traj_path.write_text(json.dumps(traj, ensure_ascii=False, indent=2))
-
-
-def append_raw_jsonl(raw_path: Path, pair) -> None:
-    """追加写入原始 JSONL（一行一个请求/响应对）"""
-    raw_path.parent.mkdir(parents=True, exist_ok=True)
-    record = {
-        "timestamp": pair.timestamp,
-        "model": pair.model,
-        "request": pair.request_body,
-        "response": pair.response_body,
-        "usage": pair.usage,
-        "stop_reason": pair.stop_reason,
-        "is_partial": pair.is_partial,
-    }
-    with open(raw_path, "a") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")

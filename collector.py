@@ -84,6 +84,11 @@ def main():
     elif event_name == "Stop":
         event["last_assistant_message"] = input_data.get("last_assistant_message")
         event["transcript_path"] = input_data.get("transcript_path")
+        # 通知代理 turn 结束，便于实时感知 turn 边界
+        notify_proxy("session-event", {
+            "session_id": session_id,
+            "event": "stop",
+        })
 
     # ── P1 事件 ──────────────────────────────────────────────
     elif event_name in ("PostToolUse", "PreToolUse"):

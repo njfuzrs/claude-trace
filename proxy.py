@@ -332,7 +332,10 @@ class DataCollector:
             session.prev_msg_hashes, session.prev_msg_count, curr_messages,
         )
 
-        # P0 #1: 在 append 之前分配序号，避免并发冲突
+        # P0 #1: 在 append 之前分配序号。
+        # 安全假设：record_request 是同步方法，aiohttp 单线程事件循环中
+        # 两个 await 点之间不会被打断，因此无需加锁。
+        # 如果未来改为 async，需要引入 asyncio.Lock 保护。
         idx = len(session.pairs) + 1
 
         pair = RequestResponsePair(
@@ -411,7 +414,11 @@ class DataCollector:
         logger.info("轨迹已导出: %s | 步骤=%d", session.id[:8], len(session.pairs))
 
     def _rebuild_traj(self, session: Session):
-        """重建并覆盖 .traj 文件"""
+        """重建并覆盖 .traj 文件
+
+        注意：内部使用 asyncio.to_thread 将同步文件 IO 移出事件循环，
+        避免大轨迹的 JSON 序列化 + 写入阻塞代理转发。
+        """
         try:
             from builder import SessionMetadata, build_trajectory, save_trajectory
             metadata = SessionMetadata(
@@ -423,7 +430,9 @@ class DataCollector:
             )
             traj = build_trajectory(session.id, session.pairs, metadata)
             traj_path = self.traj_dir / f"{session.id}.traj"
-            save_trajectory(traj_path, traj)
+            # 同步写入移到线程池，避免阻塞事件循环
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(None, save_trajectory, traj_path, traj)
         except Exception as e:
             logger.warning("重建 .traj 失败: %s", e)
 
@@ -766,12 +775,6 @@ def parse_args():
         help="上游 API 地址",
     )
     parser.add_argument("--session-timeout", type=int, default=300, help="会话超时时间（秒）")
-    parser.add_argument(
-        "--events-dir",
-        default=str(Path.home() / ".claude" / "trajectory_events"),
-        help="Hooks 事件数据目录",
-    )
-    parser.add_argument("--save-raw", default=True, action=argparse.BooleanOptionalAction, help="保存原始请求/响应")
     parser.add_argument("--verbose", action="store_true", help="详细日志输出")
     return parser.parse_args()
 

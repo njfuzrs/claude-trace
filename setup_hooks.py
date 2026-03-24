@@ -113,18 +113,33 @@ def main():
         if "hooks" not in settings:
             print("ℹ️  未找到 hooks 配置，无需移除")
             return
-        # 只移除本工具配置的事件
+        # 只移除本工具配置的 hook 条目（包含 collector.py 命令的），保留用户自定义的
         for event in HOOK_EVENTS:
-            settings["hooks"].pop(event, None)
+            if event not in settings["hooks"]:
+                continue
+            hook_groups = settings["hooks"][event]
+            filtered = []
+            for group in hook_groups:
+                kept_hooks = [
+                    h for h in group.get("hooks", [])
+                    if "collector.py" not in h.get("command", "")
+                ]
+                if kept_hooks:
+                    group["hooks"] = kept_hooks
+                    filtered.append(group)
+            if filtered:
+                settings["hooks"][event] = filtered
+            else:
+                del settings["hooks"][event]
         if not settings["hooks"]:
             del settings["hooks"]
         save_settings(settings_path, settings)
         print(f"✅ hooks 已从 {settings_path} 移除")
         return
 
-    # 部署 collector.py（如果源文件存在）
+    # 部署 collector.py（源文件存在时总是覆盖，确保更新后的版本被部署）
     src_collector = Path(__file__).parent / "collector.py"
-    if src_collector.exists() and not collector_path.exists():
+    if src_collector.exists():
         deploy_collector(src_collector)
     elif not collector_path.exists():
         print(f"⚠️  collector.py 不存在于 {collector_path}，请手动部署")

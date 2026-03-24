@@ -13,6 +13,18 @@ PORT="${PORT:-4000}"
 OUTPUT="${OUTPUT:-./trajectories}"
 UPSTREAM="${UPSTREAM:-https://api.anthropic.com}"
 PROXY_ONLY=false
+PROXY_PID=""
+
+# 信号处理：确保代理进程被清理
+cleanup() {
+    if [ -n "$PROXY_PID" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
+        echo ""
+        echo "停止代理进程 (PID: $PROXY_PID)..."
+        kill "$PROXY_PID" 2>/dev/null
+        wait "$PROXY_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
 
 # 解析参数（-- 之后的参数传递给 claude）
 CLAUDE_ARGS=()
@@ -47,7 +59,9 @@ cp "$SCRIPT_DIR/collector.py" "$HOOKS_DIR/collector.py"
 echo "✅ collector.py 已部署到 $HOOKS_DIR/"
 
 # 3. 配置 Hooks（写入 settings.json）
-python3 "$SCRIPT_DIR/setup_hooks.py" --collector "$HOOKS_DIR/collector.py" 2>/dev/null || true
+python3 "$SCRIPT_DIR/setup_hooks.py" --collector "$HOOKS_DIR/collector.py" || {
+    echo "⚠️  Hooks 配置失败，将以仅代理模式运行"
+}
 echo "✅ Hooks 已配置"
 
 # 4. 启动代理（后台）
@@ -78,12 +92,9 @@ else
     echo ""
     echo "启动 Claude Code..."
     echo "=================================================="
-    ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" claude "${CLAUDE_ARGS[@]}"
+    ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" claude ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}
 
-    # Claude Code 退出后停止代理
+    # Claude Code 退出后，trap EXIT 会自动清理代理进程
     echo ""
-    echo "Claude Code 已退出，停止代理..."
-    kill "$PROXY_PID" 2>/dev/null
-    wait "$PROXY_PID" 2>/dev/null || true
     echo "✅ 轨迹数据保存在: $OUTPUT"
 fi

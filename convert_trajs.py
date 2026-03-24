@@ -113,11 +113,20 @@ CONVERTERS = {
     "messages": traj_to_messages_plain,
 }
 
+DEFAULT_SYSTEM_MESSAGE = (
+    "You are an interactive agent that helps users with software engineering tasks. "
+    "Use the tools available to you to assist the user."
+)
 
-def convert_traj(traj: dict, style: str) -> Dict:
+
+def convert_traj(traj: dict, style: str, system_message: str = DEFAULT_SYSTEM_MESSAGE) -> Dict:
     """将单个 .traj 转换为 SFT 训练格式"""
     converter = CONVERTERS[style]
     messages = converter(traj)
+
+    # SFT 格式要求 system message 作为第一条（参考 SWE-smith collect_trajs.py）
+    if system_message:
+        messages.insert(0, {"role": "system", "content": system_message})
 
     meta = traj.get("metadata", {})
     return {
