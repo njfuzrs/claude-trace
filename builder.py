@@ -64,6 +64,8 @@ _MODEL_PRICING: Dict[str, Dict[str, float]] = {
 
 def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     """根据模型和 token 用量估算成本（USD）"""
+    if not model:
+        return 0.0
     # 模糊匹配模型名（claude-sonnet-4-20250514 → claude-sonnet-4）
     pricing = None
     for prefix, p in _MODEL_PRICING.items():
