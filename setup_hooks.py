@@ -29,6 +29,7 @@ HOOK_EVENTS = [
     # P2：可选事件
     "PreToolUse",
     "PermissionRequest",
+    "InstructionsLoaded",
     "StopFailure",
 ]
 

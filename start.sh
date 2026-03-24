@@ -14,14 +14,16 @@ OUTPUT="${OUTPUT:-./trajectories}"
 UPSTREAM="${UPSTREAM:-https://api.anthropic.com}"
 PROXY_ONLY=false
 
-# 解析参数
+# 解析参数（-- 之后的参数传递给 claude）
+CLAUDE_ARGS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --port) PORT="$2"; shift 2 ;;
         --output) OUTPUT="$2"; shift 2 ;;
         --upstream) UPSTREAM="$2"; shift 2 ;;
         --proxy-only) PROXY_ONLY=true; shift ;;
-        *) echo "未知参数: $1"; exit 1 ;;
+        --) shift; CLAUDE_ARGS=("$@"); break ;;
+        *) echo "未知参数: $1 (用 -- 分隔传给 claude 的参数)"; exit 1 ;;
     esac
 done
 
@@ -31,8 +33,11 @@ echo "=================================================="
 
 # 1. 检查 Python 依赖
 if ! python3 -c "import aiohttp" 2>/dev/null; then
-    echo "安装依赖: aiohttp..."
-    pip3 install aiohttp --break-system-packages -q 2>/dev/null || pip3 install aiohttp -q
+    echo "缺少依赖 aiohttp，请先安装："
+    echo "  pip3 install aiohttp"
+    echo "  # 或使用 venv："
+    echo "  python3 -m venv .venv && source .venv/bin/activate && pip install aiohttp"
+    exit 1
 fi
 
 # 2. 部署 Hooks 采集脚本
@@ -73,7 +78,7 @@ else
     echo ""
     echo "启动 Claude Code..."
     echo "=================================================="
-    ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" claude "$@"
+    ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" claude "${CLAUDE_ARGS[@]}"
 
     # Claude Code 退出后停止代理
     echo ""

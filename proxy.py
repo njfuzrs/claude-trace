@@ -63,6 +63,16 @@ def sanitize_headers_for_storage(headers: Dict[str, str]) -> Dict[str, str]:
 
 
 # ─────────────────────────────────────────────
+# 工具函数
+# ─────────────────────────────────────────────
+
+def _msg_hash(msg: Dict) -> str:
+    """计算单条 message 的内容指纹（用于前缀一致性校验）"""
+    key = f"{msg.get('role', '')}:{str(msg.get('content', ''))[:200]}"
+    return hashlib.md5(key.encode()).hexdigest()
+
+
+# ─────────────────────────────────────────────
 # 数据结构
 # ─────────────────────────────────────────────
 
@@ -71,6 +81,7 @@ class RequestResponsePair:
     timestamp: str
     request_body: Dict
     request_headers: Dict       # 脱敏后的请求头
+    index: int = 0              # P0 #1: 在 record_request 时分配，避免并发冲突
     response_body: Optional[Dict] = None
     new_messages: List[Dict] = field(default_factory=list)
     model: str = ""
@@ -88,18 +99,22 @@ class Session:
     start_time: str = field(default_factory=lambda: datetime.now().isoformat())
     last_activity: str = field(default_factory=lambda: datetime.now().isoformat())
     pairs: List[RequestResponsePair] = field(default_factory=list)
-    prev_messages: List[Dict] = field(default_factory=list)  # 上一次请求的 messages，用于增量提取
+    # P0 #2: 只保留 hash 列表和 count，不保留完整 messages 引用，避免内存泄漏
+    prev_msg_hashes: List[str] = field(default_factory=list)
+    prev_msg_count: int = 0
 
     def update_activity(self):
         self.last_activity = datetime.now().isoformat()
 
     def is_continuation(self, messages: List[Dict]) -> bool:
-        """对话内容连续性匹配（Hooks 未配置时的兜底）"""
-        if not self.prev_messages or not messages:
+        """对话内容连续性匹配（Hooks 未配置时的兜底）
+        P2 #11: 使用独立的 _msg_hash 函数，不再耦合 DataCollector
+        """
+        if not self.prev_msg_hashes or not messages:
             return False
-        check = min(3, len(self.prev_messages), len(messages))
+        check = min(3, self.prev_msg_count, len(messages))
         return all(
-            DataCollector._msg_hash(messages[i]) == DataCollector._msg_hash(self.prev_messages[i])
+            _msg_hash(messages[i]) == self.prev_msg_hashes[i]
             for i in range(check)
         )
 
@@ -168,8 +183,8 @@ class SessionManager:
         logger.info("新建会话（兜底）: %s", sid[:8])
         return session
 
-    def cleanup_expired(self):
-        """清理超时会话"""
+    def cleanup_expired(self, collector: Optional["DataCollector"] = None):
+        """清理超时会话，导出轨迹后再删除"""
         now = datetime.now()
         expired = []
         for sid, session in self.active_sessions.items():
@@ -177,7 +192,11 @@ class SessionManager:
             if (now - last).total_seconds() > self._timeout:
                 expired.append(sid)
         for sid in expired:
-            logger.info("会话超时清理: %s", sid[:8])
+            session = self.active_sessions[sid]
+            # P1 #5: 超时清理前先导出 .traj，防止数据丢失
+            if collector and session.pairs:
+                collector.export_session(session)
+            logger.info("会话超时清理: %s (pairs=%d)", sid[:8], len(session.pairs))
             del self.active_sessions[sid]
 
 
@@ -297,7 +316,9 @@ class DataCollector:
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
         self.raw_dir = output_dir / "raw"
+        self.traj_dir = output_dir / "traj"
         self.raw_dir.mkdir(parents=True, exist_ok=True)
+        self.traj_dir.mkdir(parents=True, exist_ok=True)
 
     def record_request(
         self,
@@ -307,17 +328,26 @@ class DataCollector:
     ) -> RequestResponsePair:
         """记录请求，提取增量 messages"""
         curr_messages = request_body.get("messages", [])
-        new_messages = self.extract_incremental_messages(session.prev_messages, curr_messages)
+        new_messages = self._extract_incremental_messages(
+            session.prev_msg_hashes, session.prev_msg_count, curr_messages,
+        )
+
+        # P0 #1: 在 append 之前分配序号，避免并发冲突
+        idx = len(session.pairs) + 1
 
         pair = RequestResponsePair(
             timestamp=datetime.now().isoformat(),
             request_body=request_body,
             request_headers=sanitize_headers_for_storage(raw_headers),
+            index=idx,
             new_messages=new_messages,
             model=request_body.get("model", ""),
         )
         session.pairs.append(pair)
-        session.prev_messages = curr_messages
+
+        # P0 #2: 只保留 hash 列表和 count，释放完整 messages 引用
+        session.prev_msg_hashes = [_msg_hash(m) for m in curr_messages]
+        session.prev_msg_count = len(curr_messages)
         return pair
 
     async def record_response_async(self, session: Session, pair: RequestResponsePair, response: Dict):
@@ -330,7 +360,8 @@ class DataCollector:
         session_dir = self.raw_dir / session.id
         session_dir.mkdir(parents=True, exist_ok=True)
 
-        idx = len(session.pairs)
+        # P0 #1: 使用 record_request 时分配的稳定序号
+        idx = pair.index
         req_file = session_dir / f"{idx:03d}_request.json"
         resp_file = session_dir / f"{idx:03d}_response.json"
 
@@ -352,6 +383,13 @@ class DataCollector:
         req_file.write_text(json.dumps(req_data, ensure_ascii=False, indent=2))
         resp_file.write_text(json.dumps(resp_data, ensure_ascii=False, indent=2))
 
+        # P1 #6: 追加写入 raw JSONL（双格式并行输出）
+        jsonl_path = self.raw_dir / f"{session.id}.jsonl"
+        self._append_raw_jsonl(jsonl_path, pair)
+
+        # P1 #6: 增量重建 .traj 文件（每次响应后保持最新状态）
+        self._rebuild_traj(session)
+
         status = "⚠️ partial" if pair.is_partial else "✅"
         logger.info(
             "%s 记录 #%d | model=%s | stop=%s | tokens=%s",
@@ -365,39 +403,73 @@ class DataCollector:
         partial_response["_complete"] = False
         await self.record_response_async(session, pair, partial_response)
 
-    def extract_incremental_messages(
-        self, prev_messages: List, curr_messages: List
+    def export_session(self, session: Session):
+        """导出会话的 .traj 文件（超时清理 / SessionEnd 时调用）"""
+        if not session.pairs:
+            return
+        self._rebuild_traj(session)
+        logger.info("轨迹已导出: %s | 步骤=%d", session.id[:8], len(session.pairs))
+
+    def _rebuild_traj(self, session: Session):
+        """重建并覆盖 .traj 文件"""
+        try:
+            from builder import SessionMetadata, build_trajectory, save_trajectory
+            metadata = SessionMetadata(
+                session_id=session.id,
+                start_time=session.start_time,
+                model=session.model,
+                working_directory=session.cwd,
+                start_source=session.source,
+            )
+            traj = build_trajectory(session.id, session.pairs, metadata)
+            traj_path = self.traj_dir / f"{session.id}.traj"
+            save_trajectory(traj_path, traj)
+        except Exception as e:
+            logger.warning("重建 .traj 失败: %s", e)
+
+    @staticmethod
+    def _append_raw_jsonl(jsonl_path: Path, pair: RequestResponsePair):
+        """追加写入原始 JSONL"""
+        record = {
+            "timestamp": pair.timestamp,
+            "model": pair.model,
+            "request": pair.request_body,
+            "response": pair.response_body,
+            "usage": pair.usage,
+            "stop_reason": pair.stop_reason,
+            "is_partial": pair.is_partial,
+        }
+        with open(jsonl_path, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _extract_incremental_messages(
+        prev_hashes: List[str], prev_count: int, curr_messages: List,
     ) -> List[Dict]:
         """提取增量 messages — Claude Code 每次请求都重发完整历史
 
-        正确处理 context compaction 场景：compaction 后 messages 前缀会变化，
-        此时记录完整历史而非增量。
+        P0 #2: 使用 hash 列表而非完整 messages 引用进行比较。
+        正确处理 context compaction 场景。
         """
-        if not prev_messages:
+        if not prev_hashes:
             return curr_messages
 
         # compaction 或重置：当前 messages 数量 <= 上次
-        if len(curr_messages) <= len(prev_messages):
+        if len(curr_messages) <= prev_count:
             return curr_messages
 
         # 前缀指纹校验（防止 compaction 后长度恰好更长的误判）
-        check_count = min(3, len(prev_messages))
+        check_count = min(3, prev_count)
         prefix_match = all(
-            self._msg_hash(curr_messages[i]) == self._msg_hash(prev_messages[i])
+            _msg_hash(curr_messages[i]) == prev_hashes[i]
             for i in range(check_count)
         )
 
         if prefix_match:
-            return curr_messages[len(prev_messages):]
+            return curr_messages[prev_count:]
         else:
             # 前缀不匹配（compaction 后重新填充），记录完整历史
             return curr_messages
-
-    @staticmethod
-    def _msg_hash(msg: Dict) -> str:
-        """计算单条 message 的内容指纹"""
-        key = f"{msg.get('role', '')}:{str(msg.get('content', ''))[:200]}"
-        return hashlib.md5(key.encode()).hexdigest()
 
 
 # ─────────────────────────────────────────────
@@ -473,6 +545,43 @@ async def handle_streaming(
     return response
 
 
+def _is_messages_request(method: str, path: str, request_body: Dict) -> bool:
+    """判断是否为需要采集的 messages API 请求"""
+    return method == "POST" and "/v1/messages" in path and "messages" in request_body
+
+
+async def _passthrough_upstream(
+    request: web.Request, upstream_base: str, body: bytes,
+) -> web.StreamResponse:
+    """直接透传非 messages 请求（GET /v1/models 等），不做会话匹配和数据采集"""
+    headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in HOP_BY_HOP_REQUEST
+    }
+    upstream_url = f"{upstream_base}{request.path}"
+    if request.query_string:
+        upstream_url += f"?{request.query_string}"
+
+    # P0 #4: GET 请求不带 body
+    data = body if request.method in ("POST", "PUT", "PATCH") else None
+
+    client: aiohttp.ClientSession = request.app["upstream_session"]
+    try:
+        async with client.request(
+            request.method, upstream_url, headers=headers, data=data,
+        ) as upstream_resp:
+            resp_body = await upstream_resp.read()
+            return web.Response(
+                status=upstream_resp.status,
+                headers=_filter_response_headers(upstream_resp.headers),
+                body=resp_body,
+            )
+    except aiohttp.ClientError as e:
+        return web.Response(status=502, text=f"Upstream connection error: {e}")
+    except asyncio.TimeoutError:
+        return web.Response(status=504, text="Upstream timeout")
+
+
 async def proxy_handler(request: web.Request) -> web.StreamResponse:
     """代理主处理器 — 支持流式和非流式两种模式"""
 
@@ -487,6 +596,10 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
         request_body = json.loads(body) if body else {}
     except json.JSONDecodeError:
         request_body = {}
+
+    # P0 #3: 非 messages 请求直接透传，不做会话匹配和数据采集
+    if not _is_messages_request(request.method, request.path, request_body):
+        return await _passthrough_upstream(request, upstream_base, body)
 
     is_streaming = request_body.get("stream", False)
 
@@ -578,15 +691,18 @@ async def handle_session_event(request: web.Request) -> web.Response:
     event = data.get("event")
     logger.info("Hook 事件: %s session=%s", event, (session_id or "")[:8])
 
-    # SessionEnd：触发会话超时清理（简单实现，后续阶段扩展为轨迹导出）
+    # P1 #7: SessionEnd 触发轨迹导出
     if event == "end" and session_id:
         session_manager: SessionManager = request.app["session_manager"]
+        collector: DataCollector = request.app["collector"]
         if session_id in session_manager.active_sessions:
             session = session_manager.active_sessions[session_id]
+            collector.export_session(session)
             logger.info(
                 "会话结束: %s | API 调用=%d 次",
                 session_id[:8], len(session.pairs),
             )
+            del session_manager.active_sessions[session_id]
 
     return web.Response(status=200, text="ok")
 
@@ -650,6 +766,12 @@ def parse_args():
         help="上游 API 地址",
     )
     parser.add_argument("--session-timeout", type=int, default=300, help="会话超时时间（秒）")
+    parser.add_argument(
+        "--events-dir",
+        default=str(Path.home() / ".claude" / "trajectory_events"),
+        help="Hooks 事件数据目录",
+    )
+    parser.add_argument("--save-raw", default=True, action=argparse.BooleanOptionalAction, help="保存原始请求/响应")
     parser.add_argument("--verbose", action="store_true", help="详细日志输出")
     return parser.parse_args()
 
@@ -686,11 +808,12 @@ async def main():
 
     # 定期清理超时会话
     session_manager: SessionManager = app["session_manager"]
+    collector: DataCollector = app["collector"]
 
     async def cleanup_loop():
         while True:
             await asyncio.sleep(60)
-            session_manager.cleanup_expired()
+            session_manager.cleanup_expired(collector=collector)
 
     cleanup_task = asyncio.create_task(cleanup_loop())
     cleanup_task.add_done_callback(_log_task_exception)
@@ -702,6 +825,10 @@ async def main():
         pass
     finally:
         cleanup_task.cancel()
+        # 优雅退出：导出所有活跃会话的轨迹
+        for sid, session in list(session_manager.active_sessions.items()):
+            if session.pairs:
+                collector.export_session(session)
         await runner.cleanup()
         logger.info("代理已停止，数据保存在: %s", output_dir.resolve())
 

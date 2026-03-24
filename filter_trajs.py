@@ -28,7 +28,10 @@ def passes_filter(traj: dict, args) -> tuple[bool, str]:
 
     step_count = len(steps)
     exit_status = info.get("exit_status", meta.get("exit_status", ""))
-    has_tool_use = any(s.get("tool_name") for s in steps if s.get("message_type") == "action")
+    has_tool_use = any(
+        s.get("tool_name") and s["tool_name"] != "final_answer"
+        for s in steps if s.get("message_type") == "action"
+    )
 
     if step_count < args.min_steps:
         return False, f"步骤数不足: {step_count} < {args.min_steps}"

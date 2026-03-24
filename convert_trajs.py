@@ -37,8 +37,9 @@ def traj_to_messages_xml(traj: dict) -> List[Dict]:
             if tool_name and tool_name != "final_answer":
                 # 构建 XML 格式的工具调用
                 params = "".join(
-                    f"<parameter={k}>{v}</parameter>"
+                    f"<parameter={k}>{json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v}</parameter>"
                     for k, v in tool_input.items()
+                    if not k.startswith("_")  # 跳过内部标记字段（如 _parse_error）
                 )
                 action_xml = f"<function={tool_name}>{params}</function>"
                 content = f"{thought}\n\n{action_xml}" if thought else action_xml

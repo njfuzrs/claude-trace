@@ -51,13 +51,14 @@ class SessionMetadata:
 # tool_result 查找
 # ─────────────────────────────────────────────
 
-def find_tool_result(pairs: List, tool_use_id: str) -> Optional[Dict]:
+def find_tool_result(pairs: List, tool_use_id: str, max_lookahead: int = 3) -> Optional[Dict]:
     """在后续请求的 messages 中查找对应的 tool_result
 
     Claude Code 每次请求都带完整对话历史，tool_result 出现在
     tool_use 之后的某个请求的 messages 里。
+    P1 #8: 限制搜索范围为后续 max_lookahead 个 pairs，避免 O(n*m) 性能问题。
     """
-    for pair in pairs:
+    for pair in pairs[:max_lookahead]:
         messages = pair.request_body.get("messages", [])
         for msg in messages:
             if msg.get("role") != "user":
@@ -194,8 +195,10 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
                     "tool_call_ids": [tool_use_id],
                 })
 
-        # ── final_answer（end_turn + 有文本回复） ──────────
-        if stop_reason == "end_turn" and thought:
+        # ── final_answer（end_turn + 有文本回复 + 无工具调用） ──
+        # P1 #9: 只在纯文本回复时生成 final_answer，避免与 tool_use action 重复
+        has_tool_use = any(b.get("type") == "tool_use" for b in content_blocks)
+        if stop_reason == "end_turn" and thought and not has_tool_use:
             trajectory.append({
                 "message_type": "action",
                 "role": "assistant",

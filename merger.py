@@ -143,11 +143,11 @@ class DataMerger:
         hook_events = load_hook_events(self.events_dir, session_id)
 
         # 3. 从 Hook 事件提取元数据
-        session_start = next((e for e in hook_events if e["event"] == "SessionStart"), {})
-        session_end = next((e for e in hook_events if e["event"] == "SessionEnd"), {})
-        compactions = [e for e in hook_events if e["event"] == "PostCompact"]
-        subagents = [e for e in hook_events if e["event"] in ("SubagentStart", "SubagentStop")]
-        user_prompts = [e["prompt"] for e in hook_events if e["event"] == "UserPromptSubmit" and "prompt" in e]
+        session_start = next((e for e in hook_events if e.get("event") == "SessionStart"), {})
+        session_end = next((e for e in hook_events if e.get("event") == "SessionEnd"), {})
+        compactions = [e for e in hook_events if e.get("event") == "PostCompact"]
+        subagents = [e for e in hook_events if e.get("event") in ("SubagentStart", "SubagentStop")]
+        user_prompts = [e["prompt"] for e in hook_events if e.get("event") == "UserPromptSubmit" and "prompt" in e]
 
         # 4. 构建 SessionMetadata
         model = session_start.get("model") or (raw_pairs[0].model if raw_pairs else "")
