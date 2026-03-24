@@ -116,13 +116,19 @@ def main():
 
     # ── P2 事件 ──────────────────────────────────────────────
     elif event_name == "PermissionRequest":
+        # P2 fix: PermissionRequest 是 pre-hook，在用户做决定之前触发，
+        # 不会有 decision 字段。只记录请求的工具名和参数。
         event["tool_name"] = input_data.get("tool_name")
         event["tool_input"] = input_data.get("tool_input")
-        event["decision"] = input_data.get("decision")
 
     elif event_name == "InstructionsLoaded":
-        event["instructions_path"] = input_data.get("instructions_path")
-        event["instructions_hash"] = input_data.get("instructions_hash")
+        # P2 fix: 使用 Claude Code 实际传入的字段名，兜底保存完整 input_data
+        event["source"] = input_data.get("source")
+        event["content_length"] = len(str(input_data.get("content", "")))
+        # 保留原始 input 中的其他字段作为兜底
+        for k in ("instructions_path", "instructions_hash", "path", "content"):
+            if k in input_data:
+                event[k] = input_data[k]
 
     elif event_name == "StopFailure":
         event["error"] = input_data.get("error")

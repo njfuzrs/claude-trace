@@ -216,8 +216,11 @@ class SessionManager:
         logger.info("新建会话（兜底）: %s", sid[:8])
         return session
 
-    def cleanup_expired(self, collector: Optional["DataCollector"] = None):
-        """清理超时会话和过期 pending，导出轨迹后再删除"""
+    async def cleanup_expired(self, collector: Optional["DataCollector"] = None):
+        """清理超时会话和过期 pending，导出轨迹后再删除
+
+        P1 fix: 改为 async，确保 export 完成后再删除 session，避免数据竞争。
+        """
         now = datetime.now()
 
         # 清理超时的活跃会话
@@ -230,7 +233,7 @@ class SessionManager:
             session = self.active_sessions[sid]
             # P1 #5: 超时清理前先导出 .traj，防止数据丢失
             if collector and session.pairs:
-                collector.export_session(session)
+                await collector.export_session_async(session)
             logger.info("会话超时清理: %s (pairs=%d)", sid[:8], len(session.pairs))
             del self.active_sessions[sid]
 
@@ -417,8 +420,10 @@ class DataCollector:
         )
 
         # 将所有同步文件 IO 移到线程池
+        # P0 fix: 对 session.pairs 做快照，避免线程池中遍历时被事件循环修改
+        pairs_snapshot = list(session.pairs)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._write_pair_files, session, pair)
+        await loop.run_in_executor(None, self._write_pair_files, session, pair, pairs_snapshot)
 
     async def record_partial_response(self, session: Session, pair: RequestResponsePair, raw_chunks: bytes):
         """SSE 流中断时保存部分数据"""
@@ -427,18 +432,20 @@ class DataCollector:
         await self.record_response_async(session, pair, partial_response)
 
     def export_session(self, session: Session):
-        """导出会话的 .traj 文件（超时清理 / SessionEnd 时调用）"""
+        """导出会话的 .traj 文件（同步版本，用于优雅退出等非 async 上下文）"""
         if not session.pairs:
             return
-        self._rebuild_traj(session)
+        self._rebuild_traj_sync(session)
         logger.info("轨迹已导出: %s | 步骤=%d", session.id[:8], len(session.pairs))
 
-    def _rebuild_traj(self, session: Session):
-        """重建并覆盖 .traj 文件
+    async def export_session_async(self, session: Session):
+        """导出会话的 .traj 文件（async 版本，用于 cleanup_expired 等 async 上下文）
 
-        P0 #1: 兼容事件循环内外两种调用场景。
-        P0 #2: run_in_executor 返回的 Future 添加异常回调。
+        P1 fix: 确保 traj 写入完成后再返回，避免 session 被删除时写入仍在进行。
         """
+        if not session.pairs:
+            return
+        pairs_snapshot = list(session.pairs)
         try:
             from builder import SessionMetadata, build_trajectory, save_trajectory
             metadata = SessionMetadata(
@@ -448,7 +455,31 @@ class DataCollector:
                 working_directory=session.cwd,
                 start_source=session.source,
             )
-            traj = build_trajectory(session.id, session.pairs, metadata)
+            traj = build_trajectory(session.id, pairs_snapshot, metadata)
+            traj_path = self.traj_dir / f"{session.id}.traj"
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, save_trajectory, traj_path, traj)
+        except Exception as e:
+            logger.warning("异步导出 .traj 失败: %s", e)
+        logger.info("轨迹已导出: %s | 步骤=%d", session.id[:8], len(session.pairs))
+
+    def _rebuild_traj_sync(self, session: Session):
+        """重建并覆盖 .traj 文件（同步版本）
+
+        P0 fix: 使用 pairs 快照避免线程安全问题。
+        兼容事件循环内外两种调用场景。
+        """
+        pairs_snapshot = list(session.pairs)
+        try:
+            from builder import SessionMetadata, build_trajectory, save_trajectory
+            metadata = SessionMetadata(
+                session_id=session.id,
+                start_time=session.start_time,
+                model=session.model,
+                working_directory=session.cwd,
+                start_source=session.source,
+            )
+            traj = build_trajectory(session.id, pairs_snapshot, metadata)
             traj_path = self.traj_dir / f"{session.id}.traj"
             try:
                 loop = asyncio.get_running_loop()
@@ -460,10 +491,11 @@ class DataCollector:
         except Exception as e:
             logger.warning("重建 .traj 失败: %s", e)
 
-    def _write_pair_files(self, session: Session, pair: RequestResponsePair):
+    def _write_pair_files(self, session: Session, pair: RequestResponsePair, pairs_snapshot: List[RequestResponsePair] = None):
         """同步写入请求/响应文件 + JSONL + .traj（在线程池中执行）
 
         P0 #3: 所有文件 IO 集中在此方法，由 run_in_executor 调用，不阻塞事件循环。
+        P0 fix: pairs_snapshot 是事件循环中的快照，避免线程池中遍历时被修改。
         P2 #18: save_raw 控制是否写入单独的 JSON 文件。
         """
         session_dir = self.raw_dir / session.id
@@ -499,6 +531,8 @@ class DataCollector:
         self._append_raw_jsonl(jsonl_path, pair)
 
         # 增量重建 .traj 文件（直接同步写入，因为已在线程池中）
+        # P0 fix: 使用 pairs_snapshot 而非 session.pairs，避免线程安全问题
+        build_pairs = pairs_snapshot if pairs_snapshot is not None else list(session.pairs)
         try:
             from builder import SessionMetadata, build_trajectory, save_trajectory
             metadata = SessionMetadata(
@@ -508,7 +542,7 @@ class DataCollector:
                 working_directory=session.cwd,
                 start_source=session.source,
             )
-            traj = build_trajectory(session.id, session.pairs, metadata)
+            traj = build_trajectory(session.id, build_pairs, metadata)
             traj_path = self.traj_dir / f"{session.id}.traj"
             save_trajectory(traj_path, traj)
         except Exception as e:
@@ -516,11 +550,30 @@ class DataCollector:
 
     @staticmethod
     def _append_raw_jsonl(jsonl_path: Path, pair: RequestResponsePair):
-        """追加写入原始 JSONL"""
+        """追加写入原始 JSONL
+
+        P0 fix: 只保存 new_messages 而非完整 request_body，避免 O(n^2) 存储膨胀。
+        Claude Code 每次请求都重发完整对话历史，JSONL 中保存完整 request_body
+        会导致存储量随对话轮数平方增长。首次请求（index=1）保存完整 request_body
+        作为基线，后续只保存增量 new_messages。
+        """
+        if pair.index == 1:
+            # 首次请求：保存完整 request_body（含 system prompt 等）
+            request_data = pair.request_body
+        else:
+            # 后续请求：只保存增量 messages + 非 messages 的请求参数
+            request_data = {
+                k: v for k, v in pair.request_body.items()
+                if k != "messages"
+            }
+            request_data["new_messages"] = pair.new_messages
+            request_data["_messages_count"] = len(pair.request_body.get("messages", []))
+
         record = {
             "timestamp": pair.timestamp,
+            "index": pair.index,
             "model": pair.model,
-            "request": pair.request_body,
+            "request": request_data,
             "response": pair.response_body,
             "usage": pair.usage,
             "stop_reason": pair.stop_reason,
@@ -794,7 +847,7 @@ async def handle_session_event(request: web.Request) -> web.Response:
         collector: DataCollector = request.app["collector"]
         if session_id in session_manager.active_sessions:
             session = session_manager.active_sessions[session_id]
-            collector.export_session(session)
+            await collector.export_session_async(session)
             logger.info(
                 "会话结束: %s | API 调用=%d 次",
                 session_id[:8], len(session.pairs),
@@ -908,7 +961,7 @@ async def main():
     async def cleanup_loop():
         while True:
             await asyncio.sleep(60)
-            session_manager.cleanup_expired(collector=collector)
+            await session_manager.cleanup_expired(collector=collector)
 
     cleanup_task = asyncio.create_task(cleanup_loop())
     cleanup_task.add_done_callback(_log_task_exception)

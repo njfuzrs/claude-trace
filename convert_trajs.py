@@ -120,6 +120,43 @@ DEFAULT_SYSTEM_MESSAGE = (
 )
 
 
+def _extract_patch(traj: dict) -> str:
+    """P1 fix: 从轨迹中提取 patch（文件编辑的 diff 内容）
+
+    遍历 trajectory 中的 write/edit 工具调用，提取文件路径和内容变更。
+    由于代理采集的是工具输入而非 git diff，这里拼接为伪 patch 格式，
+    记录哪些文件被修改了以及修改内容，供下游 SFT 训练参考。
+    """
+    edits = []
+    steps = traj.get("trajectory", [])
+    for step in steps:
+        if step.get("message_type") != "action":
+            continue
+        tool_name = step.get("tool_name", "")
+        tool_input = step.get("tool_input", {})
+        if not tool_name or not tool_input:
+            continue
+
+        if tool_name == "write":
+            fp = tool_input.get("file_path") or tool_input.get("path", "")
+            content = tool_input.get("content", "")
+            if fp and content:
+                edits.append(f"--- /dev/null\n+++ {fp}\n{content}")
+        elif tool_name == "edit":
+            fp = tool_input.get("file_path") or tool_input.get("path", "")
+            old = tool_input.get("old_string", tool_input.get("old_text", ""))
+            new = tool_input.get("new_string", tool_input.get("new_text", ""))
+            if fp and (old or new):
+                edits.append(f"--- {fp}\n+++ {fp}\n-{old}\n+{new}")
+        elif tool_name == "bash":
+            cmd = tool_input.get("command", "")
+            # 检测 sed/patch 等常见文件修改命令
+            if cmd and any(kw in cmd for kw in ("sed -i", "patch ", "tee ", "cat >", "echo >")):
+                edits.append(f"# bash: {cmd}")
+
+    return "\n".join(edits)
+
+
 def convert_traj(traj: dict, style: str, system_message: str = DEFAULT_SYSTEM_MESSAGE) -> Dict:
     """将单个 .traj 转换为 SFT 训练格式"""
     converter = CONVERTERS[style]
@@ -130,6 +167,7 @@ def convert_traj(traj: dict, style: str, system_message: str = DEFAULT_SYSTEM_ME
         messages.insert(0, {"role": "system", "content": system_message})
 
     meta = traj.get("metadata", {})
+    patch = _extract_patch(traj)
     return {
         "messages": messages,
         "instance_id": meta.get("session_id", ""),
@@ -137,6 +175,7 @@ def convert_traj(traj: dict, style: str, system_message: str = DEFAULT_SYSTEM_ME
         "resolved": meta.get("exit_status") == "end_turn",
         "tools_used": meta.get("tools_used", []),
         "total_steps": meta.get("total_steps", 0),
+        "patch": patch,
     }
 
 

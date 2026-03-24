@@ -12,6 +12,7 @@ Anthropic API → TAO 映射：
   stop_reason=end_turn    → final_answer
 """
 
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -35,6 +36,7 @@ class SessionMetadata:
     total_api_calls: int = 0
     total_tokens_sent: int = 0
     total_tokens_received: int = 0
+    total_cost_usd: float = 0.0     # P2 fix: 估算成本（基于模型定价）
     exit_status: str = ""           # end_turn / tool_use_loop / user_interrupt / error
     tools_used: List[str] = field(default_factory=list)
     files_edited: List[str] = field(default_factory=list)
@@ -42,12 +44,49 @@ class SessionMetadata:
     has_thinking: bool = False
     has_sub_agent: bool = False
     working_directory: str = ""
+    claude_md_hash: str = ""        # P2 fix: CLAUDE.md 内容 hash（用于关联项目）
     # Hook 事件丰富字段
     start_source: str = ""          # startup / resume / clear
     end_source: str = ""
     user_prompts: List[str] = field(default_factory=list)
     compactions: List[Dict] = field(default_factory=list)
     subagent_spans: List[Dict] = field(default_factory=list)
+
+
+# 模型定价（USD per million tokens），用于估算成本
+# 来源：https://docs.anthropic.com/en/docs/about-claude/pricing
+_MODEL_PRICING: Dict[str, Dict[str, float]] = {
+    "claude-opus-4": {"input": 15.0, "output": 75.0},
+    "claude-sonnet-4": {"input": 3.0, "output": 15.0},
+    "claude-haiku-4": {"input": 0.80, "output": 4.0},
+}
+
+
+def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """根据模型和 token 用量估算成本（USD）"""
+    # 模糊匹配模型名（claude-sonnet-4-20250514 → claude-sonnet-4）
+    pricing = None
+    for prefix, p in _MODEL_PRICING.items():
+        if model.startswith(prefix):
+            pricing = p
+            break
+    if not pricing:
+        return 0.0
+    return (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
+
+
+def _extract_claude_md_hash(request_body: Dict) -> str:
+    """从首次请求的 system prompt 中提取 CLAUDE.md 内容 hash"""
+    system = request_body.get("system")
+    if not system:
+        return ""
+    if isinstance(system, list):
+        text = "\n".join(b.get("text", "") for b in system if isinstance(b, dict))
+    else:
+        text = str(system)
+    if not text:
+        return ""
+    return hashlib.md5(text.encode()).hexdigest()
 
 
 # ─────────────────────────────────────────────
@@ -132,8 +171,9 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
                     "agent": "primary",
                 })
             # 记录首次请求中的 user messages
+            # P1 fix: 跳过 role=system 的 messages，避免与上面的 system prompt 重复
             for msg in request_messages:
-                if msg.get("role") in ("user", "system"):
+                if msg.get("role") == "user":
                     history.append({
                         "role": msg["role"],
                         "content": msg.get("content", ""),
@@ -257,11 +297,16 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
     metadata.total_api_calls = len(pairs)
     metadata.total_tokens_sent = total_input_tokens
     metadata.total_tokens_received = total_output_tokens
+    metadata.total_cost_usd = _estimate_cost(metadata.model, total_input_tokens, total_output_tokens)
     metadata.tools_used = sorted(tools_used)
     metadata.files_edited = sorted(files_edited)
     metadata.step_count = len(trajectory)
     metadata.has_thinking = has_thinking
     metadata.end_time = datetime.now().isoformat()
+
+    # P2 fix: 从首次请求的 system prompt 提取 CLAUDE.md hash
+    if pairs and not metadata.claude_md_hash:
+        metadata.claude_md_hash = _extract_claude_md_hash(pairs[0].request_body)
 
     # exit_status：取最后一个 pair 的 stop_reason
     if pairs:
@@ -276,6 +321,7 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
                 "tokens_sent": total_input_tokens,
                 "tokens_received": total_output_tokens,
                 "api_calls": len(pairs),
+                "total_cost_usd": metadata.total_cost_usd,
             },
             "exit_status": metadata.exit_status,
             "has_thinking": has_thinking,
@@ -289,12 +335,14 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
             "total_api_calls": metadata.total_api_calls,
             "total_tokens_sent": total_input_tokens,
             "total_tokens_received": total_output_tokens,
+            "total_cost_usd": metadata.total_cost_usd,
             "exit_status": metadata.exit_status,
             "tools_used": metadata.tools_used,
             "files_edited": metadata.files_edited,
             "has_thinking": has_thinking,
             "has_sub_agent": metadata.has_sub_agent,
             "working_directory": metadata.working_directory,
+            "claude_md_hash": metadata.claude_md_hash,
             "start_source": metadata.start_source,
             "end_source": metadata.end_source,
             "user_prompts": metadata.user_prompts,

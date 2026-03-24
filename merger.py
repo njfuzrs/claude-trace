@@ -43,10 +43,19 @@ class RawPair:
     stop_reason: str
     is_partial: bool
     model: str
+    new_messages: List[Dict] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.new_messages is None:
+            self.new_messages = []
 
 
 def load_raw_pairs_from_dir(session_dir: Path) -> List[RawPair]:
-    """从 raw/{session_id}/ 目录加载（每对一个 JSON 文件）"""
+    """从 raw/{session_id}/ 目录加载（每对一个 JSON 文件）
+
+    P2 fix: 目录格式中 request 用 key "body"，response 用 key "body"，
+    同时兼容 "request"/"response" key（向后兼容）。
+    """
     pairs = []
     req_files = sorted(session_dir.glob("*_request.json"))
     for req_file in req_files:
@@ -56,33 +65,46 @@ def load_raw_pairs_from_dir(session_dir: Path) -> List[RawPair]:
         req_data = json.loads(req_file.read_text())
         resp_data = json.loads(resp_file.read_text()) if resp_file.exists() else {}
 
+        # P2 fix: 统一用 "body" 优先，兼容 "request"/"response"
+        request_body = req_data.get("body") or req_data.get("request", {})
+        response_body = resp_data.get("body") or resp_data.get("response")
+
         pairs.append(RawPair(
             timestamp=req_data.get("timestamp", ""),
-            request_body=req_data.get("body", req_data.get("request", {})),
-            response_body=resp_data.get("body", resp_data.get("response")),
+            request_body=request_body,
+            response_body=response_body,
             usage=resp_data.get("usage", {}),
             stop_reason=resp_data.get("stop_reason", ""),
             is_partial=resp_data.get("is_partial", False),
             model=req_data.get("model", ""),
+            new_messages=req_data.get("new_messages", []),
         ))
     return pairs
 
 
 def load_raw_pairs_from_jsonl(jsonl_path: Path) -> List[RawPair]:
-    """从 raw/{session_id}.jsonl 加载（一行一对）"""
+    """从 raw/{session_id}.jsonl 加载（一行一对）
+
+    P0 fix: 兼容新的 compact JSONL 格式（非首条记录只有 new_messages，无完整 messages）。
+    P1 fix: 读取 new_messages 字段，避免 merger 重建轨迹时 history 数据丢失。
+    """
     pairs = []
     for line in jsonl_path.read_text().splitlines():
         if not line.strip():
             continue
         record = json.loads(line)
+        request_data = record.get("request", {})
+        # compact JSONL 中非首条记录的 new_messages 存在 request_data 内部
+        new_messages = request_data.pop("new_messages", []) if "new_messages" in request_data else []
         pairs.append(RawPair(
             timestamp=record.get("timestamp", ""),
-            request_body=record.get("request", {}),
+            request_body=request_data,
             response_body=record.get("response"),
             usage=record.get("usage", {}),
             stop_reason=record.get("stop_reason", ""),
             is_partial=record.get("is_partial", False),
             model=record.get("model", ""),
+            new_messages=new_messages,
         ))
     return pairs
 
@@ -148,6 +170,7 @@ class DataMerger:
         compactions = [e for e in hook_events if e.get("event") == "PostCompact"]
         subagents = [e for e in hook_events if e.get("event") in ("SubagentStart", "SubagentStop")]
         user_prompts = [e["prompt"] for e in hook_events if e.get("event") == "UserPromptSubmit" and "prompt" in e]
+        post_tool_uses = [e for e in hook_events if e.get("event") == "PostToolUse"]
 
         # 4. 构建 SessionMetadata
         model = session_start.get("model") or (raw_pairs[0].model if raw_pairs else "")
@@ -170,18 +193,24 @@ class DataMerger:
         # 6. 构建轨迹
         traj = build_trajectory(session_id, adapted_pairs, metadata)
 
-        # 7. 保存 .traj 文件
+        # 7. P1 fix: 工具调用交叉验证（代理 tool_use vs Hook PostToolUse）
+        validation = _cross_validate_tool_calls(traj, post_tool_uses)
+        traj["metadata"]["tool_call_validation"] = validation
+
+        # 8. 保存 .traj 文件
         traj_path = self.output_dir / f"{session_id}.traj"
         save_trajectory(traj_path, traj)
 
         logger.info(
-            "合并完成: %s | 步骤=%d | API调用=%d | tokens=%d+%d | Hook事件=%d",
+            "合并完成: %s | 步骤=%d | API调用=%d | tokens=%d+%d | Hook事件=%d | 工具验证=%d/%d",
             session_id[:8],
             traj["metadata"]["total_steps"],
             traj["metadata"]["total_api_calls"],
             traj["metadata"]["total_tokens_sent"],
             traj["metadata"]["total_tokens_received"],
             len(hook_events),
+            validation["matched"],
+            validation["proxy_total"],
         )
         return traj
 
@@ -210,6 +239,64 @@ class DataMerger:
 
         logger.info("共合并 %d 个会话", len(merged))
         return merged
+
+
+def _cross_validate_tool_calls(traj: Dict, post_tool_uses: List[Dict]) -> Dict:
+    """P1 fix: 交叉验证代理提取的 tool_use 与 Hook PostToolUse 事件
+
+    通过 tool_use_id 匹配两个通道的工具调用记录，检测遗漏和不一致。
+    返回验证摘要，写入 traj metadata。
+    """
+    # 从 traj 中提取代理侧的 tool_use actions
+    proxy_actions = {
+        s["tool_use_id"]: s
+        for s in traj.get("trajectory", [])
+        if s.get("message_type") == "action" and s.get("tool_use_id")
+    }
+
+    # 从 Hook 事件中提取 PostToolUse（按 tool_use_id 索引）
+    hook_tools = {
+        e["tool_use_id"]: e
+        for e in post_tool_uses
+        if e.get("tool_use_id")
+    }
+
+    matched = 0
+    proxy_only = []
+    hook_only = []
+    mismatches = []
+
+    for tid, proxy_step in proxy_actions.items():
+        if tid in hook_tools:
+            matched += 1
+            # 检查 tool_name 是否一致
+            hook_evt = hook_tools[tid]
+            if proxy_step.get("tool_name") != hook_evt.get("tool_name"):
+                mismatches.append({
+                    "tool_use_id": tid,
+                    "proxy_tool": proxy_step.get("tool_name"),
+                    "hook_tool": hook_evt.get("tool_name"),
+                })
+        else:
+            proxy_only.append(tid)
+
+    for tid in hook_tools:
+        if tid not in proxy_actions:
+            hook_only.append(tid)
+
+    if mismatches:
+        logger.warning("工具调用名称不一致: %d 个", len(mismatches))
+    if hook_only:
+        logger.info("Hook 独有工具调用（可能来自 sub-agent）: %d 个", len(hook_only))
+
+    return {
+        "proxy_total": len(proxy_actions),
+        "hook_total": len(hook_tools),
+        "matched": matched,
+        "proxy_only_count": len(proxy_only),
+        "hook_only_count": len(hook_only),
+        "mismatches": mismatches,
+    }
 
 
 @dataclass
@@ -243,6 +330,7 @@ def _adapt_raw_pair(raw: RawPair, index: int) -> _AdaptedPair:
         is_partial=raw.is_partial,
         model=raw.model,
         index=index,
+        new_messages=raw.new_messages,
     )
 
 
