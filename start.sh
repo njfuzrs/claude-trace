@@ -84,7 +84,7 @@ else
     # P2 #15: 等待代理端口就绪（轮询替代固定 sleep）
     echo -n "等待代理就绪..."
     for i in $(seq 1 20); do
-        if curl -s -o /dev/null "http://127.0.0.1:$PORT" 2>/dev/null; then
+        if curl -s -o /dev/null "http://127.0.0.1:$PORT/_internal/health" 2>/dev/null; then
             echo " 就绪"
             break
         fi

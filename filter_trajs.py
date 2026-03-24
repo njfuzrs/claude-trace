@@ -67,9 +67,17 @@ def compute_quality_metrics(traj: dict) -> dict:
     model_stats = info.get("model_stats", {})
     api_calls = model_stats.get("api_calls", meta.get("total_api_calls", 0))
 
-    # partial 步骤数（从 history 中检测）
+    # partial 步骤数：通过 history 中 assistant 消息的 stop_reason 判断
+    # stop_reason 为空字符串不代表 partial（可能只是未记录），
+    # 需要检查 _complete 标记或 stop_reason 是否明确缺失
     history = traj.get("history", [])
-    partial_count = sum(1 for h in history if h.get("stop_reason") == "" and h.get("role") == "assistant")
+    partial_count = sum(
+        1 for h in history
+        if h.get("role") == "assistant"
+        and h.get("stop_reason") is not None  # 字段存在
+        and h.get("stop_reason") == ""         # 但值为空（SSE 流中断）
+        and not h.get("tool_calls")            # 排除正常的 tool_use 响应
+    )
 
     sse_complete_rate = 1.0 - (partial_count / api_calls) if api_calls else 1.0
 

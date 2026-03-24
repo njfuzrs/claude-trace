@@ -23,6 +23,8 @@ from typing import Dict, List, Optional
 import aiohttp
 from aiohttp import web
 
+from builder import SessionMetadata, build_trajectory, save_trajectory
+
 # ─────────────────────────────────────────────
 # 日志配置
 # ─────────────────────────────────────────────
@@ -174,6 +176,25 @@ class SessionManager:
         logger.info("会话关联（%s）: %s", match_type, session_id[:8])
         return session
 
+    @staticmethod
+    def _extract_cwd_from_request(request_body: Dict) -> str:
+        """从请求的 system prompt 中尝试提取工作目录信息
+
+        Claude Code 的 system prompt 通常包含 'working directory' 或 'cwd' 等信息，
+        可用于多实例场景下辅助区分不同的 Claude Code 实例。
+        """
+        system = request_body.get("system")
+        if not system:
+            return ""
+        if isinstance(system, list):
+            text = "\n".join(b.get("text", "") for b in system if isinstance(b, dict))
+        else:
+            text = str(system)
+        # 常见模式：Primary working directory: /path/to/dir
+        import re as _re
+        match = _re.search(r"(?:working directory|cwd)[:\s]+(/\S+)", text, _re.IGNORECASE)
+        return match.group(1) if match else ""
+
     def match_session(self, request_body: Dict) -> Session:
         """双通道会话匹配"""
 
@@ -185,6 +206,9 @@ class SessionManager:
         # P1 #6: 多个 pending 时，用 model + cwd 联合匹配，避免同 model 误关联
         if self._pending_sessions:
             request_model = request_body.get("model", "")
+            # 尝试从请求的 system prompt 中提取 cwd 信息进行联合匹配
+            request_cwd = self._extract_cwd_from_request(request_body)
+
             # 先尝试 model 精确匹配
             model_matches = [
                 (sid, meta) for sid, meta in self._pending_sessions.items()
@@ -194,7 +218,17 @@ class SessionManager:
                 sid, metadata = model_matches[0]
                 return self._create_session_from_pending(sid, metadata, "Hook model 匹配")
             elif len(model_matches) > 1:
-                # 多个同 model 的 pending，warn 并取第一个（FIFO）
+                # 多个同 model，尝试 cwd 联合匹配
+                if request_cwd:
+                    cwd_matches = [
+                        (sid, meta) for sid, meta in model_matches
+                        if meta.get("cwd") == request_cwd
+                    ]
+                    if len(cwd_matches) == 1:
+                        sid, metadata = cwd_matches[0]
+                        return self._create_session_from_pending(sid, metadata, "Hook model+cwd 匹配")
+
+                # cwd 匹配也无法区分，warn 并取第一个（FIFO）
                 logger.warning(
                     "多个 pending session 使用相同 model=%s，按 FIFO 关联（可能不准确）",
                     request_model,
@@ -220,28 +254,40 @@ class SessionManager:
         """清理超时会话和过期 pending，导出轨迹后再删除
 
         P1 fix: 改为 async，确保 export 完成后再删除 session，避免数据竞争。
+        P1 #6 fix: 单个 session 清理失败不阻塞其他 session 的清理。
         """
         now = datetime.now()
 
         # 清理超时的活跃会话
         expired = []
         for sid, session in self.active_sessions.items():
-            last = datetime.fromisoformat(session.last_activity)
-            if (now - last).total_seconds() > self._timeout:
+            try:
+                last = datetime.fromisoformat(session.last_activity)
+                if (now - last).total_seconds() > self._timeout:
+                    expired.append(sid)
+            except (ValueError, TypeError) as e:
+                logger.warning("会话 %s 时间解析失败，标记为过期: %s", sid[:8], e)
                 expired.append(sid)
         for sid in expired:
-            session = self.active_sessions[sid]
-            # P1 #5: 超时清理前先导出 .traj，防止数据丢失
-            if collector and session.pairs:
-                await collector.export_session_async(session)
-            logger.info("会话超时清理: %s (pairs=%d)", sid[:8], len(session.pairs))
+            try:
+                session = self.active_sessions[sid]
+                # P1 #5: 超时清理前先导出 .traj，防止数据丢失
+                if collector and session.pairs:
+                    await collector.export_session_async(session)
+                logger.info("会话超时清理: %s (pairs=%d)", sid[:8], len(session.pairs))
+            except Exception as e:
+                logger.warning("会话 %s 清理时异常: %s", sid[:8], e)
             del self.active_sessions[sid]
 
         # P1 #10: 清理过期的 pending sessions（Hook 注册了但始终没有 API 请求到达）
-        stale_pending = [
-            sid for sid, meta in self._pending_sessions.items()
-            if (now - datetime.fromisoformat(meta.get("_registered_at", now.isoformat()))).total_seconds() > self._timeout
-        ]
+        stale_pending = []
+        for sid, meta in self._pending_sessions.items():
+            try:
+                registered_at = datetime.fromisoformat(meta.get("_registered_at", now.isoformat()))
+                if (now - registered_at).total_seconds() > self._timeout:
+                    stale_pending.append(sid)
+            except (ValueError, TypeError):
+                stale_pending.append(sid)
         for sid in stale_pending:
             logger.info("Pending 会话超时清理: %s", sid[:8])
             del self._pending_sessions[sid]
@@ -401,10 +447,18 @@ class DataCollector:
         session.prev_msg_count = len(curr_messages)
         return pair
 
-    async def record_response_async(self, session: Session, pair: RequestResponsePair, response: Dict):
+    async def record_response_async(
+        self,
+        session: Session,
+        pair: RequestResponsePair,
+        response: Dict,
+        pairs_snapshot: Optional[List[RequestResponsePair]] = None,
+    ):
         """异步记录重组后的响应，写入 raw/ 目录
 
         P0 #3: 所有文件 IO 移到线程池，避免 JSON 序列化 + 写入阻塞事件循环。
+        P0 #4 fix: pairs_snapshot 应由调用方在 create_task 之前创建并传入，
+        确保快照时机在事件循环的同步上下文中，而非 task 被调度执行时。
         """
         pair.response_body = response
         pair.usage = response.get("usage", {})
@@ -420,8 +474,9 @@ class DataCollector:
         )
 
         # 将所有同步文件 IO 移到线程池
-        # P0 fix: 对 session.pairs 做快照，避免线程池中遍历时被事件循环修改
-        pairs_snapshot = list(session.pairs)
+        # 如果调用方未传入 snapshot，在此处兜底创建（直接 await 场景）
+        if pairs_snapshot is None:
+            pairs_snapshot = list(session.pairs)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._write_pair_files, session, pair, pairs_snapshot)
 
@@ -431,11 +486,41 @@ class DataCollector:
         partial_response["_complete"] = False
         await self.record_response_async(session, pair, partial_response)
 
+    def _build_traj_data(self, session: Session, pairs_snapshot: List[RequestResponsePair]) -> tuple:
+        """公共方法：构建 traj 数据和目标路径，消除三处重复逻辑。
+
+        Returns:
+            (traj_path, traj_dict) 或在异常时返回 (None, None)
+        """
+        try:
+            metadata = SessionMetadata(
+                session_id=session.id,
+                start_time=session.start_time,
+                model=session.model,
+                working_directory=session.cwd,
+                start_source=session.source,
+            )
+            traj = build_trajectory(session.id, pairs_snapshot, metadata)
+            traj_path = self.traj_dir / f"{session.id}.traj"
+            return traj_path, traj
+        except Exception as e:
+            logger.warning("构建 .traj 失败: %s", e)
+            return None, None
+
     def export_session(self, session: Session):
         """导出会话的 .traj 文件（同步版本，用于优雅退出等非 async 上下文）"""
         if not session.pairs:
             return
-        self._rebuild_traj_sync(session)
+        pairs_snapshot = list(session.pairs)
+        traj_path, traj = self._build_traj_data(session, pairs_snapshot)
+        if traj_path and traj:
+            try:
+                loop = asyncio.get_running_loop()
+                future = loop.run_in_executor(None, save_trajectory, traj_path, traj)
+                future.add_done_callback(_log_future_exception)
+            except RuntimeError:
+                # 非事件循环上下文（如优雅退出的 finally 块），直接同步写入
+                save_trajectory(traj_path, traj)
         logger.info("轨迹已导出: %s | 步骤=%d", session.id[:8], len(session.pairs))
 
     async def export_session_async(self, session: Session):
@@ -446,57 +531,24 @@ class DataCollector:
         if not session.pairs:
             return
         pairs_snapshot = list(session.pairs)
-        try:
-            from builder import SessionMetadata, build_trajectory, save_trajectory
-            metadata = SessionMetadata(
-                session_id=session.id,
-                start_time=session.start_time,
-                model=session.model,
-                working_directory=session.cwd,
-                start_source=session.source,
-            )
-            traj = build_trajectory(session.id, pairs_snapshot, metadata)
-            traj_path = self.traj_dir / f"{session.id}.traj"
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, save_trajectory, traj_path, traj)
-        except Exception as e:
-            logger.warning("异步导出 .traj 失败: %s", e)
-        logger.info("轨迹已导出: %s | 步骤=%d", session.id[:8], len(session.pairs))
-
-    def _rebuild_traj_sync(self, session: Session):
-        """重建并覆盖 .traj 文件（同步版本）
-
-        P0 fix: 使用 pairs 快照避免线程安全问题。
-        兼容事件循环内外两种调用场景。
-        """
-        pairs_snapshot = list(session.pairs)
-        try:
-            from builder import SessionMetadata, build_trajectory, save_trajectory
-            metadata = SessionMetadata(
-                session_id=session.id,
-                start_time=session.start_time,
-                model=session.model,
-                working_directory=session.cwd,
-                start_source=session.source,
-            )
-            traj = build_trajectory(session.id, pairs_snapshot, metadata)
-            traj_path = self.traj_dir / f"{session.id}.traj"
+        traj_path, traj = self._build_traj_data(session, pairs_snapshot)
+        if traj_path and traj:
             try:
                 loop = asyncio.get_running_loop()
-                future = loop.run_in_executor(None, save_trajectory, traj_path, traj)
-                future.add_done_callback(_log_future_exception)
-            except RuntimeError:
-                # 非事件循环上下文（如优雅退出的 finally 块），直接同步写入
-                save_trajectory(traj_path, traj)
-        except Exception as e:
-            logger.warning("重建 .traj 失败: %s", e)
+                await loop.run_in_executor(None, save_trajectory, traj_path, traj)
+            except Exception as e:
+                logger.warning("异步导出 .traj 失败: %s", e)
+        logger.info("轨迹已导出: %s | 步骤=%d", session.id[:8], len(session.pairs))
 
-    def _write_pair_files(self, session: Session, pair: RequestResponsePair, pairs_snapshot: List[RequestResponsePair] = None):
+    def _write_pair_files(self, session: Session, pair: RequestResponsePair, pairs_snapshot: List[RequestResponsePair]):
         """同步写入请求/响应文件 + JSONL + .traj（在线程池中执行）
 
         P0 #3: 所有文件 IO 集中在此方法，由 run_in_executor 调用，不阻塞事件循环。
         P0 fix: pairs_snapshot 是事件循环中的快照，避免线程池中遍历时被修改。
         P2 #18: save_raw 控制是否写入单独的 JSON 文件。
+
+        注意：session.id / start_time / model / cwd / source 在 Session 创建后不可变，
+        线程池中读取是安全的。可变字段（pairs / last_activity）通过 pairs_snapshot 隔离。
         """
         session_dir = self.raw_dir / session.id
         session_dir.mkdir(parents=True, exist_ok=True)
@@ -531,22 +583,9 @@ class DataCollector:
         self._append_raw_jsonl(jsonl_path, pair)
 
         # 增量重建 .traj 文件（直接同步写入，因为已在线程池中）
-        # P0 fix: 使用 pairs_snapshot 而非 session.pairs，避免线程安全问题
-        build_pairs = pairs_snapshot if pairs_snapshot is not None else list(session.pairs)
-        try:
-            from builder import SessionMetadata, build_trajectory, save_trajectory
-            metadata = SessionMetadata(
-                session_id=session.id,
-                start_time=session.start_time,
-                model=session.model,
-                working_directory=session.cwd,
-                start_source=session.source,
-            )
-            traj = build_trajectory(session.id, build_pairs, metadata)
-            traj_path = self.traj_dir / f"{session.id}.traj"
+        traj_path, traj = self._build_traj_data(session, pairs_snapshot)
+        if traj_path and traj:
             save_trajectory(traj_path, traj)
-        except Exception as e:
-            logger.warning("重建 .traj 失败: %s", e)
 
     @staticmethod
     def _append_raw_jsonl(jsonl_path: Path, pair: RequestResponsePair):
@@ -687,8 +726,10 @@ async def handle_streaming(
     # 流正常结束：重组 SSE 事件 → 异步记录
     full_data = b"".join(raw_chunks)
     complete_response = reassemble_sse_response(full_data)
+    # P0 #4 fix: 在 create_task 之前创建 snapshot
+    pairs_snapshot = list(session.pairs)
     t = asyncio.create_task(
-        collector.record_response_async(session, pair, complete_response)
+        collector.record_response_async(session, pair, complete_response, pairs_snapshot)
     )
     t.add_done_callback(_log_task_exception)
 
@@ -788,8 +829,10 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                 except json.JSONDecodeError:
                     response_json = {"_raw": resp_body.decode("utf-8", errors="replace")}
 
+                # P0 #4 fix: 在 create_task 之前创建 snapshot，确保快照时机正确
+                pairs_snapshot = list(session.pairs)
                 t = asyncio.create_task(
-                    collector.record_response_async(session, pair, response_json)
+                    collector.record_response_async(session, pair, response_json, pairs_snapshot)
                 )
                 t.add_done_callback(_log_task_exception)
 
@@ -857,6 +900,20 @@ async def handle_session_event(request: web.Request) -> web.Response:
     return web.Response(status=200, text="ok")
 
 
+async def handle_health(request: web.Request) -> web.Response:
+    """健康检查端点，供 start.sh 等外部脚本探测代理是否就绪"""
+    session_manager: SessionManager = request.app["session_manager"]
+    return web.Response(
+        status=200,
+        content_type="application/json",
+        text=json.dumps({
+            "status": "ok",
+            "active_sessions": len(session_manager.active_sessions),
+            "pending_sessions": len(session_manager._pending_sessions),
+        }),
+    )
+
+
 # ─────────────────────────────────────────────
 # 应用工厂
 # ─────────────────────────────────────────────
@@ -892,6 +949,7 @@ async def create_app(
     # 内部路由（优先注册，避免被通配符覆盖）
     app.router.add_post("/_internal/session-register", handle_session_register)
     app.router.add_post("/_internal/session-event", handle_session_event)
+    app.router.add_get("/_internal/health", handle_health)
 
     # 通配符路由：透传所有请求
     app.router.add_route("*", "/{path:.*}", proxy_handler)
