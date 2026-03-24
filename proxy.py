@@ -1,0 +1,713 @@
+#!/usr/bin/env python3
+"""
+claude-trace proxy.py — HTTP 代理服务器
+通道 A：透明转发 Claude Code 的 API 请求，SSE Tee 模式采集完整轨迹数据
+
+用法：
+    python proxy.py --port 4000 --output ./trajectories
+    ANTHROPIC_BASE_URL=http://localhost:4000 claude
+"""
+
+import argparse
+import asyncio
+import hashlib
+import json
+import logging
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import aiohttp
+from aiohttp import web
+
+# ─────────────────────────────────────────────
+# 日志配置
+# ─────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("claude-trace")
+
+
+def _log_task_exception(task: asyncio.Task):
+    """asyncio.create_task 异常回调，防止异常被静默吞没"""
+    if not task.cancelled() and task.exception():
+        logger.error("后台任务异常: %s", task.exception(), exc_info=task.exception())
+
+
+# ─────────────────────────────────────────────
+# 安全：请求头脱敏
+# ─────────────────────────────────────────────
+
+SENSITIVE_HEADERS = {"x-api-key", "authorization", "proxy-authorization"}
+
+
+def sanitize_headers_for_storage(headers: Dict[str, str]) -> Dict[str, str]:
+    """对请求头中的敏感信息脱敏后再存储
+
+    安全原则：raw JSON 文件中不应存储明文 API Key，防止轨迹数据
+    意外泄露（上传 HuggingFace、分享给他人等）导致 API Key 被盗用。
+    """
+    sanitized = {}
+    for k, v in headers.items():
+        if k.lower() in SENSITIVE_HEADERS:
+            sanitized[k] = v[:10] + "***" if len(v) > 10 else "***"
+        else:
+            sanitized[k] = v
+    return sanitized
+
+
+# ─────────────────────────────────────────────
+# 数据结构
+# ─────────────────────────────────────────────
+
+@dataclass
+class RequestResponsePair:
+    timestamp: str
+    request_body: Dict
+    request_headers: Dict       # 脱敏后的请求头
+    response_body: Optional[Dict] = None
+    new_messages: List[Dict] = field(default_factory=list)
+    model: str = ""
+    usage: Dict = field(default_factory=dict)
+    stop_reason: str = ""
+    is_partial: bool = False    # SSE 流中断时标记
+
+
+@dataclass
+class Session:
+    id: str
+    model: str = ""
+    source: str = ""            # startup / resume / clear
+    cwd: str = ""
+    start_time: str = field(default_factory=lambda: datetime.now().isoformat())
+    last_activity: str = field(default_factory=lambda: datetime.now().isoformat())
+    pairs: List[RequestResponsePair] = field(default_factory=list)
+    prev_messages: List[Dict] = field(default_factory=list)  # 上一次请求的 messages，用于增量提取
+
+    def update_activity(self):
+        self.last_activity = datetime.now().isoformat()
+
+    def is_continuation(self, messages: List[Dict]) -> bool:
+        """对话内容连续性匹配（Hooks 未配置时的兜底）"""
+        if not self.prev_messages or not messages:
+            return False
+        check = min(3, len(self.prev_messages), len(messages))
+        return all(
+            DataCollector._msg_hash(messages[i]) == DataCollector._msg_hash(self.prev_messages[i])
+            for i in range(check)
+        )
+
+
+# ─────────────────────────────────────────────
+# 会话管理
+# ─────────────────────────────────────────────
+
+class SessionManager:
+    def __init__(self, session_timeout: int = 300):
+        self.active_sessions: Dict[str, Session] = {}
+        # Hooks 通过 HTTP 回调注册的 pending 队列（等待首次 API 请求关联）
+        self._pending_sessions: Dict[str, dict] = {}
+        self._timeout = session_timeout
+
+    def register_session_from_hook(self, session_id: str, metadata: dict):
+        """由 /_internal/session-register 路由调用，Hooks 主动通知"""
+        if session_id not in self.active_sessions:
+            self._pending_sessions[session_id] = metadata
+            logger.info("Hook 注册会话: %s (model=%s)", session_id[:8], metadata.get("model", ""))
+
+    def match_session(self, request_body: Dict) -> Session:
+        """双通道会话匹配"""
+
+        # 策略 1：Hooks 注册的 pending 队列（确定性关联）
+        if len(self._pending_sessions) == 1:
+            session_id, metadata = next(iter(self._pending_sessions.items()))
+            self._pending_sessions.pop(session_id)
+            session = Session(
+                id=session_id,
+                model=metadata.get("model", ""),
+                source=metadata.get("source", ""),
+                cwd=metadata.get("cwd", ""),
+            )
+            self.active_sessions[session_id] = session
+            logger.info("会话关联（Hook 单实例）: %s", session_id[:8])
+            return session
+
+        # 多个 pending 时，用 model 字段辅助匹配
+        if self._pending_sessions:
+            request_model = request_body.get("model", "")
+            for sid, metadata in list(self._pending_sessions.items()):
+                if metadata.get("model") == request_model:
+                    self._pending_sessions.pop(sid)
+                    session = Session(
+                        id=sid,
+                        model=metadata.get("model", ""),
+                        source=metadata.get("source", ""),
+                        cwd=metadata.get("cwd", ""),
+                    )
+                    self.active_sessions[sid] = session
+                    logger.info("会话关联（Hook 多实例 model 匹配）: %s", sid[:8])
+                    return session
+
+        # 策略 2：对话内容连续性匹配（Hooks 未配置时的兜底）
+        messages = request_body.get("messages", [])
+        for session in self.active_sessions.values():
+            if session.is_continuation(messages):
+                session.update_activity()
+                return session
+
+        # 策略 3：创建新会话（自动生成 session_id）
+        sid = str(uuid.uuid4())
+        session = Session(id=sid, model=request_body.get("model", ""))
+        self.active_sessions[sid] = session
+        logger.info("新建会话（兜底）: %s", sid[:8])
+        return session
+
+    def cleanup_expired(self):
+        """清理超时会话"""
+        now = datetime.now()
+        expired = []
+        for sid, session in self.active_sessions.items():
+            last = datetime.fromisoformat(session.last_activity)
+            if (now - last).total_seconds() > self._timeout:
+                expired.append(sid)
+        for sid in expired:
+            logger.info("会话超时清理: %s", sid[:8])
+            del self.active_sessions[sid]
+
+
+# ─────────────────────────────────────────────
+# SSE 解析与重组
+# ─────────────────────────────────────────────
+
+def parse_sse_events(raw_data: bytes) -> List[Dict]:
+    """解析原始 SSE 字节流为事件列表
+
+    按空行（\\n\\n）分割事件块，符合 SSE 规范，能正确处理多行 data。
+    """
+    events = []
+    text = raw_data.decode("utf-8", errors="replace")
+
+    for block in text.split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+
+        data_lines = []
+        for line in block.split("\n"):
+            if line.startswith("data: "):
+                data_lines.append(line[6:])
+            elif line.startswith("data:"):
+                data_lines.append(line[5:])
+
+        if not data_lines:
+            continue
+
+        data_str = "\n".join(data_lines)
+        if data_str and data_str != "[DONE]":
+            try:
+                events.append(json.loads(data_str))
+            except json.JSONDecodeError:
+                pass  # 跳过无法解析的事件
+
+    return events
+
+
+def reassemble_sse_response(raw_data: bytes) -> Dict:
+    """从 SSE 事件流重组完整的 API 响应
+
+    处理所有 Anthropic SSE 事件类型：
+    message_start / content_block_start / content_block_delta /
+    content_block_stop / message_delta / message_stop
+    """
+    events = parse_sse_events(raw_data)
+
+    message: Dict = {}
+    content_blocks: List[Dict] = []
+    current_block: Optional[Dict] = None
+    has_message_stop = False
+
+    for event in events:
+        event_type = event.get("type")
+
+        if event_type == "message_start":
+            message = event.get("message", {})
+
+        elif event_type == "content_block_start":
+            current_block = dict(event.get("content_block", {}))
+            current_block["_deltas"] = []
+
+        elif event_type == "content_block_delta":
+            if current_block is None:
+                continue
+            delta: Dict = event.get("delta", {})
+            delta_type = delta.get("type")
+            if delta_type == "text_delta":
+                current_block["_deltas"].append(delta.get("text", ""))
+            elif delta_type == "thinking_delta":
+                current_block["_deltas"].append(delta.get("thinking", ""))
+            elif delta_type == "input_json_delta":
+                current_block["_deltas"].append(delta.get("partial_json", ""))
+
+        elif event_type == "content_block_stop":
+            if current_block is not None:
+                block_type = current_block.get("type")
+                merged = "".join(current_block.pop("_deltas", []))
+
+                if block_type == "text":
+                    current_block["text"] = merged
+                elif block_type == "thinking":
+                    current_block["thinking"] = merged
+                elif block_type == "tool_use":
+                    # 容错：SSE 流中断时 merged 可能是不完整的 JSON
+                    try:
+                        current_block["input"] = json.loads(merged) if merged else {}
+                    except json.JSONDecodeError:
+                        current_block["input"] = {
+                            "_raw_partial": merged,
+                            "_parse_error": True,
+                        }
+
+                content_blocks.append(current_block)
+                current_block = None
+
+        elif event_type == "message_delta":
+            message.update(event.get("delta", {}))
+            if "usage" in event:
+                message.setdefault("usage", {}).update(event["usage"])
+
+        elif event_type == "message_stop":
+            has_message_stop = True
+
+    message["content"] = content_blocks
+    message["_complete"] = has_message_stop  # 标记 SSE 流是否完整
+    return message
+
+
+# ─────────────────────────────────────────────
+# 数据采集器
+# ─────────────────────────────────────────────
+
+class DataCollector:
+    def __init__(self, output_dir: Path):
+        self.output_dir = output_dir
+        self.raw_dir = output_dir / "raw"
+        self.raw_dir.mkdir(parents=True, exist_ok=True)
+
+    def record_request(
+        self,
+        session: Session,
+        request_body: Dict,
+        raw_headers: Dict[str, str],
+    ) -> RequestResponsePair:
+        """记录请求，提取增量 messages"""
+        curr_messages = request_body.get("messages", [])
+        new_messages = self.extract_incremental_messages(session.prev_messages, curr_messages)
+
+        pair = RequestResponsePair(
+            timestamp=datetime.now().isoformat(),
+            request_body=request_body,
+            request_headers=sanitize_headers_for_storage(raw_headers),
+            new_messages=new_messages,
+            model=request_body.get("model", ""),
+        )
+        session.pairs.append(pair)
+        session.prev_messages = curr_messages
+        return pair
+
+    async def record_response_async(self, session: Session, pair: RequestResponsePair, response: Dict):
+        """异步记录重组后的响应，写入 raw/ 目录"""
+        pair.response_body = response
+        pair.usage = response.get("usage", {})
+        pair.stop_reason = response.get("stop_reason", "")
+        pair.is_partial = not response.get("_complete", False)
+
+        session_dir = self.raw_dir / session.id
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        idx = len(session.pairs)
+        req_file = session_dir / f"{idx:03d}_request.json"
+        resp_file = session_dir / f"{idx:03d}_response.json"
+
+        req_data = {
+            "timestamp": pair.timestamp,
+            "model": pair.model,
+            "headers": pair.request_headers,  # 已脱敏
+            "body": pair.request_body,
+            "new_messages": pair.new_messages,
+        }
+        resp_data = {
+            "timestamp": datetime.now().isoformat(),
+            "usage": pair.usage,
+            "stop_reason": pair.stop_reason,
+            "is_partial": pair.is_partial,
+            "body": pair.response_body,
+        }
+
+        req_file.write_text(json.dumps(req_data, ensure_ascii=False, indent=2))
+        resp_file.write_text(json.dumps(resp_data, ensure_ascii=False, indent=2))
+
+        status = "⚠️ partial" if pair.is_partial else "✅"
+        logger.info(
+            "%s 记录 #%d | model=%s | stop=%s | tokens=%s",
+            status, idx, pair.model, pair.stop_reason,
+            pair.usage.get("output_tokens", "?"),
+        )
+
+    async def record_partial_response(self, session: Session, pair: RequestResponsePair, raw_chunks: bytes):
+        """SSE 流中断时保存部分数据"""
+        partial_response = reassemble_sse_response(raw_chunks)
+        partial_response["_complete"] = False
+        await self.record_response_async(session, pair, partial_response)
+
+    def extract_incremental_messages(
+        self, prev_messages: List, curr_messages: List
+    ) -> List[Dict]:
+        """提取增量 messages — Claude Code 每次请求都重发完整历史
+
+        正确处理 context compaction 场景：compaction 后 messages 前缀会变化，
+        此时记录完整历史而非增量。
+        """
+        if not prev_messages:
+            return curr_messages
+
+        # compaction 或重置：当前 messages 数量 <= 上次
+        if len(curr_messages) <= len(prev_messages):
+            return curr_messages
+
+        # 前缀指纹校验（防止 compaction 后长度恰好更长的误判）
+        check_count = min(3, len(prev_messages))
+        prefix_match = all(
+            self._msg_hash(curr_messages[i]) == self._msg_hash(prev_messages[i])
+            for i in range(check_count)
+        )
+
+        if prefix_match:
+            return curr_messages[len(prev_messages):]
+        else:
+            # 前缀不匹配（compaction 后重新填充），记录完整历史
+            return curr_messages
+
+    @staticmethod
+    def _msg_hash(msg: Dict) -> str:
+        """计算单条 message 的内容指纹"""
+        key = f"{msg.get('role', '')}:{str(msg.get('content', ''))[:200]}"
+        return hashlib.md5(key.encode()).hexdigest()
+
+
+# ─────────────────────────────────────────────
+# 响应头过滤
+# ─────────────────────────────────────────────
+
+HOP_BY_HOP_REQUEST = {
+    "host", "content-length", "connection",
+    "keep-alive", "transfer-encoding", "upgrade",
+}
+
+HOP_BY_HOP_RESPONSE = {
+    "connection", "keep-alive", "transfer-encoding",
+    "upgrade", "content-encoding",  # aiohttp 自动解压，不透传
+}
+
+
+def _filter_response_headers(headers) -> Dict[str, str]:
+    return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP_RESPONSE}
+
+
+# ─────────────────────────────────────────────
+# 代理处理器
+# ─────────────────────────────────────────────
+
+async def handle_streaming(
+    request: web.Request,
+    upstream_resp: aiohttp.ClientResponse,
+    session: Session,
+    pair: RequestResponsePair,
+    collector: DataCollector,
+) -> web.StreamResponse:
+    """SSE Tee 模式：逐 chunk 立即转发 + 后台收集"""
+
+    response = web.StreamResponse(
+        status=upstream_resp.status,
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # 禁用 Nginx 缓冲
+        },
+    )
+    await response.prepare(request)
+
+    raw_chunks: List[bytes] = []
+    try:
+        async for chunk in upstream_resp.content.iter_any():
+            raw_chunks.append(chunk)
+            await response.write(chunk)  # 立即转发，零延迟
+    except (aiohttp.ClientPayloadError, ConnectionResetError) as e:
+        logger.warning("SSE 流中断: %s，保存部分数据", e)
+        if raw_chunks:
+            t = asyncio.create_task(
+                collector.record_partial_response(session, pair, b"".join(raw_chunks))
+            )
+            t.add_done_callback(_log_task_exception)
+        return response
+    finally:
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
+
+    # 流正常结束：重组 SSE 事件 → 异步记录
+    full_data = b"".join(raw_chunks)
+    complete_response = reassemble_sse_response(full_data)
+    t = asyncio.create_task(
+        collector.record_response_async(session, pair, complete_response)
+    )
+    t.add_done_callback(_log_task_exception)
+
+    return response
+
+
+async def proxy_handler(request: web.Request) -> web.StreamResponse:
+    """代理主处理器 — 支持流式和非流式两种模式"""
+
+    session_manager: SessionManager = request.app["session_manager"]
+    collector: DataCollector = request.app["collector"]
+    upstream_base: str = request.app["upstream_base"]
+
+    # 1. 读取请求体
+    body: bytes = b""
+    try:
+        body = await request.read()
+        request_body = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        request_body = {}
+
+    is_streaming = request_body.get("stream", False)
+
+    # 2. 会话匹配 + 记录请求
+    session = session_manager.match_session(request_body)
+    raw_headers = dict(request.headers)
+    pair = collector.record_request(session, request_body, raw_headers)
+
+    # 3. 构建上游请求头（透传原始 headers，去掉 hop-by-hop）
+    headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in HOP_BY_HOP_REQUEST
+    }
+
+    # 4. 构建上游 URL
+    upstream_url = f"{upstream_base}{request.path}"
+    if request.query_string:
+        upstream_url += f"?{request.query_string}"
+
+    # 5. 转发到上游（使用全局复用的 ClientSession）
+    client: aiohttp.ClientSession = request.app["upstream_session"]
+    try:
+        async with client.request(
+            request.method,
+            upstream_url,
+            headers=headers,
+            data=body,
+        ) as upstream_resp:
+
+            if is_streaming:
+                return await handle_streaming(request, upstream_resp, session, pair, collector)
+            else:
+                resp_body = await upstream_resp.read()
+                try:
+                    response_json = json.loads(resp_body)
+                except json.JSONDecodeError:
+                    response_json = {"_raw": resp_body.decode("utf-8", errors="replace")}
+
+                t = asyncio.create_task(
+                    collector.record_response_async(session, pair, response_json)
+                )
+                t.add_done_callback(_log_task_exception)
+
+                return web.Response(
+                    status=upstream_resp.status,
+                    headers=_filter_response_headers(upstream_resp.headers),
+                    body=resp_body,
+                )
+
+    except aiohttp.ClientError as e:
+        logger.error("上游连接失败: %s", e)
+        return web.Response(status=502, text=f"Upstream connection error: {e}")
+    except asyncio.TimeoutError:
+        logger.error("上游请求超时")
+        return web.Response(status=504, text="Upstream timeout")
+    except Exception as e:
+        logger.exception("代理内部错误")
+        return web.Response(status=500, text=f"Proxy error: {e}")
+
+
+# ─────────────────────────────────────────────
+# 内部路由：Hooks 回调
+# ─────────────────────────────────────────────
+
+async def handle_session_register(request: web.Request) -> web.Response:
+    """接收 Hooks 的 SessionStart 注册通知"""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.Response(status=400, text="invalid json")
+
+    session_id = data.get("session_id")
+    if not session_id:
+        return web.Response(status=400, text="missing session_id")
+
+    session_manager: SessionManager = request.app["session_manager"]
+    session_manager.register_session_from_hook(session_id, data)
+    return web.Response(status=200, text="ok")
+
+
+async def handle_session_event(request: web.Request) -> web.Response:
+    """接收 Hooks 的其他会话事件（SessionEnd 等）"""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.Response(status=400, text="invalid json")
+
+    session_id = data.get("session_id")
+    event = data.get("event")
+    logger.info("Hook 事件: %s session=%s", event, (session_id or "")[:8])
+
+    # SessionEnd：触发会话超时清理（简单实现，后续阶段扩展为轨迹导出）
+    if event == "end" and session_id:
+        session_manager: SessionManager = request.app["session_manager"]
+        if session_id in session_manager.active_sessions:
+            session = session_manager.active_sessions[session_id]
+            logger.info(
+                "会话结束: %s | API 调用=%d 次",
+                session_id[:8], len(session.pairs),
+            )
+
+    return web.Response(status=200, text="ok")
+
+
+# ─────────────────────────────────────────────
+# 应用工厂
+# ─────────────────────────────────────────────
+
+async def create_app(
+    upstream_base: str,
+    output_dir: Path,
+    session_timeout: int,
+) -> web.Application:
+    app = web.Application()
+
+    # 共享状态
+    app["upstream_base"] = upstream_base.rstrip("/")
+    app["session_manager"] = SessionManager(session_timeout=session_timeout)
+    app["collector"] = DataCollector(output_dir)
+
+    # 应用启动时创建全局 ClientSession（连接池复用）
+    async def on_startup(app):
+        app["upstream_session"] = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=300, sock_read=300),
+        )
+        logger.info("ClientSession 已创建（连接池复用）")
+
+    # 应用关闭时销毁 ClientSession
+    async def on_cleanup(app):
+        await app["upstream_session"].close()
+        logger.info("ClientSession 已关闭")
+
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+
+    # 内部路由（优先注册，避免被通配符覆盖）
+    app.router.add_post("/_internal/session-register", handle_session_register)
+    app.router.add_post("/_internal/session-event", handle_session_event)
+
+    # 通配符路由：透传所有请求
+    app.router.add_route("*", "/{path:.*}", proxy_handler)
+
+    return app
+
+
+# ─────────────────────────────────────────────
+# CLI 入口
+# ─────────────────────────────────────────────
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="claude-trace — Claude Code HTTP 代理 + 轨迹采集",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--port", type=int, default=4000, help="代理监听端口")
+    parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1，防止局域网访问）")
+    parser.add_argument("--output", default="./trajectories", help="轨迹数据输出目录")
+    parser.add_argument(
+        "--upstream",
+        default="https://api.anthropic.com",
+        help="上游 API 地址",
+    )
+    parser.add_argument("--session-timeout", type=int, default=300, help="会话超时时间（秒）")
+    parser.add_argument("--verbose", action="store_true", help="详细日志输出")
+    return parser.parse_args()
+
+
+async def main():
+    args = parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    app = await create_app(
+        upstream_base=args.upstream,
+        output_dir=output_dir,
+        session_timeout=args.session_timeout,
+    )
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, args.host, args.port)
+    await site.start()
+
+    logger.info("=" * 50)
+    logger.info("claude-trace 代理已启动")
+    logger.info("监听地址: http://%s:%d", args.host, args.port)
+    logger.info("上游 API:  %s", args.upstream)
+    logger.info("输出目录:  %s", output_dir.resolve())
+    logger.info("=" * 50)
+    logger.info("启动 Claude Code：")
+    logger.info("  ANTHROPIC_BASE_URL=http://%s:%d claude", args.host, args.port)
+    logger.info("=" * 50)
+
+    # 定期清理超时会话
+    session_manager: SessionManager = app["session_manager"]
+
+    async def cleanup_loop():
+        while True:
+            await asyncio.sleep(60)
+            session_manager.cleanup_expired()
+
+    cleanup_task = asyncio.create_task(cleanup_loop())
+    cleanup_task.add_done_callback(_log_task_exception)
+
+    try:
+        # 等待直到 Ctrl+C
+        await asyncio.Event().wait()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        cleanup_task.cancel()
+        await runner.cleanup()
+        logger.info("代理已停止，数据保存在: %s", output_dir.resolve())
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
