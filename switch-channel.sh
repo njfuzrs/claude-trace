@@ -16,6 +16,7 @@ CONFIG="$SCRIPT_DIR/channels.json"
 SETTINGS="$HOME/.claude/settings.json"
 PLIST="$HOME/Library/LaunchAgents/com.claude-trace.proxy.plist"
 LABEL="com.claude-trace.proxy"
+PORT="${PORT:-4000}"
 
 # 检查配置文件
 if [ ! -f "$CONFIG" ]; then
@@ -147,12 +148,31 @@ with open(path, "wb") as f:
 print("  ✅ plist 已更新")
 PYEOF
 
-        # 3. 重启代理
+        # 3. 重启代理（unload+load 让 plist 新环境变量生效）
+        #    先停掉旧服务和进程，再重新加载
+        local was_running=false
         if launchctl list "$LABEL" &>/dev/null; then
-            launchctl kickstart -k "gui/$(id -u)/$LABEL" &>/dev/null
-            echo "  ✅ 代理已重启"
+            was_running=true
+            launchctl unload "$PLIST" 2>/dev/null || true
+        fi
+
+        # 确保端口释放（unload 可能不会立即杀掉 Python 子进程）
+        local proxy_pid
+        proxy_pid=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+        if [ -n "$proxy_pid" ]; then
+            kill "$proxy_pid" 2>/dev/null
+            for i in 1 2 3; do
+                lsof -ti tcp:"$PORT" -sTCP:LISTEN &>/dev/null || break
+                sleep 1
+            done
+        fi
+
+        # 重新加载 plist 并启动
+        launchctl load "$PLIST" 2>/dev/null
+        if launchctl list "$LABEL" &>/dev/null; then
+            echo "  ✅ 代理已重启（plist 已重新加载）"
         else
-            echo "  ⚠️  代理未运行，执行 ./install-daemon.sh install 启动"
+            echo "  ❌ 代理启动失败，请检查: tail /tmp/claude-trace-proxy.log"
         fi
     else
         echo "  ⚠️  plist 不存在，执行 UPSTREAM=$UPSTREAM FORCE_THINKING=$FORCE_THINKING ./install-daemon.sh install"
