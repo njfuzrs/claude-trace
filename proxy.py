@@ -96,6 +96,39 @@ def _msg_hash(msg: Dict) -> str:
     return hashlib.md5(key.encode()).hexdigest()
 
 
+def _normalize_model(model: str) -> str:
+    """标准化模型名称，去掉 context window 后缀和日期后缀，用于模糊匹配。
+
+    Hook 注册的 model 可能带 context window 后缀（如 'claude-opus-4-6[1m]'），
+    API 请求的 model 可能带日期后缀（如 'claude-haiku-4-5-20251001'）。
+    标准化为基础名称以支持匹配。
+
+    示例：
+      'claude-opus-4-6[1m]'       → 'claude-opus-4-6'
+      'claude-opus-4-6'           → 'claude-opus-4-6'
+      'claude-haiku-4-5-20251001' → 'claude-haiku-4-5'
+      'claude-sonnet-4-6'         → 'claude-sonnet-4-6'
+    """
+    if not model:
+        return ""
+    # 去掉 [...] 后缀（context window 标记）
+    base = model.split("[")[0]
+    # 去掉日期后缀（-YYYYMMDD 格式）
+    base = re.sub(r"-\d{8}$", "", base)
+    return base
+
+
+def _models_match(model_a: str, model_b: str) -> bool:
+    """判断两个模型名是否指向同一个模型系列。
+
+    支持 Hook 注册的 'claude-opus-4-6[1m]' 与 API 请求的 'claude-opus-4-6' 匹配，
+    以及 'claude-haiku-4-5-20251001' 与 'claude-haiku-4-5' 匹配。
+    """
+    if not model_a or not model_b:
+        return False
+    return _normalize_model(model_a) == _normalize_model(model_b)
+
+
 # ─────────────────────────────────────────────
 # 数据结构
 # ─────────────────────────────────────────────
@@ -196,23 +229,25 @@ class SessionManager:
         return match.group(1) if match else ""
 
     def match_session(self, request_body: Dict) -> Session:
-        """双通道会话匹配"""
+        """双通道会话匹配
 
-        # 策略 1：Hooks 注册的 pending 队列（确定性关联）
-        if len(self._pending_sessions) == 1:
-            session_id, metadata = next(iter(self._pending_sessions.items()))
-            return self._create_session_from_pending(session_id, metadata, "Hook 单实例")
+        修复：
+        - 策略 1 不再无条件消费单 pending，始终校验 model 匹配
+        - model 匹配改为模糊匹配（_models_match），支持 Hook 的 'claude-opus-4-6[1m]'
+          与 API 的 'claude-opus-4-6' 匹配
+        - 策略 2 增加 model 一致性校验，防止 sub-agent 请求匹配到主 agent session
+        """
+        request_model = request_body.get("model", "")
 
-        # P1 #6: 多个 pending 时，用 model + cwd 联合匹配，避免同 model 误关联
+        # 策略 1：Hooks 注册的 pending 队列（model 匹配关联）
         if self._pending_sessions:
-            request_model = request_body.get("model", "")
             # 尝试从请求的 system prompt 中提取 cwd 信息进行联合匹配
             request_cwd = self._extract_cwd_from_request(request_body)
 
-            # 先尝试 model 精确匹配
+            # model 模糊匹配（支持 Hook 的 [1m] 后缀和 API 的日期后缀）
             model_matches = [
                 (sid, meta) for sid, meta in self._pending_sessions.items()
-                if meta.get("model") == request_model
+                if _models_match(meta.get("model", ""), request_model)
             ]
             if len(model_matches) == 1:
                 sid, metadata = model_matches[0]
@@ -236,8 +271,21 @@ class SessionManager:
                 sid, metadata = model_matches[0]
                 return self._create_session_from_pending(sid, metadata, "Hook FIFO 兜底")
 
-        # 策略 2：对话内容连续性匹配（Hooks 未配置时的兜底）
+            # model 不匹配任何 pending（sub-agent 请求），不消费 pending，继续往下走
+            if self._pending_sessions:
+                logger.debug(
+                    "请求 model=%s 不匹配任何 pending session，跳过 pending 队列",
+                    request_model,
+                )
+
+        # 策略 2：已有活跃会话的对话内容连续性匹配
+        # 优先匹配 model 一致的 session，防止 sub-agent 请求匹配到主 agent session
         messages = request_body.get("messages", [])
+        for session in self.active_sessions.values():
+            if _models_match(session.model, request_model) and session.is_continuation(messages):
+                session.update_activity()
+                return session
+        # model 不一致也尝试匹配（兼容 Hooks 未配置时的场景）
         for session in self.active_sessions.values():
             if session.is_continuation(messages):
                 session.update_activity()
@@ -247,7 +295,7 @@ class SessionManager:
         sid = str(uuid.uuid4())
         session = Session(id=sid, model=request_body.get("model", ""))
         self.active_sessions[sid] = session
-        logger.info("新建会话（兜底）: %s", sid[:8])
+        logger.info("新建会话（兜底）: %s model=%s", sid[:8], request_model)
         return session
 
     async def cleanup_expired(self, collector: Optional["DataCollector"] = None):
