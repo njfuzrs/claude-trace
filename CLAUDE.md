@@ -43,6 +43,9 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 ├── start.sh            # 一键启动脚本（代理 + Claude Code 生命周期绑定）
 ├── proxy-daemon.sh     # 守护进程脚本（自动重启循环）
 ├── install-daemon.sh   # 安装/卸载 launchd 自启动服务（macOS）
+├── switch-channel.sh   # 快速切换 API 渠道（token + 上游）
+├── channels.json       # 渠道配置文件（含 token，已加入 .gitignore）
+├── channels.json.example  # 渠道配置模板（可提交）
 ├── trajectories/
 │   ├── raw/            # 原始请求/响应数据
 │   └── traj/           # 构建好的 .traj 文件
@@ -78,6 +81,39 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 - 安全：API Key 自动脱敏，代理默认绑定 127.0.0.1
 - 代理使用 SSE Tee 模式，零延迟转发 + 后台记录，不影响 Claude Code 正常使用
 
+## 渠道管理
+
+多个 API 渠道（token + 上游地址）通过 `channels.json` 统一管理，使用 `switch-channel.sh` 一键切换：
+
+```bash
+./switch-channel.sh list       # 列出所有渠道
+./switch-channel.sh company    # 切换到公司渠道
+./switch-channel.sh monthly    # 切换到个人月卡
+./switch-channel.sh status     # 查看当前渠道
+```
+
+切换时会同步更新：
+1. `~/.claude/settings.json` 的 `ANTHROPIC_AUTH_TOKEN` 和 `ANTHROPIC_BASE_URL`（固定指向代理）
+2. launchd plist 的 `UPSTREAM` 和 `FORCE_THINKING`
+3. 自动重启代理使配置生效
+
+新增渠道只需编辑 `channels.json`，无需修改脚本：
+
+```json
+{
+  "channels": {
+    "my-channel": {
+      "name": "渠道名称",
+      "token": "sk-xxx",
+      "upstream": "https://your-api.example.com",
+      "force_thinking": 0
+    }
+  }
+}
+```
+
+> `channels.json` 含有 API Key，已加入 `.gitignore`，不会提交到 git。初始化时复制 `channels.json.example` 并填写真实值。
+
 ## 常用命令
 
 ```bash
@@ -86,6 +122,10 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 ./install-daemon.sh status          # 查看服务状态
 ./install-daemon.sh restart         # 重启服务
 ./install-daemon.sh uninstall       # 卸载服务
+
+# 渠道切换
+./switch-channel.sh list            # 列出所有渠道
+./switch-channel.sh <渠道名>        # 切换渠道（同步更新 token + 代理上游）
 
 # 一键启动（代理 + Claude Code 生命周期绑定，适合临时使用）
 ./start.sh

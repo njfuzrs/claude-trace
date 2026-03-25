@@ -1,0 +1,16 @@
+{
+  "channels": {
+    "company": {
+      "name": "公司渠道",
+      "token": "sk-xxx",
+      "upstream": "https://your-company-api.example.com",
+      "force_thinking": 0
+    },
+    "monthly": {
+      "name": "个人月卡",
+      "token": "sk-xxx",
+      "upstream": "https://api.anthropic.com",
+      "force_thinking": 1
+    }
+  }
+}

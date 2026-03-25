@@ -16,6 +16,7 @@ Claude Code 轨迹采集工具。通过 HTTP 代理 + Hooks 双通道采集 Clau
   - [代理参数](#代理参数)
   - [Hooks 配置](#hooks-配置)
   - [第三方 API 代理](#第三方-api-代理)
+- [渠道管理](#渠道管理)
 - [数据目录结构](#数据目录结构)
 - [数据处理管道](#数据处理管道)
   - [第一步：过滤](#第一步过滤)
@@ -279,6 +280,46 @@ UPSTREAM=https://your-proxy.com ./start.sh
 
 ---
 
+## 渠道管理
+
+如果你需要在多个 API 渠道（公司账号、个人月卡等）之间切换，使用 `switch-channel.sh` 一键完成：
+
+```bash
+./switch-channel.sh list       # 列出所有可用渠道
+./switch-channel.sh company    # 切换到公司渠道
+./switch-channel.sh monthly    # 切换到个人月卡
+./switch-channel.sh status     # 查看当前渠道
+```
+
+切换时会同时更新：`ANTHROPIC_AUTH_TOKEN`（token）、代理上游地址（`UPSTREAM`）、`FORCE_THINKING` 参数，并自动重启代理。
+
+**渠道配置文件 `channels.json`**（复制 `channels.json.example` 创建）：
+
+```json
+{
+  "channels": {
+    "company": {
+      "name": "公司渠道",
+      "token": "sk-xxx",
+      "upstream": "https://your-company-api.example.com",
+      "force_thinking": 0
+    },
+    "monthly": {
+      "name": "个人月卡",
+      "token": "sk-xxx",
+      "upstream": "https://api.anthropic.com",
+      "force_thinking": 1
+    }
+  }
+}
+```
+
+新增渠道只需在 `channels.json` 中添加 key，无需修改任何脚本。
+
+> `channels.json` 含有 API Key，已加入 `.gitignore`，不会提交到 git。
+
+---
+
 ## 数据目录结构
 
 ```
@@ -434,6 +475,9 @@ python3 merger.py --all \
 | `start.sh` | 一键启动脚本 |
 | `proxy-daemon.sh` | 自动重启的守护进程脚本 |
 | `install-daemon.sh` | 安装/卸载 launchd 自启动服务（macOS） |
+| `switch-channel.sh` | 快速切换 API 渠道（同步更新 token + 代理上游） |
+| `channels.json` | 渠道配置文件，含 token/upstream/force_thinking（已加入 .gitignore） |
+| `channels.json.example` | 渠道配置模板，可提交到 git |
 | `viewer.py` | 轨迹数据 HTML 查看器，将 .traj 转为可视化 HTML |
 
 ---

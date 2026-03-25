@@ -4,3 +4,4 @@ __pycache__/
 trajectories/
 *.traj
 .env
+channels.json
