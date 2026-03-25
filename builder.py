@@ -62,8 +62,15 @@ _MODEL_PRICING: Dict[str, Dict[str, float]] = {
 }
 
 
-def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """根据模型和 token 用量估算成本（USD）"""
+def _estimate_cost(
+    model: str, input_tokens: int, output_tokens: int,
+    cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
+) -> float:
+    """根据模型和 token 用量估算成本（USD）
+
+    Fix 6: 加入 cache token 定价。
+    Anthropic cache_read 是 input 价格的 10%，cache_creation 是 input 价格的 25%。
+    """
     if not model:
         return 0.0
     # 模糊匹配模型名（claude-sonnet-4-20250514 → claude-sonnet-4）
@@ -74,7 +81,10 @@ def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
             break
     if not pricing:
         return 0.0
-    return (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
+    base_cost = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
+    cache_read_cost = cache_read_tokens * pricing["input"] * 0.1 / 1_000_000
+    cache_creation_cost = cache_creation_tokens * pricing["input"] * 0.25 / 1_000_000
+    return base_cost + cache_read_cost + cache_creation_cost
 
 
 def _extract_claude_md_hash(request_body: Dict) -> str:
@@ -138,6 +148,8 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
     history = []
     total_input_tokens = 0
     total_output_tokens = 0
+    total_cache_read_tokens = 0
+    total_cache_creation_tokens = 0
     tools_used = set()
     files_edited = set()
     has_thinking = False
@@ -153,6 +165,8 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
 
         total_input_tokens += usage.get("input_tokens", 0)
         total_output_tokens += usage.get("output_tokens", 0)
+        total_cache_read_tokens += usage.get("cache_read_input_tokens", 0)
+        total_cache_creation_tokens += usage.get("cache_creation_input_tokens", 0)
 
         # ── P2 #17: history 记录 system + user messages（首次请求） ──
         if pair_idx == 0:
@@ -280,6 +294,17 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
                     "agent": "primary",
                     "tool_call_ids": [tool_use_id],
                 })
+            else:
+                # Fix 3: 标记 orphan tool_use（会话中断或 sub-agent 导致的 tool_result 丢失）
+                trajectory.append({
+                    "message_type": "observation",
+                    "role": "user",
+                    "content": "[tool_result not found - session may have ended mid-execution]",
+                    "agent": "primary",
+                    "is_error": False,
+                    "tool_use_id": tool_use_id,
+                    "_orphan": True,
+                })
 
         # ── final_answer（end_turn + 有文本回复 + 无工具调用） ──
         # P1 #9: 只在纯文本回复时生成 final_answer，避免与 tool_use action 重复
@@ -299,7 +324,10 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
     metadata.total_api_calls = len(pairs)
     metadata.total_tokens_sent = total_input_tokens
     metadata.total_tokens_received = total_output_tokens
-    metadata.total_cost_usd = _estimate_cost(metadata.model, total_input_tokens, total_output_tokens)
+    metadata.total_cost_usd = _estimate_cost(
+        metadata.model, total_input_tokens, total_output_tokens,
+        total_cache_read_tokens, total_cache_creation_tokens,
+    )
     metadata.tools_used = sorted(tools_used)
     metadata.files_edited = sorted(files_edited)
     metadata.step_count = len(trajectory)
@@ -322,6 +350,8 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
             "model_stats": {
                 "tokens_sent": total_input_tokens,
                 "tokens_received": total_output_tokens,
+                "cache_read_tokens": total_cache_read_tokens,
+                "cache_creation_tokens": total_cache_creation_tokens,
                 "api_calls": len(pairs),
                 "total_cost_usd": metadata.total_cost_usd,
             },
@@ -337,6 +367,9 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
             "total_api_calls": metadata.total_api_calls,
             "total_tokens_sent": total_input_tokens,
             "total_tokens_received": total_output_tokens,
+            "total_cache_read_tokens": total_cache_read_tokens,
+            "total_cache_creation_tokens": total_cache_creation_tokens,
+            "total_tokens": total_input_tokens + total_output_tokens + total_cache_read_tokens + total_cache_creation_tokens,
             "total_cost_usd": metadata.total_cost_usd,
             "exit_status": metadata.exit_status,
             "tools_used": metadata.tools_used,

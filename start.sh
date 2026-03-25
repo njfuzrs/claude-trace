@@ -5,6 +5,7 @@
 #   ./start.sh                    # 默认端口 4000
 #   ./start.sh --port 5000        # 自定义端口
 #   ./start.sh --proxy-only       # 仅启动代理，不启动 Claude Code
+#   ./start.sh --force-thinking 10000  # 强制每次请求产生 thinking blocks
 
 set -euo pipefail
 
@@ -12,6 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PORT="${PORT:-4000}"
 OUTPUT="${OUTPUT:-./trajectories}"
 UPSTREAM="${UPSTREAM:-https://api.anthropic.com}"
+FORCE_THINKING="${FORCE_THINKING:-0}"
 PROXY_ONLY=false
 PROXY_PID=""
 
@@ -33,6 +35,7 @@ while [[ $# -gt 0 ]]; do
         --port) PORT="$2"; shift 2 ;;
         --output) OUTPUT="$2"; shift 2 ;;
         --upstream) UPSTREAM="$2"; shift 2 ;;
+        --force-thinking) FORCE_THINKING="$2"; shift 2 ;;
         --proxy-only) PROXY_ONLY=true; shift ;;
         --) shift; CLAUDE_ARGS=("$@"); break ;;
         *) echo "未知参数: $1 (用 -- 分隔传给 claude 的参数)"; exit 1 ;;
@@ -74,10 +77,10 @@ export CLAUDE_PROXY_PORT="$PORT"
 
 if [ "$PROXY_ONLY" = true ]; then
     # 前台运行代理
-    exec python3 "$SCRIPT_DIR/proxy.py" --port "$PORT" --output "$OUTPUT" --upstream "$UPSTREAM"
+    exec python3 "$SCRIPT_DIR/proxy.py" --port "$PORT" --output "$OUTPUT" --upstream "$UPSTREAM" --force-thinking "$FORCE_THINKING"
 else
     # 后台运行代理
-    python3 "$SCRIPT_DIR/proxy.py" --port "$PORT" --output "$OUTPUT" --upstream "$UPSTREAM" &
+    python3 "$SCRIPT_DIR/proxy.py" --port "$PORT" --output "$OUTPUT" --upstream "$UPSTREAM" --force-thinking "$FORCE_THINKING" &
     PROXY_PID=$!
     echo "代理 PID: $PROXY_PID"
 

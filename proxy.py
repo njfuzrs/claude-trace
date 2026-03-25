@@ -406,11 +406,12 @@ def reassemble_sse_response(raw_data: bytes) -> Dict:
 # ─────────────────────────────────────────────
 
 class DataCollector:
-    def __init__(self, output_dir: Path, save_raw: bool = True):
+    def __init__(self, output_dir: Path, save_raw: bool = True, events_dir: Optional[Path] = None):
         self.output_dir = output_dir
         self.raw_dir = output_dir / "raw"
         self.traj_dir = output_dir / "traj"
         self.save_raw = save_raw  # P2 #18: 控制是否保存原始 JSON 文件
+        self.events_dir = events_dir or (Path.home() / ".claude" / "trajectory_events")
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.traj_dir.mkdir(parents=True, exist_ok=True)
 
@@ -425,6 +426,12 @@ class DataCollector:
         new_messages = self._extract_incremental_messages(
             session.prev_msg_hashes, session.prev_msg_count, curr_messages,
         )
+
+        # Fix 2: Hook 注册时 model 可能为 None（Claude Code SessionStart 不传 model），
+        # 从首次 API 请求的 request_body 中补全
+        if not session.model and request_body.get("model"):
+            session.model = request_body["model"]
+            logger.info("从 API 请求补全 model: %s (session=%s)", session.model, session.id[:8])
 
         # P0 #1: 在 append 之前分配序号。
         # 安全假设：record_request 是同步方法，aiohttp 单线程事件循环中
@@ -489,6 +496,8 @@ class DataCollector:
     def _build_traj_data(self, session: Session, pairs_snapshot: List[RequestResponsePair]) -> tuple:
         """公共方法：构建 traj 数据和目标路径，消除三处重复逻辑。
 
+        Fix 1: 读取 hook events JSONL 丰富 metadata（user_prompts/compactions/subagent_spans）。
+
         Returns:
             (traj_path, traj_dict) 或在异常时返回 (None, None)
         """
@@ -500,6 +509,37 @@ class DataCollector:
                 working_directory=session.cwd,
                 start_source=session.source,
             )
+
+            # Fix 1: 从 hook events JSONL 读取语义事件，丰富 metadata
+            events_file = self.events_dir / f"{session.id}.jsonl"
+            if events_file.exists():
+                try:
+                    hook_events = []
+                    for line in events_file.read_text().splitlines():
+                        if line.strip():
+                            try:
+                                hook_events.append(json.loads(line))
+                            except json.JSONDecodeError:
+                                pass
+                    metadata.user_prompts = [
+                        e["prompt"] for e in hook_events
+                        if e.get("event") == "UserPromptSubmit" and "prompt" in e
+                    ]
+                    metadata.compactions = [
+                        e for e in hook_events if e.get("event") == "PostCompact"
+                    ]
+                    metadata.subagent_spans = [
+                        e for e in hook_events
+                        if e.get("event") in ("SubagentStart", "SubagentStop")
+                    ]
+                    metadata.has_sub_agent = len(metadata.subagent_spans) > 0
+                    session_end = next(
+                        (e for e in hook_events if e.get("event") == "SessionEnd"), {}
+                    )
+                    metadata.end_source = session_end.get("source", "")
+                except Exception as e:
+                    logger.debug("读取 hook events 失败: %s", e)
+
             traj = build_trajectory(session.id, pairs_snapshot, metadata)
             traj_path = self.traj_dir / f"{session.id}.traj"
             return traj_path, traj
@@ -646,9 +686,26 @@ class DataCollector:
 
         if prefix_match:
             return curr_messages[prev_count:]
-        else:
-            # 前缀不匹配（compaction 后重新填充），记录完整历史
-            return curr_messages
+
+        # Fix 5: 前缀不匹配时，再检查尾部是否包含上次的最后几条。
+        # 新 turn 开始时 Claude Code 可能在 messages 前面插入 system reminder 等内容，
+        # 导致前缀变化，但尾部仍然包含上次的历史。这不是 compaction。
+        tail_check = min(3, prev_count)
+        if tail_check > 0 and len(curr_messages) > prev_count:
+            try:
+                tail_match = all(
+                    _msg_hash(curr_messages[len(curr_messages) - prev_count + prev_count - tail_check + i])
+                    == prev_hashes[prev_count - tail_check + i]
+                    for i in range(tail_check)
+                )
+                if tail_match:
+                    # 尾部匹配，说明前面插入了新内容，取尾部新增部分
+                    return curr_messages[prev_count:]
+            except (IndexError, KeyError):
+                pass
+
+        # 真正的 compaction 或历史重写，记录完整历史
+        return curr_messages
 
 
 # ─────────────────────────────────────────────
@@ -794,6 +851,30 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
 
     is_streaming = request_body.get("stream", False)
 
+    # Force thinking: 将 adaptive thinking 改写为 effort=max，
+    # 提高 thinking blocks 的产生概率（但不保证 100%）。
+    #
+    # ⚠️ 不能改写为 type=enabled + budget_tokens，原因：
+    #   1. Claude Code 按 adaptive 模式管理对话历史，不保证保留 thinking blocks，
+    #      而 enabled 模式要求历史中的 thinking blocks 原样保留，否则 API 返回 400。
+    #      参见 https://github.com/anthropics/claude-code/issues/14264
+    #   2. type=enabled 在 Opus 4.6 上已 deprecated，随时可能被移除。
+    #   3. 每次请求强制消耗 budget_tokens 个 thinking tokens，成本大幅增加。
+    #
+    # 安全方案：改写 thinking.effort 为 "max"（仅 Opus 4.6 支持），
+    # 这是 adaptive 模式内部的参数，不改变 type，不破坏对话历史兼容性。
+    force_thinking: int = request.app.get("force_thinking", 0)
+    body_rewritten = False
+    if force_thinking > 0 and request_body.get("thinking"):
+        original_thinking = request_body["thinking"]
+        if original_thinking.get("type") == "adaptive":
+            request_body["thinking"] = {
+                "type": "adaptive",
+                "effort": "max",
+            }
+            body_rewritten = True
+            logger.debug("thinking 改写: adaptive → adaptive/effort=max")
+
     # 2. 会话匹配 + 记录请求
     session = session_manager.match_session(request_body)
     raw_headers = dict(request.headers)
@@ -811,13 +892,15 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
         upstream_url += f"?{request.query_string}"
 
     # 5. 转发到上游（使用全局复用的 ClientSession）
+    # 如果 thinking 被改写，需要用修改后的 request_body 重新序列化
+    upstream_body = json.dumps(request_body).encode() if body_rewritten else body
     client: aiohttp.ClientSession = request.app["upstream_session"]
     try:
         async with client.request(
             request.method,
             upstream_url,
             headers=headers,
-            data=body,
+            data=upstream_body,
         ) as upstream_resp:
 
             if is_streaming:
@@ -923,13 +1006,16 @@ async def create_app(
     output_dir: Path,
     session_timeout: int,
     save_raw: bool = True,
+    events_dir: Optional[Path] = None,
+    force_thinking: int = 0,
 ) -> web.Application:
     app = web.Application()
 
     # 共享状态
     app["upstream_base"] = upstream_base.rstrip("/")
     app["session_manager"] = SessionManager(session_timeout=session_timeout)
-    app["collector"] = DataCollector(output_dir, save_raw=save_raw)
+    app["collector"] = DataCollector(output_dir, save_raw=save_raw, events_dir=events_dir)
+    app["force_thinking"] = force_thinking
 
     # 应用启动时创建全局 ClientSession（连接池复用）
     async def on_startup(app):
@@ -975,8 +1061,19 @@ def parse_args():
         help="上游 API 地址",
     )
     parser.add_argument("--session-timeout", type=int, default=300, help="会话超时时间（秒）")
+    parser.add_argument(
+        "--events-dir",
+        default=str(Path.home() / ".claude" / "trajectory_events"),
+        help="Hooks 事件数据目录",
+    )
     parser.add_argument("--save-raw", action="store_true", default=True, help="保存原始请求/响应 JSON 文件")
     parser.add_argument("--no-save-raw", dest="save_raw", action="store_false", help="不保存原始请求/响应 JSON 文件（只保留 JSONL + .traj）")
+    parser.add_argument(
+        "--force-thinking", type=int, default=0, metavar="BUDGET",
+        help="强制提高 thinking blocks 产生概率。设为非 0 值时，将 adaptive thinking 的 effort 改写为 max。"
+             "effort=max 是 Opus 4.6 独有的最高档，比 high 更激进地触发 thinking。"
+             "注意：这不保证 100%% 产生 thinking blocks，但显著提高概率。设为 0 表示不改写（默认）。",
+    )
     parser.add_argument("--verbose", action="store_true", help="详细日志输出")
     return parser.parse_args()
 
@@ -995,6 +1092,8 @@ async def main():
         output_dir=output_dir,
         session_timeout=args.session_timeout,
         save_raw=args.save_raw,
+        events_dir=Path(args.events_dir),
+        force_thinking=args.force_thinking,
     )
 
     runner = web.AppRunner(app)
@@ -1007,6 +1106,8 @@ async def main():
     logger.info("监听地址: http://%s:%d", args.host, args.port)
     logger.info("上游 API:  %s", args.upstream)
     logger.info("输出目录:  %s", output_dir.resolve())
+    if args.force_thinking:
+        logger.info("强制 thinking: effort=max (adaptive 模式内提升)")
     logger.info("=" * 50)
     logger.info("启动 Claude Code：")
     logger.info("  ANTHROPIC_BASE_URL=http://%s:%d claude", args.host, args.port)
