@@ -33,15 +33,35 @@ _CSS = """
   --error-bg: #2d1215; --error-border: #f85149;
   --meta-bg: #161b22; --accent: #58a6ff; --accent2: #3fb950;
   --code-bg: #1a1e24;
+  --timeline-line: #21262d; --timeline-dot: #30363d;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
-       background: var(--bg); color: var(--fg); line-height: 1.6;
-       max-width: 960px; margin: 0 auto; padding: 16px; }
+       background: var(--bg); color: var(--fg); line-height: 1.6; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
-/* 元信息卡片 */
+/* ── 整体布局 ── */
+.page-layout { display: flex; min-height: 100vh; }
+.sidebar { width: 220px; position: fixed; top: 0; left: 0; height: 100vh;
+           background: var(--meta-bg); border-right: 1px solid var(--border);
+           overflow-y: auto; padding: 12px 0; z-index: 200; font-size: 12px; }
+.sidebar .sid { padding: 8px 14px; color: var(--accent); font-weight: 600;
+                font-size: 13px; border-bottom: 1px solid var(--border); margin-bottom: 6px; }
+.sidebar .nav-section { padding: 4px 14px; color: var(--system-fg); font-size: 10px;
+                        text-transform: uppercase; letter-spacing: 0.5px; margin-top: 10px; }
+.sidebar .nav-item { display: block; padding: 4px 14px; color: var(--fg);
+                     text-decoration: none; border-left: 2px solid transparent;
+                     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sidebar .nav-item:hover { background: rgba(255,255,255,0.04); }
+.sidebar .nav-item.active { border-left-color: var(--accent); color: var(--accent); background: rgba(88,166,255,0.06); }
+.sidebar .nav-item.nav-user { color: var(--user-border); font-weight: 500; }
+.sidebar .nav-item.nav-step { color: var(--system-fg); padding-left: 22px; font-size: 11px; }
+.sidebar .nav-item .nav-badge { display: inline-block; background: var(--tool-bg); border: 1px solid var(--border);
+                                border-radius: 3px; padding: 0 4px; font-size: 10px; margin-left: 4px; color: var(--system-fg); }
+.main-content { margin-left: 220px; max-width: 900px; padding: 16px 24px; flex: 1; }
+
+/* ── 元信息卡片 ── */
 .meta-card { background: var(--meta-bg); border: 1px solid var(--border);
              border-radius: 8px; padding: 16px; margin-bottom: 20px; }
 .meta-card h1 { font-size: 18px; margin-bottom: 8px; color: var(--accent); }
@@ -53,7 +73,7 @@ a:hover { text-decoration: underline; }
 .tools-list span { background: var(--tool-bg); border: 1px solid var(--border);
                    border-radius: 4px; padding: 1px 6px; margin: 2px; display: inline-block; }
 
-/* 搜索栏 */
+/* ── 搜索栏 ── */
 .search-bar { position: sticky; top: 0; z-index: 100; background: var(--bg);
               padding: 8px 0; margin-bottom: 12px; border-bottom: 1px solid var(--border); }
 .search-bar input { width: 100%; padding: 8px 12px; background: var(--meta-bg);
@@ -62,90 +82,170 @@ a:hover { text-decoration: underline; }
 .search-bar input:focus { border-color: var(--accent); }
 .search-bar .stats { font-size: 12px; color: var(--system-fg); margin-top: 4px; }
 
-/* 消息气泡 */
-.msg { margin: 6px 0; padding: 10px 14px; border-radius: 8px;
-       border-left: 3px solid transparent; position: relative; }
-.msg-system { background: var(--system-bg); border-left-color: var(--system-fg);
-              color: var(--system-fg); font-size: 12px; }
-.msg-user { background: var(--user-bg); border-left-color: var(--user-border); }
-.msg-assistant { background: var(--assistant-bg); border-left-color: var(--assistant-border); }
-.msg-error { background: var(--error-bg); border-left-color: var(--error-border); }
+/* ── 时间线 ── */
+.timeline { position: relative; padding-left: 28px; }
+.timeline::before { content: ''; position: absolute; left: 9px; top: 0; bottom: 0;
+                    width: 2px; background: var(--timeline-line); }
 
-.msg-label { font-size: 11px; font-weight: 600; text-transform: uppercase;
-             letter-spacing: 0.5px; margin-bottom: 4px; }
-.msg-system .msg-label { color: var(--system-fg); }
-.msg-user .msg-label { color: var(--user-border); }
-.msg-assistant .msg-label { color: var(--assistant-border); }
-.msg-assistant .msg-label .turn-num { color: var(--system-fg); font-weight: normal; }
-.msg-ts { font-size: 10px; color: var(--system-fg); float: right; }
+/* 时间线节点 */
+.tl-node { position: relative; margin: 0 0 2px 0; }
+.tl-node::before { content: ''; position: absolute; left: -23px; top: 14px;
+                   width: 10px; height: 10px; border-radius: 50%;
+                   background: var(--timeline-dot); border: 2px solid var(--bg); z-index: 1; }
 
-/* 文本内容 */
+/* ── 用户输入节点 ── */
+.tl-user { margin: 20px 0 12px 0; }
+.tl-user::before { background: var(--user-border); width: 12px; height: 12px; left: -24px; top: 12px; }
+.tl-user-card { background: var(--user-bg); border: 1px solid rgba(31,111,235,0.3);
+                border-radius: 8px; padding: 12px 16px; }
+.tl-user-card .tl-label { font-size: 11px; font-weight: 600; text-transform: uppercase;
+                          color: var(--user-border); letter-spacing: 0.5px; margin-bottom: 4px; }
+.tl-user-card .tl-label .tl-ts { color: var(--system-fg); font-weight: normal;
+                                  float: right; font-size: 10px; text-transform: none; }
+
+/* ── 工具循环节点（折叠的连续工具调用） ── */
+.tl-toolloop { margin: 2px 0; }
+.tl-toolloop::before { background: var(--tool-border); width: 8px; height: 8px; left: -22px; top: 10px; }
+.tl-toolloop > summary { list-style: none; cursor: pointer; user-select: none;
+                         background: var(--tool-bg); border: 1px solid var(--border); border-radius: 6px;
+                         padding: 6px 12px; font-size: 12px; color: var(--system-fg); display: flex;
+                         align-items: center; gap: 6px; }
+.tl-toolloop > summary::-webkit-details-marker { display: none; }
+.tl-toolloop > summary::before { content: '▶'; font-size: 9px; color: var(--system-fg); transition: transform 0.15s; }
+.tl-toolloop[open] > summary::before { transform: rotate(90deg); }
+.tl-toolloop > summary .loop-label { color: #79c0ff; font-weight: 500; }
+.tl-toolloop > summary .loop-count { color: var(--system-fg); }
+.tool-pill { display: inline-block; background: rgba(121,192,255,0.1); border: 1px solid rgba(121,192,255,0.2);
+             border-radius: 3px; padding: 0 5px; font-size: 11px; color: #79c0ff; margin: 1px 2px; }
+.tool-pill.t-error { border-color: rgba(248,81,73,0.3); color: var(--error-border); background: rgba(248,81,73,0.08); }
+.tl-toolloop > .loop-body { padding: 4px 0 4px 8px; border-left: 2px solid var(--border); margin: 4px 0 4px 12px; }
+
+/* 工具调用/结果（loop 内部） */
+.tool-step { margin: 3px 0; }
+.tool-step summary { cursor: pointer; font-size: 12px; padding: 3px 8px; border-radius: 4px;
+                     list-style: none; user-select: none; }
+.tool-step summary::-webkit-details-marker { display: none; }
+.tool-step summary::before { content: '▶ '; font-size: 9px; }
+.tool-step[open] > summary::before { content: '▼ '; }
+.tool-step .detail-body { padding: 6px 10px; margin-top: 2px; border-radius: 4px;
+                          font-size: 12px; overflow-x: auto; }
+.tool-step.tc summary { color: #79c0ff; background: rgba(121,192,255,0.05); }
+.tool-step.tc .detail-body { background: var(--tool-bg); border: 1px solid var(--border); }
+.tool-step.tr summary { color: var(--system-fg); background: rgba(139,148,158,0.05); }
+.tool-step.tr .detail-body { background: var(--tool-bg); border: 1px solid var(--border); }
+.tool-step.tr.is-error summary { color: var(--error-border); }
+
+/* ── Assistant 文本回复节点 ── */
+.tl-text { margin: 8px 0; }
+.tl-text::before { background: var(--assistant-border); width: 10px; height: 10px; left: -23px; top: 14px; }
+.tl-text-card { background: var(--assistant-bg); border: 1px solid rgba(63,185,80,0.2);
+                border-radius: 8px; padding: 12px 16px; }
+.tl-text-card .tl-label { font-size: 11px; font-weight: 600; text-transform: uppercase;
+                          color: var(--assistant-border); letter-spacing: 0.5px; margin-bottom: 4px; }
+.tl-text-card .tl-label .tl-ts { color: var(--system-fg); font-weight: normal;
+                                  float: right; font-size: 10px; text-transform: none; }
+
+/* ── Thinking 节点 ── */
+.tl-thinking { margin: 4px 0; }
+.tl-thinking::before { background: var(--thinking-border); width: 8px; height: 8px; left: -22px; top: 10px; }
+.tl-thinking > summary { list-style: none; cursor: pointer; user-select: none;
+                         background: var(--thinking-bg); border: 1px solid var(--thinking-border);
+                         border-radius: 6px; padding: 6px 12px; font-size: 12px; color: var(--thinking-border); }
+.tl-thinking > summary::-webkit-details-marker { display: none; }
+.tl-thinking > summary::before { content: '▶ '; font-size: 9px; }
+.tl-thinking[open] > summary::before { content: '▼ '; }
+.tl-thinking .detail-body { background: var(--thinking-bg); border: 1px solid var(--thinking-border);
+                            border-radius: 6px; padding: 10px 14px; margin-top: 4px;
+                            color: #c9d1d9; white-space: pre-wrap; font-size: 13px;
+                            max-height: 500px; overflow-y: auto; }
+
+/* ── System prompt 节点 ── */
+.tl-system { margin: 4px 0; }
+.tl-system::before { background: var(--system-fg); width: 8px; height: 8px; left: -22px; top: 10px; }
+.tl-system > summary { list-style: none; cursor: pointer; user-select: none;
+                       background: var(--system-bg); border: 1px solid var(--border);
+                       border-radius: 6px; padding: 6px 12px; font-size: 12px; color: var(--system-fg); }
+.tl-system > summary::-webkit-details-marker { display: none; }
+.tl-system > summary::before { content: '▶ '; font-size: 9px; }
+.tl-system[open] > summary::before { content: '▼ '; }
+.tl-system .detail-body { background: var(--system-bg); border: 1px solid var(--border);
+                          border-radius: 6px; padding: 10px 14px; margin-top: 4px;
+                          color: var(--system-fg); white-space: pre-wrap; font-size: 12px;
+                          max-height: 600px; overflow-y: auto; }
+
+/* ── 空 assistant 占位 ── */
+.tl-empty { margin: 2px 0; opacity: 0.5; }
+.tl-empty::before { background: var(--timeline-dot); width: 6px; height: 6px; left: -21px; top: 10px; }
+.tl-empty-inner { font-size: 11px; color: var(--system-fg); font-style: italic; padding: 2px 0; }
+
+/* ── 通用 ── */
 .msg-text { white-space: pre-wrap; word-break: break-word; font-size: 14px; }
-.msg-text code { background: var(--code-bg); padding: 1px 4px; border-radius: 3px;
-                 font-size: 13px; }
+.msg-text code { background: var(--code-bg); padding: 1px 4px; border-radius: 3px; font-size: 13px; }
 .msg-text pre { background: var(--code-bg); padding: 10px; border-radius: 6px;
                 overflow-x: auto; margin: 6px 0; font-size: 13px; }
-
-/* 折叠块 */
-details { margin: 6px 0; }
-summary { cursor: pointer; font-size: 13px; font-weight: 500; padding: 4px 8px;
-          border-radius: 4px; user-select: none; list-style: none; }
-summary::-webkit-details-marker { display: none; }
-summary::before { content: '▶ '; font-size: 10px; }
-details[open] > summary::before { content: '▼ '; }
-details > .detail-body { padding: 8px 12px; margin-top: 4px; border-radius: 4px;
-                         font-size: 13px; overflow-x: auto; }
-
-/* 工具调用 */
-.tool-call summary { background: var(--tool-bg); border: 1px solid var(--tool-border); color: #79c0ff; }
-.tool-call .detail-body { background: var(--tool-bg); border: 1px solid var(--border); }
-.tool-result summary { background: var(--tool-bg); border: 1px solid var(--border); color: var(--system-fg); }
-.tool-result .detail-body { background: var(--tool-bg); border: 1px solid var(--border); }
-.tool-result.is-error summary { color: var(--error-border); border-color: var(--error-border); }
-
-/* Thinking */
-.thinking summary { background: var(--thinking-bg); border: 1px solid var(--thinking-border); color: var(--thinking-border); }
-.thinking .detail-body { background: var(--thinking-bg); border: 1px solid var(--thinking-border);
-                         color: #c9d1d9; white-space: pre-wrap; }
-
-/* System prompt */
-.system-prompt summary { background: var(--system-bg); border: 1px solid var(--border); color: var(--system-fg); }
-.system-prompt .detail-body { background: var(--system-bg); border: 1px solid var(--border);
-                              color: var(--system-fg); white-space: pre-wrap; max-height: 600px; overflow-y: auto; }
-
-/* Usage 标签 */
-.usage-tag { display: inline-block; font-size: 11px; color: var(--system-fg);
+.usage-tag { display: inline-block; font-size: 10px; color: var(--system-fg);
              background: var(--tool-bg); border: 1px solid var(--border);
-             border-radius: 3px; padding: 0 5px; margin-left: 6px; }
-
-/* 搜索高亮 */
+             border-radius: 3px; padding: 0 4px; margin-left: 4px; }
 mark { background: #6e4e00; color: #ffd700; border-radius: 2px; padding: 0 1px; }
 .hidden { display: none !important; }
 
-/* 索引页 */
+/* ── 索引页 ── */
 .index-table { width: 100%; border-collapse: collapse; font-size: 14px; }
 .index-table th { text-align: left; padding: 8px; border-bottom: 2px solid var(--border);
                   color: var(--system-fg); font-size: 12px; text-transform: uppercase; }
 .index-table td { padding: 8px; border-bottom: 1px solid var(--border); }
 .index-table tr:hover td { background: var(--meta-bg); }
+
+/* ── 响应式 ── */
+@media (max-width: 768px) {
+  .sidebar { display: none; }
+  .main-content { margin-left: 0; padding: 12px; }
+}
 """
 
 _JS = """
 function doSearch() {
   const q = document.getElementById('search-input').value.trim().toLowerCase();
-  const msgs = document.querySelectorAll('.msg');
+  const nodes = document.querySelectorAll('.tl-node');
   let shown = 0;
-  msgs.forEach(el => {
+  nodes.forEach(el => {
     if (!q) { el.classList.remove('hidden'); shown++; return; }
     const text = el.textContent.toLowerCase();
     if (text.includes(q)) { el.classList.remove('hidden'); shown++; }
     else { el.classList.add('hidden'); }
   });
-  document.getElementById('search-stats').textContent = q ? shown + ' / ' + msgs.length + ' messages' : '';
+  document.getElementById('search-stats').textContent = q ? shown + ' / ' + nodes.length + ' nodes' : '';
 }
+
+/* 侧边栏高亮当前可见节点 */
+function initNavHighlight() {
+  const navItems = document.querySelectorAll('.sidebar .nav-item');
+  if (!navItems.length) return;
+  const targets = [];
+  navItems.forEach(a => {
+    const id = a.getAttribute('href');
+    if (id && id.startsWith('#')) {
+      const el = document.getElementById(id.slice(1));
+      if (el) targets.push({ nav: a, el: el });
+    }
+  });
+  if (!targets.length) return;
+  const obs = new IntersectionObserver(entries => {
+    entries.forEach(e => {
+      const item = targets.find(t => t.el === e.target);
+      if (item) item.visible = e.isIntersecting;
+    });
+    const first = targets.find(t => t.visible);
+    navItems.forEach(a => a.classList.remove('active'));
+    if (first) first.nav.classList.add('active');
+  }, { rootMargin: '-80px 0px -60% 0px' });
+  targets.forEach(t => obs.observe(t.el));
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   const input = document.getElementById('search-input');
   if (input) { let t; input.addEventListener('input', () => { clearTimeout(t); t = setTimeout(doSearch, 200); }); }
+  initNavHighlight();
 });
 """
 
@@ -240,13 +340,204 @@ def _tool_call_summary(tool_name: str, tool_input: Dict) -> str:
     return ""
 
 
+def _get_ts(entry: Dict) -> str:
+    """安全提取 timestamp"""
+    ts = entry.get("timestamp", "")
+    return ts[:19] if isinstance(ts, str) else ""
+
+
+def _parse_assistant_entry(entry: Dict) -> Dict:
+    """解析 assistant history 条目，提取结构化信息"""
+    content = entry.get("content", [])
+    thinking_blocks = entry.get("thinking_blocks")
+    tool_calls_field = entry.get("tool_calls") or []
+
+    thinkings = []
+    texts = []
+    tool_uses = []
+
+    # 从顶层 thinking_blocks
+    if thinking_blocks:
+        for tb in thinking_blocks:
+            t = tb.get("thinking", "") if isinstance(tb, dict) else str(tb)
+            if t:
+                thinkings.append(t)
+
+    if isinstance(content, list):
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            btype = b.get("type", "")
+            if btype == "thinking" and not thinking_blocks:
+                t = b.get("thinking", "")
+                if t:
+                    thinkings.append(t)
+            elif btype == "redacted_thinking":
+                thinkings.append("[redacted]")
+            elif btype == "text":
+                t = b.get("text", "")
+                if t.strip():
+                    texts.append(t)
+            elif btype == "tool_use":
+                tool_uses.append({
+                    "id": b.get("id", ""),
+                    "name": b.get("name", "unknown"),
+                    "input": b.get("input") or {},
+                })
+    elif isinstance(content, str) and content.strip():
+        texts.append(content)
+
+    # 从 tool_calls 字段补充
+    if not tool_uses and tool_calls_field:
+        for tc in tool_calls_field:
+            if not isinstance(tc, dict):
+                continue
+            func = tc.get("function", {})
+            name = func.get("name", "unknown")
+            try:
+                inp = json.loads(func.get("arguments", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                inp = {"_raw": func.get("arguments", "")}
+            tool_uses.append({"id": tc.get("id", ""), "name": name, "input": inp})
+
+    return {
+        "thinkings": thinkings,
+        "texts": texts,
+        "tool_uses": tool_uses,
+        "usage": entry.get("usage", {}),
+        "stop_reason": entry.get("stop_reason", ""),
+        "timestamp": _get_ts(entry),
+    }
+
+
+def _linearize_history(history: List[Dict], tool_name_map: Dict[str, str]) -> List[Dict]:
+    """将 history 转换为线性节点列表，合并连续工具调用为 tool_loop。
+
+    节点类型:
+      system, user_input, tool_loop, assistant_text, thinking, empty_assistant
+    """
+    nodes = []
+    # 先收集所有 tool_result，按 tool_use_id 索引
+    tool_results_by_id: Dict[str, Dict] = {}
+    for entry in history:
+        if entry.get("role") != "user":
+            continue
+        content = entry.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                tid = b.get("tool_use_id", "")
+                if tid:
+                    is_error = b.get("is_error", False)
+                    rc = b.get("content", "")
+                    if isinstance(rc, list):
+                        rc = "\n".join(x.get("text", "") for x in rc if isinstance(x, dict))
+                    tool_results_by_id[tid] = {"content": str(rc), "is_error": is_error}
+
+    # 遍历 history 构建节点
+    pending_tools = []  # 当前累积的工具调用步骤
+    turn_num = 0
+
+    def _flush_tools():
+        """将累积的工具调用合并为一个 tool_loop 节点"""
+        nonlocal pending_tools
+        if not pending_tools:
+            return
+        nodes.append({
+            "type": "tool_loop",
+            "steps": list(pending_tools),
+            "timestamp": pending_tools[0].get("timestamp", ""),
+        })
+        pending_tools = []
+
+    for entry in history:
+        role = entry.get("role", "")
+
+        if role == "system":
+            _flush_tools()
+            content = entry.get("content", "")
+            text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            nodes.append({"type": "system", "text": text})
+
+        elif role == "user":
+            content = entry.get("content", "")
+            # 判断是否为 tool_result
+            is_tool_result = isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+            )
+            if is_tool_result:
+                continue  # tool_result 已通过 tool_results_by_id 索引，不单独渲染
+
+            # 真实用户输入
+            _flush_tools()
+            if isinstance(content, str):
+                if content.strip():
+                    nodes.append({"type": "user_input", "text": content})
+            elif isinstance(content, list):
+                text_parts = [b.get("text", "") for b in content
+                              if isinstance(b, dict) and b.get("type") == "text"]
+                combined = "\n".join(t for t in text_parts if t.strip())
+                if combined.strip():
+                    nodes.append({"type": "user_input", "text": combined})
+
+        elif role == "assistant":
+            turn_num += 1
+            parsed = _parse_assistant_entry(entry)
+
+            # Thinking — 独立节点
+            for t in parsed["thinkings"]:
+                _flush_tools()
+                nodes.append({"type": "thinking", "text": t, "timestamp": parsed["timestamp"]})
+
+            # Text — 独立节点（先 flush 工具）
+            if parsed["texts"]:
+                _flush_tools()
+                nodes.append({
+                    "type": "assistant_text",
+                    "texts": parsed["texts"],
+                    "turn_num": turn_num,
+                    "usage": parsed["usage"],
+                    "stop_reason": parsed["stop_reason"],
+                    "timestamp": parsed["timestamp"],
+                })
+
+            # Tool uses — 累积到 pending_tools
+            if parsed["tool_uses"]:
+                for tu in parsed["tool_uses"]:
+                    result = tool_results_by_id.get(tu["id"], {})
+                    pending_tools.append({
+                        "name": tu["name"],
+                        "input": tu["input"],
+                        "result_content": result.get("content", ""),
+                        "is_error": result.get("is_error", False),
+                        "timestamp": parsed["timestamp"],
+                        "usage": parsed["usage"],
+                    })
+
+            # 空 assistant（无 text、无 tool、无 thinking）
+            if not parsed["texts"] and not parsed["tool_uses"] and not parsed["thinkings"]:
+                nodes.append({
+                    "type": "empty_assistant",
+                    "turn_num": turn_num,
+                    "usage": parsed["usage"],
+                    "stop_reason": parsed["stop_reason"],
+                    "timestamp": parsed["timestamp"],
+                })
+
+    _flush_tools()
+    return nodes
+
+
 def render_traj(traj: Dict) -> str:
-    """将 .traj 数据渲染为 HTML body 内容"""
+    """将 .traj 数据渲染为时间线 HTML"""
     metadata = traj.get("metadata", {})
     history = traj.get("history", [])
     tool_name_map = _build_tool_name_map(history)
+    nodes = _linearize_history(history, tool_name_map)
 
     parts: List[str] = []
+    nav_items: List[str] = []  # 侧边栏导航
 
     # ── 元信息卡片 ──
     sid = metadata.get("session_id", "unknown")
@@ -283,197 +574,182 @@ def render_traj(traj: Dict) -> str:
     # ── 搜索栏 ──
     parts.append("""
     <div class="search-bar">
-      <input id="search-input" type="text" placeholder="Search messages..." />
+      <input id="search-input" type="text" placeholder="Search in timeline..." />
       <div class="stats" id="search-stats"></div>
     </div>
     """)
 
-    # ── 对话流 ──
-    turn_num = 0
-    for entry in history:
-        role = entry.get("role", "")
-        content = entry.get("content", "")
-        timestamp = entry.get("timestamp", "")
-        if isinstance(timestamp, str):
-            timestamp = timestamp[:19]
-        else:
-            timestamp = ""
-        usage = entry.get("usage", {})
-        stop_reason = entry.get("stop_reason", "")
-        thinking_blocks = entry.get("thinking_blocks")
-        tool_calls = entry.get("tool_calls") or []
+    # ── 时间线 ──
+    parts.append('<div class="timeline">')
+    node_id = 0
+    user_count = 0
+    text_count = 0
+    loop_count = 0
 
-        if role == "system":
-            # System prompt — 折叠
-            text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+    for nd in nodes:
+        ntype = nd["type"]
+        node_id += 1
+        anchor = f"n{node_id}"
+
+        if ntype == "system":
+            text = nd["text"]
             parts.append(f"""
-            <div class="msg msg-system">
-              <details class="system-prompt">
-                <summary>System Prompt ({len(text):,} chars)</summary>
-                <div class="detail-body">{_esc(_truncate(text, 10000))}</div>
-              </details>
+            <details class="tl-node tl-system" id="{anchor}">
+              <summary>System Prompt ({len(text):,} chars)</summary>
+              <div class="detail-body">{_esc(_truncate(text, 10000))}</div>
+            </details>
+            """)
+
+        elif ntype == "user_input":
+            user_count += 1
+            text = nd["text"]
+            preview = text.strip()[:60].replace("\n", " ")
+            nav_items.append(
+                f'<a class="nav-item nav-user" href="#{anchor}">'
+                f'User: {_esc(preview)}</a>'
+            )
+            parts.append(f"""
+            <div class="tl-node tl-user" id="{anchor}">
+              <div class="tl-user-card">
+                <div class="tl-label">User #{user_count}</div>
+                <div class="msg-text">{_format_content_text(text)}</div>
+              </div>
             </div>
             """)
 
-        elif role == "user":
-            if isinstance(content, str):
-                if not content.strip():
-                    continue
+        elif ntype == "thinking":
+            text = nd["text"]
+            ts = nd.get("timestamp", "")
+            if text == "[redacted]":
                 parts.append(f"""
-                <div class="msg msg-user">
-                  <div class="msg-label">User {f'<span class="msg-ts">{_esc(timestamp)}</span>' if timestamp else ''}</div>
-                  <div class="msg-text">{_format_content_text(content)}</div>
-                </div>
+                <details class="tl-node tl-thinking" id="{anchor}">
+                  <summary>Redacted Thinking</summary>
+                  <div class="detail-body">[content redacted by API]</div>
+                </details>
                 """)
-            elif isinstance(content, list):
-                # 先渲染 text blocks（如果有且不混合 tool_result）
-                text_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "text"]
-                tool_results = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
+            else:
+                parts.append(f"""
+                <details class="tl-node tl-thinking" id="{anchor}">
+                  <summary>Thinking ({len(text):,} chars){f' <span class="usage-tag">{_esc(ts)}</span>' if ts else ''}</summary>
+                  <div class="detail-body">{_esc(_truncate(text, 8000))}</div>
+                </details>
+                """)
 
-                if text_blocks and not tool_results:
-                    combined = "\n".join(b.get("text", "") for b in text_blocks if b.get("text", "").strip())
-                    if combined.strip():
-                        parts.append(f"""
-                        <div class="msg msg-user">
-                          <div class="msg-label">User</div>
-                          <div class="msg-text">{_format_content_text(combined)}</div>
-                        </div>
-                        """)
+        elif ntype == "tool_loop":
+            loop_count += 1
+            loop_steps = nd["steps"]
+            # 统计工具名
+            from collections import Counter
+            tool_counts = Counter(s["name"] for s in loop_steps)
+            has_error = any(s.get("is_error") for s in loop_steps)
+            pills_html = " ".join(
+                f'<span class="tool-pill">{_esc(name)}'
+                f'{"&times;" + str(cnt) if cnt > 1 else ""}</span>'
+                for name, cnt in tool_counts.items()
+            )
+            if has_error:
+                pills_html += ' <span class="tool-pill t-error">ERROR</span>'
 
-                if tool_results:
-                    result_parts = []
-                    for b in tool_results:
-                        tool_use_id = b.get("tool_use_id", "")
-                        tool_name = tool_name_map.get(tool_use_id, "")
-                        is_error = b.get("is_error", False)
-                        result_content = b.get("content", "")
-                        if isinstance(result_content, list):
-                            result_content = "\n".join(
-                                x.get("text", "") for x in result_content if isinstance(x, dict)
-                            )
-                        result_content = _truncate(str(result_content), 8000)
-                        error_cls = " is-error" if is_error else ""
-                        error_label = " [ERROR]" if is_error else ""
-                        name_label = f" [{_esc(tool_name)}]" if tool_name else ""
-                        result_parts.append(f"""
-                        <details class="tool-result{error_cls}">
-                          <summary>Result{name_label}{_esc(error_label)} ({len(result_content):,} chars)</summary>
-                          <div class="detail-body"><pre>{_esc(result_content)}</pre></div>
-                        </details>
-                        """)
-                    if result_parts:
-                        parts.append(f"""
-                        <div class="msg msg-user">
-                          <div class="msg-label" style="color: var(--system-fg)">Tool Results</div>
-                          {"".join(result_parts)}
-                        </div>
-                        """)
+            nav_items.append(
+                f'<a class="nav-item nav-step" href="#{anchor}">'
+                f'{", ".join(tool_counts.keys())}'
+                f'<span class="nav-badge">{len(loop_steps)}</span></a>'
+            )
 
-        elif role == "assistant":
-            turn_num += 1
-            usage_str = _format_usage(usage)
-            usage_html = f'<span class="usage-tag">{_esc(usage_str)}</span>' if usage_str else ""
-            stop_html = f'<span class="usage-tag">{_esc(stop_reason)}</span>' if stop_reason else ""
-
-            inner_parts = []
-
-            # Thinking blocks（优先从顶层字段读取）
-            if thinking_blocks:
-                for tb in thinking_blocks:
-                    thinking_text = tb.get("thinking", "") if isinstance(tb, dict) else str(tb)
-                    if thinking_text:
-                        inner_parts.append(f"""
-                        <details class="thinking">
-                          <summary>Thinking ({len(thinking_text):,} chars)</summary>
-                          <div class="detail-body">{_esc(_truncate(thinking_text, 8000))}</div>
-                        </details>
-                        """)
-
-            # Content blocks
-            if isinstance(content, list):
-                for b in content:
-                    if not isinstance(b, dict):
-                        continue
-                    btype = b.get("type", "")
-                    if btype == "thinking":
-                        # 从 content blocks 中补充（仅当顶层 thinking_blocks 为空时）
-                        if not thinking_blocks:
-                            thinking_text = b.get("thinking", "")
-                            if thinking_text:
-                                inner_parts.append(f"""
-                                <details class="thinking">
-                                  <summary>Thinking ({len(thinking_text):,} chars)</summary>
-                                  <div class="detail-body">{_esc(_truncate(thinking_text, 8000))}</div>
-                                </details>
-                                """)
-                    elif btype == "redacted_thinking":
-                        inner_parts.append("""
-                        <details class="thinking">
-                          <summary>Redacted Thinking</summary>
-                          <div class="detail-body">[content redacted by API]</div>
-                        </details>
-                        """)
-                    elif btype == "text":
-                        text = b.get("text", "")
-                        if text.strip():
-                            inner_parts.append(f'<div class="msg-text">{_format_content_text(text)}</div>')
-                    elif btype == "tool_use":
-                        tool_name = b.get("name", "unknown")
-                        tool_input = b.get("input", {}) or {}
-                        input_str = json.dumps(tool_input, ensure_ascii=False, indent=2)
-                        summary_extra = _tool_call_summary(tool_name, tool_input)
-                        inner_parts.append(f"""
-                        <details class="tool-call">
-                          <summary>Tool: {_esc(tool_name)}{summary_extra}</summary>
-                          <div class="detail-body"><pre>{_esc(_truncate(input_str, 5000))}</pre></div>
-                        </details>
-                        """)
-            elif isinstance(content, str) and content.strip():
-                inner_parts.append(f'<div class="msg-text">{_format_content_text(content)}</div>')
-
-            # 当 content 为空但有 tool_calls 字段时，从 tool_calls 补充渲染
-            if not inner_parts and tool_calls:
-                for tc in tool_calls:
-                    if not isinstance(tc, dict):
-                        continue
-                    func = tc.get("function", {})
-                    tool_name = func.get("name", "unknown")
-                    try:
-                        tool_input = json.loads(func.get("arguments", "{}"))
-                    except (json.JSONDecodeError, TypeError):
-                        tool_input = {"_raw": func.get("arguments", "")}
-                    input_str = json.dumps(tool_input, ensure_ascii=False, indent=2)
-                    summary_extra = _tool_call_summary(tool_name, tool_input)
-                    inner_parts.append(f"""
-                    <details class="tool-call">
-                      <summary>Tool: {_esc(tool_name)}{summary_extra}</summary>
-                      <div class="detail-body"><pre>{_esc(_truncate(input_str, 5000))}</pre></div>
+            # 内部展开的每个工具步骤
+            step_parts = []
+            for si, step in enumerate(loop_steps):
+                sname = step["name"]
+                sinput = step["input"]
+                input_str = json.dumps(sinput, ensure_ascii=False, indent=2)
+                summary_extra = _tool_call_summary(sname, sinput)
+                step_parts.append(f"""
+                <details class="tool-step tc">
+                  <summary>Tool: {_esc(sname)}{summary_extra}</summary>
+                  <div class="detail-body"><pre>{_esc(_truncate(input_str, 5000))}</pre></div>
+                </details>
+                """)
+                # 对应的 result
+                rc = step.get("result_content", "")
+                if rc:
+                    rc = _truncate(rc, 8000)
+                    err_cls = " is-error" if step.get("is_error") else ""
+                    err_label = " [ERROR]" if step.get("is_error") else ""
+                    step_parts.append(f"""
+                    <details class="tool-step tr{err_cls}">
+                      <summary>Result [{_esc(sname)}]{_esc(err_label)} ({len(rc):,} chars)</summary>
+                      <div class="detail-body"><pre>{_esc(rc)}</pre></div>
                     </details>
                     """)
 
-            # 始终渲染 assistant 消息（即使 content 为空，也显示元信息）
-            ts_html = f'<span class="msg-ts">{_esc(timestamp)}</span>' if timestamp else ''
-            if inner_parts:
-                parts.append(f"""
-                <div class="msg msg-assistant">
-                  <div class="msg-label">Assistant <span class="turn-num">#{turn_num}</span>
-                    {usage_html}{stop_html}{ts_html}
-                  </div>
-                  {"".join(inner_parts)}
-                </div>
-                """)
-            elif usage or stop_reason or timestamp:
-                # 空 content 的 assistant 消息 — 显示占位信息
-                parts.append(f"""
-                <div class="msg msg-assistant" style="opacity: 0.6">
-                  <div class="msg-label">Assistant <span class="turn-num">#{turn_num}</span>
-                    {usage_html}{stop_html}{ts_html}
-                  </div>
-                  <div class="msg-text" style="color: var(--system-fg); font-style: italic; font-size: 12px">[empty response]</div>
-                </div>
-                """)
+            parts.append(f"""
+            <details class="tl-node tl-toolloop" id="{anchor}">
+              <summary>
+                <span class="loop-label">Tools</span>
+                <span class="loop-count">({len(loop_steps)} calls)</span>
+                {pills_html}
+              </summary>
+              <div class="loop-body">
+                {"".join(step_parts)}
+              </div>
+            </details>
+            """)
 
-    return "\n".join(parts)
+        elif ntype == "assistant_text":
+            text_count += 1
+            texts = nd["texts"]
+            usage = nd.get("usage", {})
+            stop_reason = nd.get("stop_reason", "")
+            ts = nd.get("timestamp", "")
+            turn = nd.get("turn_num", 0)
+            usage_str = _format_usage(usage)
+            usage_html = f'<span class="usage-tag">{_esc(usage_str)}</span>' if usage_str else ""
+            stop_html = f'<span class="usage-tag">{_esc(stop_reason)}</span>' if stop_reason else ""
+            ts_html = f'<span class="tl-ts">{_esc(ts)}</span>' if ts else ""
+
+            preview = texts[0].strip()[:50].replace("\n", " ")
+            nav_items.append(
+                f'<a class="nav-item" href="#{anchor}">'
+                f'#{turn} {_esc(preview)}</a>'
+            )
+
+            text_html = "\n".join(
+                f'<div class="msg-text">{_format_content_text(t)}</div>' for t in texts
+            )
+            parts.append(f"""
+            <div class="tl-node tl-text" id="{anchor}">
+              <div class="tl-text-card">
+                <div class="tl-label">Assistant #{turn} {usage_html}{stop_html}{ts_html}</div>
+                {text_html}
+              </div>
+            </div>
+            """)
+
+        elif ntype == "empty_assistant":
+            turn = nd.get("turn_num", 0)
+            usage = nd.get("usage", {})
+            ts = nd.get("timestamp", "")
+            usage_str = _format_usage(usage)
+            parts.append(f"""
+            <div class="tl-node tl-empty" id="{anchor}">
+              <div class="tl-empty-inner">
+                #{turn} [empty]{f" {_esc(usage_str)}" if usage_str else ""}{f" {_esc(ts)}" if ts else ""}
+              </div>
+            </div>
+            """)
+
+    parts.append('</div>')  # end .timeline
+
+    # ── 构建侧边栏 ──
+    sidebar = f"""
+    <nav class="sidebar">
+      <div class="sid">{_esc(sid[:12])}...</div>
+      <div class="nav-section">Navigation</div>
+      {"".join(nav_items)}
+    </nav>
+    """
+
+    return sidebar + '<div class="main-content">' + "\n".join(parts) + '</div>'
 
 
 def generate_html(traj: Dict, title: str = "Trajectory Viewer") -> str:
@@ -488,7 +764,9 @@ def generate_html(traj: Dict, title: str = "Trajectory Viewer") -> str:
 <style>{_CSS}</style>
 </head>
 <body>
+<div class="page-layout">
 {body}
+</div>
 <script>{_JS}</script>
 </body>
 </html>"""
