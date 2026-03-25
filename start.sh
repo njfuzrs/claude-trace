@@ -67,7 +67,20 @@ python3 "$SCRIPT_DIR/setup_hooks.py" --collector "$HOOKS_DIR/collector.py" || {
 }
 echo "✅ Hooks 已配置"
 
-# 4. 启动代理（后台）
+# 4. 清理占用端口的旧进程
+OLD_PID=$(lsof -ti:"$PORT" 2>/dev/null || true)
+if [ -n "$OLD_PID" ]; then
+    echo "⚠️  端口 $PORT 被占用 (PID: $OLD_PID)，正在清理..."
+    kill $OLD_PID 2>/dev/null || true
+    sleep 0.5
+    # 如果还没退出，强制杀掉
+    if lsof -ti:"$PORT" >/dev/null 2>&1; then
+        kill -9 $OLD_PID 2>/dev/null || true
+    fi
+    echo "✅ 旧进程已清理"
+fi
+
+# 5. 启动代理（后台）
 echo ""
 echo "启动代理: http://127.0.0.1:$PORT"
 echo "输出目录: $OUTPUT"
