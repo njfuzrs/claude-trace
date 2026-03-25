@@ -159,6 +159,10 @@ class Session:
     # P0 #2: 只保留 hash 列表和 count，不保留完整 messages 引用，避免内存泄漏
     prev_msg_hashes: List[str] = field(default_factory=list)
     prev_msg_count: int = 0
+    # 子会话（sub-agent 产生的独立 API 请求流）
+    child_sessions: List["Session"] = field(default_factory=list)
+    parent_session_id: Optional[str] = None  # 如果是子会话，指向父会话 id
+    is_subagent: bool = False
 
     def update_activity(self):
         self.last_activity = datetime.now().isoformat()
@@ -182,11 +186,17 @@ class Session:
 # ─────────────────────────────────────────────
 
 class SessionManager:
+    # pending session 超时时间：用户可能花很长时间阅读/思考才提交第一个 prompt，
+    # 所以 pending 超时要远大于活跃会话超时。默认 30 分钟。
+    PENDING_TIMEOUT = 1800  # 30 minutes
+
     def __init__(self, session_timeout: int = 300):
         self.active_sessions: Dict[str, Session] = {}
         # Hooks 通过 HTTP 回调注册的 pending 队列（等待首次 API 请求关联）
         self._pending_sessions: Dict[str, dict] = {}
         self._timeout = session_timeout
+        # sub-agent session_id → parent session_id 映射
+        self._subagent_parent_map: Dict[str, str] = {}
 
     def register_session_from_hook(self, session_id: str, metadata: dict):
         """由 /_internal/session-register 路由调用，Hooks 主动通知"""
@@ -228,23 +238,45 @@ class SessionManager:
         match = _re.search(r"(?:working directory|cwd)[:\s]+(/\S+)", text, _re.IGNORECASE)
         return match.group(1) if match else ""
 
+    def _find_parent_session(self) -> Optional[Session]:
+        """查找当前活跃的主会话（用于 sub-agent 请求关联）
+
+        优先选择由 Hook 注册创建的会话（有 source 字段），因为这是真正的
+        Claude Code 主会话。
+        """
+        # 优先：由 Hook 注册创建的会话（source 非空）
+        hook_sessions = [
+            s for s in self.active_sessions.values()
+            if not s.is_subagent and s.source
+        ]
+        if len(hook_sessions) == 1:
+            return hook_sessions[0]
+
+        # 兜底：唯一的非 sub-agent 会话
+        main_sessions = [
+            s for s in self.active_sessions.values()
+            if not s.is_subagent
+        ]
+        if len(main_sessions) == 1:
+            return main_sessions[0]
+
+        return None
+
     def match_session(self, request_body: Dict) -> Session:
         """双通道会话匹配
 
-        修复：
-        - 策略 1 不再无条件消费单 pending，始终校验 model 匹配
-        - model 匹配改为模糊匹配（_models_match），支持 Hook 的 'claude-opus-4-6[1m]'
-          与 API 的 'claude-opus-4-6' 匹配
-        - 策略 2 增加 model 一致性校验，防止 sub-agent 请求匹配到主 agent session
+        策略优先级：
+        1. Hooks 注册的 pending 队列（model 匹配 → 确定性关联）
+        2. 已有活跃会话的对话内容连续性匹配（同 model 优先）
+        3. Sub-agent 路由：model 不匹配时，关联到唯一的活跃主会话作为子会话
+        4. 兜底：创建新会话
         """
         request_model = request_body.get("model", "")
 
         # 策略 1：Hooks 注册的 pending 队列（model 匹配关联）
         if self._pending_sessions:
-            # 尝试从请求的 system prompt 中提取 cwd 信息进行联合匹配
             request_cwd = self._extract_cwd_from_request(request_body)
 
-            # model 模糊匹配（支持 Hook 的 [1m] 后缀和 API 的日期后缀）
             model_matches = [
                 (sid, meta) for sid, meta in self._pending_sessions.items()
                 if _models_match(meta.get("model", ""), request_model)
@@ -253,7 +285,6 @@ class SessionManager:
                 sid, metadata = model_matches[0]
                 return self._create_session_from_pending(sid, metadata, "Hook model 匹配")
             elif len(model_matches) > 1:
-                # 多个同 model，尝试 cwd 联合匹配
                 if request_cwd:
                     cwd_matches = [
                         (sid, meta) for sid, meta in model_matches
@@ -263,24 +294,22 @@ class SessionManager:
                         sid, metadata = cwd_matches[0]
                         return self._create_session_from_pending(sid, metadata, "Hook model+cwd 匹配")
 
-                # cwd 匹配也无法区分，warn 并取第一个（FIFO）
                 logger.warning(
-                    "多个 pending session 使用相同 model=%s，按 FIFO 关联（可能不准确）",
+                    "多个 pending session 使用相同 model=%s，按 FIFO 关联",
                     request_model,
                 )
                 sid, metadata = model_matches[0]
                 return self._create_session_from_pending(sid, metadata, "Hook FIFO 兜底")
 
-            # model 不匹配任何 pending（sub-agent 请求），不消费 pending，继续往下走
-            if self._pending_sessions:
-                logger.debug(
-                    "请求 model=%s 不匹配任何 pending session，跳过 pending 队列",
-                    request_model,
-                )
+            # model 不匹配任何 pending（可能是 sub-agent 或标题生成请求）
+            logger.debug(
+                "请求 model=%s 不匹配任何 pending session，跳过 pending 队列",
+                request_model,
+            )
 
         # 策略 2：已有活跃会话的对话内容连续性匹配
-        # 优先匹配 model 一致的 session，防止 sub-agent 请求匹配到主 agent session
         messages = request_body.get("messages", [])
+        # 优先匹配 model 一致的 session
         for session in self.active_sessions.values():
             if _models_match(session.model, request_model) and session.is_continuation(messages):
                 session.update_activity()
@@ -291,24 +320,51 @@ class SessionManager:
                 session.update_activity()
                 return session
 
-        # 策略 3：创建新会话（自动生成 session_id）
+        # 策略 3：Sub-agent 路由 — 如果有唯一的活跃主会话，将不匹配的请求
+        # 作为子会话关联到它。Claude Code 的 sub-agent 使用不同 model（如 haiku），
+        # 标题生成也用 haiku，这些请求不应创建独立的 traj 文件。
+        parent = self._find_parent_session()
+        if parent is not None:
+            child_sid = str(uuid.uuid4())
+            child = Session(
+                id=child_sid,
+                model=request_model,
+                parent_session_id=parent.id,
+                is_subagent=True,
+            )
+            self.active_sessions[child_sid] = child
+            parent.child_sessions.append(child)
+            self._subagent_parent_map[child_sid] = parent.id
+            parent.update_activity()
+            logger.info(
+                "Sub-agent 会话: %s → parent %s (model=%s)",
+                child_sid[:8], parent.id[:8], request_model,
+            )
+            return child
+
+        # 策略 4：创建新会话（自动生成 session_id）
         sid = str(uuid.uuid4())
         session = Session(id=sid, model=request_body.get("model", ""))
         self.active_sessions[sid] = session
         logger.info("新建会话（兜底）: %s model=%s", sid[:8], request_model)
         return session
 
-    async def cleanup_expired(self, collector: Optional["DataCollector"] = None):
-        """清理超时会话和过期 pending，导出轨迹后再删除
+    def get_parent_session(self, session: Session) -> Optional[Session]:
+        """获取子会话的父会话"""
+        if session.parent_session_id:
+            return self.active_sessions.get(session.parent_session_id)
+        return None
 
-        P1 fix: 改为 async，确保 export 完成后再删除 session，避免数据竞争。
-        P1 #6 fix: 单个 session 清理失败不阻塞其他 session 的清理。
-        """
+    async def cleanup_expired(self, collector: Optional["DataCollector"] = None):
+        """清理超时会话和过期 pending，导出轨迹后再删除"""
         now = datetime.now()
 
-        # 清理超时的活跃会话
+        # 清理超时的活跃会话（子会话跟随父会话一起清理）
         expired = []
         for sid, session in self.active_sessions.items():
+            # 子会话不单独超时，跟随父会话
+            if session.is_subagent:
+                continue
             try:
                 last = datetime.fromisoformat(session.last_activity)
                 if (now - last).total_seconds() > self._timeout:
@@ -319,20 +375,25 @@ class SessionManager:
         for sid in expired:
             try:
                 session = self.active_sessions[sid]
-                # P1 #5: 超时清理前先导出 .traj，防止数据丢失
-                if collector and session.pairs:
+                if collector and (session.pairs or session.child_sessions):
                     await collector.export_session_async(session)
-                logger.info("会话超时清理: %s (pairs=%d)", sid[:8], len(session.pairs))
+                # 清理子会话
+                for child in session.child_sessions:
+                    self.active_sessions.pop(child.id, None)
+                    self._subagent_parent_map.pop(child.id, None)
+                logger.info("会话超时清理: %s (pairs=%d, children=%d)",
+                            sid[:8], len(session.pairs), len(session.child_sessions))
             except Exception as e:
                 logger.warning("会话 %s 清理时异常: %s", sid[:8], e)
             del self.active_sessions[sid]
 
-        # P1 #10: 清理过期的 pending sessions（Hook 注册了但始终没有 API 请求到达）
+        # 清理过期的 pending sessions
+        # 使用 PENDING_TIMEOUT（30 分钟）而非 session_timeout（5 分钟）
         stale_pending = []
         for sid, meta in self._pending_sessions.items():
             try:
                 registered_at = datetime.fromisoformat(meta.get("_registered_at", now.isoformat()))
-                if (now - registered_at).total_seconds() > self._timeout:
+                if (now - registered_at).total_seconds() > self.PENDING_TIMEOUT:
                     stale_pending.append(sid)
             except (ValueError, TypeError):
                 stale_pending.append(sid)
@@ -542,9 +603,10 @@ class DataCollector:
         await self.record_response_async(session, pair, partial_response)
 
     def _build_traj_data(self, session: Session, pairs_snapshot: List[RequestResponsePair]) -> tuple:
-        """公共方法：构建 traj 数据和目标路径，消除三处重复逻辑。
+        """构建 traj 数据，合并子会话数据，读取 hook events 丰富 metadata。
 
-        Fix 1: 读取 hook events JSONL 丰富 metadata（user_prompts/compactions/subagent_spans）。
+        子会话（sub-agent）的 pairs 会被合并到主会话的 trajectory 中，
+        并标记 agent="subagent:{child_session_id[:8]}"。
 
         Returns:
             (traj_path, traj_dict) 或在异常时返回 (None, None)
@@ -558,7 +620,7 @@ class DataCollector:
                 start_source=session.source,
             )
 
-            # Fix 1: 从 hook events JSONL 读取语义事件，丰富 metadata
+            # 从 hook events JSONL 读取语义事件，丰富 metadata
             events_file = self.events_dir / f"{session.id}.jsonl"
             if events_file.exists():
                 try:
@@ -588,7 +650,54 @@ class DataCollector:
                 except Exception as e:
                     logger.debug("读取 hook events 失败: %s", e)
 
+            # 构建主会话轨迹
             traj = build_trajectory(session.id, pairs_snapshot, metadata)
+
+            # 合并子会话（sub-agent）的轨迹数据
+            if session.child_sessions:
+                for child in session.child_sessions:
+                    if not child.pairs:
+                        continue
+                    child_meta = SessionMetadata(
+                        session_id=child.id,
+                        start_time=child.start_time,
+                        model=child.model,
+                    )
+                    child_traj = build_trajectory(child.id, list(child.pairs), child_meta)
+
+                    # 将子会话的 trajectory 步骤标记为 subagent 并追加
+                    for step in child_traj.get("trajectory", []):
+                        step["agent"] = f"subagent:{child.id[:8]}"
+                        step["_subagent_model"] = child.model
+                    traj["trajectory"].extend(child_traj.get("trajectory", []))
+
+                    # 合并子会话的 history
+                    for entry in child_traj.get("history", []):
+                        entry["agent"] = f"subagent:{child.id[:8]}"
+                    traj["history"].extend(child_traj.get("history", []))
+
+                    # 合并 token 统计
+                    child_stats = child_traj.get("info", {}).get("model_stats", {})
+                    main_stats = traj["info"]["model_stats"]
+                    main_stats["tokens_sent"] += child_stats.get("tokens_sent", 0)
+                    main_stats["tokens_received"] += child_stats.get("tokens_received", 0)
+                    main_stats["cache_read_tokens"] += child_stats.get("cache_read_tokens", 0)
+                    main_stats["cache_creation_tokens"] += child_stats.get("cache_creation_tokens", 0)
+                    main_stats["api_calls"] += child_stats.get("api_calls", 0)
+                    main_stats["total_cost_usd"] += child_stats.get("total_cost_usd", 0)
+
+                # 更新合并后的 metadata 统计
+                traj["metadata"]["total_steps"] = len(traj["trajectory"])
+                traj["metadata"]["total_api_calls"] = traj["info"]["model_stats"]["api_calls"]
+                traj["metadata"]["total_tokens_sent"] = traj["info"]["model_stats"]["tokens_sent"]
+                traj["metadata"]["total_tokens_received"] = traj["info"]["model_stats"]["tokens_received"]
+                traj["metadata"]["total_cost_usd"] = traj["info"]["model_stats"]["total_cost_usd"]
+                traj["metadata"]["has_sub_agent"] = True
+                traj["metadata"]["child_sessions"] = [
+                    {"id": c.id, "model": c.model, "pairs": len(c.pairs)}
+                    for c in session.child_sessions if c.pairs
+                ]
+
             traj_path = self.traj_dir / f"{session.id}.traj"
             return traj_path, traj
         except Exception as e:
@@ -596,8 +705,15 @@ class DataCollector:
             return None, None
 
     def export_session(self, session: Session):
-        """导出会话的 .traj 文件（同步版本，用于优雅退出等非 async 上下文）"""
-        if not session.pairs:
+        """导出会话的 .traj 文件（同步版本，用于优雅退出等非 async 上下文）
+
+        子会话不单独导出 traj，它们的数据会在父会话导出时合并。
+        """
+        # 子会话不单独导出
+        if session.is_subagent:
+            return
+        # 没有任何数据（主会话和子会话都没有 pairs）
+        if not session.pairs and not any(c.pairs for c in session.child_sessions):
             return
         pairs_snapshot = list(session.pairs)
         traj_path, traj = self._build_traj_data(session, pairs_snapshot)
@@ -607,16 +723,19 @@ class DataCollector:
                 future = loop.run_in_executor(None, save_trajectory, traj_path, traj)
                 future.add_done_callback(_log_future_exception)
             except RuntimeError:
-                # 非事件循环上下文（如优雅退出的 finally 块），直接同步写入
                 save_trajectory(traj_path, traj)
-        logger.info("轨迹已导出: %s | 步骤=%d", session.id[:8], len(session.pairs))
+        total_pairs = len(session.pairs) + sum(len(c.pairs) for c in session.child_sessions)
+        logger.info("轨迹已导出: %s | 步骤=%d (含 %d 子会话)",
+                     session.id[:8], total_pairs, len(session.child_sessions))
 
     async def export_session_async(self, session: Session):
-        """导出会话的 .traj 文件（async 版本，用于 cleanup_expired 等 async 上下文）
+        """导出会话的 .traj 文件（async 版本）
 
-        P1 fix: 确保 traj 写入完成后再返回，避免 session 被删除时写入仍在进行。
+        子会话不单独导出 traj，它们的数据会在父会话导出时合并。
         """
-        if not session.pairs:
+        if session.is_subagent:
+            return
+        if not session.pairs and not any(c.pairs for c in session.child_sessions):
             return
         pairs_snapshot = list(session.pairs)
         traj_path, traj = self._build_traj_data(session, pairs_snapshot)
@@ -626,7 +745,9 @@ class DataCollector:
                 await loop.run_in_executor(None, save_trajectory, traj_path, traj)
             except Exception as e:
                 logger.warning("异步导出 .traj 失败: %s", e)
-        logger.info("轨迹已导出: %s | 步骤=%d", session.id[:8], len(session.pairs))
+        total_pairs = len(session.pairs) + sum(len(c.pairs) for c in session.child_sessions)
+        logger.info("轨迹已导出: %s | 步骤=%d (含 %d 子会话)",
+                     session.id[:8], total_pairs, len(session.child_sessions))
 
     def _write_pair_files(self, session: Session, pair: RequestResponsePair, pairs_snapshot: List[RequestResponsePair]):
         """同步写入请求/响应文件 + JSONL + .traj（在线程池中执行）
@@ -670,10 +791,11 @@ class DataCollector:
         jsonl_path = self.raw_dir / f"{session.id}.jsonl"
         self._append_raw_jsonl(jsonl_path, pair)
 
-        # 增量重建 .traj 文件（直接同步写入，因为已在线程池中）
-        traj_path, traj = self._build_traj_data(session, pairs_snapshot)
-        if traj_path and traj:
-            save_trajectory(traj_path, traj)
+        # 增量重建 .traj 文件 — 子会话跳过（它们在父会话导出时合并）
+        if not session.is_subagent:
+            traj_path, traj = self._build_traj_data(session, pairs_snapshot)
+            if traj_path and traj:
+                save_trajectory(traj_path, traj)
 
     @staticmethod
     def _append_raw_jsonl(jsonl_path: Path, pair: RequestResponsePair):
@@ -1015,17 +1137,22 @@ async def handle_session_event(request: web.Request) -> web.Response:
     event = data.get("event")
     logger.info("Hook 事件: %s session=%s", event, (session_id or "")[:8])
 
-    # P1 #7: SessionEnd 触发轨迹导出
+    # SessionEnd 触发轨迹导出（包含子会话合并）
     if event == "end" and session_id:
         session_manager: SessionManager = request.app["session_manager"]
         collector: DataCollector = request.app["collector"]
         if session_id in session_manager.active_sessions:
             session = session_manager.active_sessions[session_id]
             await collector.export_session_async(session)
+            total_pairs = len(session.pairs) + sum(len(c.pairs) for c in session.child_sessions)
             logger.info(
-                "会话结束: %s | API 调用=%d 次",
-                session_id[:8], len(session.pairs),
+                "会话结束: %s | API 调用=%d 次 (含 %d 个子会话)",
+                session_id[:8], total_pairs, len(session.child_sessions),
             )
+            # 清理子会话
+            for child in session.child_sessions:
+                session_manager.active_sessions.pop(child.id, None)
+                session_manager._subagent_parent_map.pop(child.id, None)
             del session_manager.active_sessions[session_id]
 
     return web.Response(status=200, text="ok")
@@ -1180,9 +1307,9 @@ async def main():
         pass
     finally:
         cleanup_task.cancel()
-        # 优雅退出：导出所有活跃会话的轨迹
+        # 优雅退出：导出所有活跃主会话的轨迹（子会话自动合并）
         for _sid, session in list(session_manager.active_sessions.items()):
-            if session.pairs:
+            if not session.is_subagent and (session.pairs or session.child_sessions):
                 collector.export_session(session)
         await runner.cleanup()
         logger.info("代理已停止，数据保存在: %s", output_dir.resolve())
