@@ -19,7 +19,7 @@ LOG_FILE="/tmp/claude-trace-proxy.log"
 PORT="${PORT:-4000}"
 UPSTREAM="${UPSTREAM:-https://api.anthropic.com}"
 OUTPUT="${OUTPUT:-$SCRIPT_DIR/trajectories}"
-FORCE_THINKING="${FORCE_THINKING:-0}"
+FORCE_THINKING="${FORCE_THINKING:-1}"
 
 usage() {
     echo "用法: $0 {install|uninstall|status|restart}"

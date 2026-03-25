@@ -338,9 +338,15 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
     if pairs and not metadata.claude_md_hash:
         metadata.claude_md_hash = _extract_claude_md_hash(pairs[0].request_body)
 
-    # exit_status：取最后一个 pair 的 stop_reason
+    # exit_status：取最后一个非 partial pair 的 stop_reason
+    # 修复竞态兜底：如果最后一个 pair 的 stop_reason 为空（record_response_async 还没完成），
+    # 向前搜索最近一个有 stop_reason 的 pair
     if pairs:
-        last_stop = pairs[-1].stop_reason
+        last_stop = ""
+        for p in reversed(pairs):
+            if p.stop_reason:
+                last_stop = p.stop_reason
+                break
         metadata.exit_status = last_stop if last_stop else "unknown"
 
     return {

@@ -49,6 +49,22 @@ def _log_future_exception(future: asyncio.Future):
         logger.error("线程池任务异常: %s", future.exception(), exc_info=future.exception())
 
 
+async def _drain_pending_writes(session: "Session"):
+    """等待会话中所有 pending 的写入任务完成，避免导出时读到半成品 pair。"""
+    if not session._pending_write_tasks:
+        return
+
+    pending = [task for task in session._pending_write_tasks if not task.done()]
+    session._pending_write_tasks = []
+    if not pending:
+        return
+
+    results = await asyncio.gather(*pending, return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception):
+            logger.warning("等待写入任务完成时发生异常: %s", result)
+
+
 # ─────────────────────────────────────────────
 # 安全：请求头脱敏 + 路径校验
 # ─────────────────────────────────────────────
@@ -164,6 +180,8 @@ class Session:
     parent_session_id: Optional[str] = None  # 如果是子会话，指向父会话 id
     is_subagent: bool = False
     is_title_generation: bool = False  # 标题生成请求（haiku 单条 message，不含有价值的轨迹数据）
+    # 修复 exit_status 竞态：跟踪 pending 的 record_response_async tasks
+    _pending_write_tasks: List[asyncio.Task] = field(default_factory=list)
 
     def update_activity(self):
         self.last_activity = datetime.now().isoformat()
@@ -369,6 +387,19 @@ class SessionManager:
         # 标题生成也用 haiku，这些请求不应创建独立的 traj 文件。
         parent = self._find_parent_session()
         if parent is not None:
+            # 同 model 的主会话请求（代理重启后 is_continuation 失败的恢复场景）：
+            # 如果请求带 system prompt + 多条 messages + model 匹配 parent，
+            # 说明这是同一个 Claude Code 会话的延续，直接关联而非创建子会话。
+            if (has_system and len(messages) > 1
+                    and _models_match(parent.model, request_model)):
+                parent.update_activity()
+                logger.info(
+                    "主会话恢复关联: %s (model=%s, msgs=%d→%d)",
+                    parent.id[:8], request_model,
+                    parent.prev_msg_count, len(messages),
+                )
+                return parent
+
             # 识别标题生成请求：haiku model + 单条 message + 有 system prompt
             # 标题生成的 system prompt 通常很短（<500 字符），且 messages 只有 1 条
             is_title_gen = (
@@ -396,6 +427,43 @@ class SessionManager:
             return child
 
         # 策略 4：创建新会话（自动生成 session_id）
+        # 识别标题生成请求：haiku + 单条 message，即使没有 parent 也不应产生独立 traj
+        is_title_gen = (
+            len(messages) == 1
+            and has_system
+            and "haiku" in request_model.lower()
+        )
+        if is_title_gen:
+            # 标题生成请求没有找到 parent — 可能主会话还没创建或已清理。
+            # 尝试关联到 pending 中的会话（Hook 已注册但首次 API 请求还没到）。
+            pending_parents = [
+                (sid, meta) for sid, meta in self._pending_sessions.items()
+            ]
+            if pending_parents:
+                parent_sid, parent_meta = pending_parents[0]
+                parent = self._create_session_from_pending(parent_sid, parent_meta, "标题生成提前关联")
+                child_sid = str(uuid.uuid4())
+                child = Session(
+                    id=child_sid,
+                    model=request_model,
+                    parent_session_id=parent.id,
+                    is_subagent=True,
+                    is_title_generation=True,
+                )
+                self.active_sessions[child_sid] = child
+                parent.child_sessions.append(child)
+                self._subagent_parent_map[child_sid] = parent.id
+                logger.info("标题生成提前关联: %s → parent %s", child_sid[:8], parent.id[:8])
+                return child
+            # 没有 pending 也没有 parent — 标记为标题生成的独立会话，
+            # 后续 DataCollector 会跳过导出
+            sid = str(uuid.uuid4())
+            session = Session(id=sid, model=request_body.get("model", ""),
+                              is_title_generation=True)
+            self.active_sessions[sid] = session
+            logger.info("标题生成（孤立）: %s model=%s", sid[:8], request_model)
+            return session
+
         sid = str(uuid.uuid4())
         session = Session(id=sid, model=request_body.get("model", ""))
         self.active_sessions[sid] = session
@@ -445,6 +513,8 @@ class SessionManager:
                 session = self.active_sessions[sid]
                 self._exporting_sessions.add(sid)
                 if collector and (session.pairs or session.child_sessions):
+                    # 修复 exit_status 竞态：等待 pending 写入完成
+                    await _drain_pending_writes(session)
                     await collector.export_session_async(session)
                 logger.info("会话超时清理: %s (pairs=%d, children=%d)",
                             sid[:8], len(session.pairs), len(session.child_sessions))
@@ -803,8 +873,12 @@ class DataCollector:
         """导出会话的 .traj 文件（同步版本，用于优雅退出等非 async 上下文）
 
         子会话不单独导出 traj，它们的数据会在父会话导出时合并。
+        标题生成的孤立会话（没有 parent）也跳过导出。
         """
         if session.is_subagent:
+            return
+        # 跳过标题生成的孤立会话（没有 parent 的标题生成请求）
+        if session.is_title_generation:
             return
         if not session.pairs and not any(c.pairs for c in session.child_sessions):
             return
@@ -827,8 +901,12 @@ class DataCollector:
         """导出会话的 .traj 文件（async 版本）
 
         子会话不单独导出 traj，它们的数据会在父会话导出时合并。
+        标题生成的孤立会话（没有 parent）也跳过导出。
         """
         if session.is_subagent:
+            return
+        # 跳过标题生成的孤立会话（没有 parent 的标题生成请求）
+        if session.is_title_generation:
             return
         if not session.pairs and not any(c.pairs for c in session.child_sessions):
             return
@@ -1036,6 +1114,8 @@ async def handle_streaming(
                 collector.record_partial_response(session, pair, b"".join(raw_chunks))
             )
             t.add_done_callback(_log_task_exception)
+            # 修复 exit_status 竞态：跟踪 partial task
+            session._pending_write_tasks.append(t)
 
     # write_eof 只调用一次（无论正常结束还是中断）
     try:
@@ -1055,6 +1135,8 @@ async def handle_streaming(
         collector.record_response_async(session, pair, complete_response, pairs_snapshot)
     )
     t.add_done_callback(_log_task_exception)
+    # 修复 exit_status 竞态：跟踪 task，export 前 drain
+    session._pending_write_tasks.append(t)
 
     return response
 
@@ -1184,6 +1266,8 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                     collector.record_response_async(session, pair, response_json, pairs_snapshot)
                 )
                 t.add_done_callback(_log_task_exception)
+                # 修复 exit_status 竞态：跟踪 task，export 前 drain
+                session._pending_write_tasks.append(t)
 
                 return web.Response(
                     status=upstream_resp.status,
@@ -1251,6 +1335,8 @@ async def handle_session_event(request: web.Request) -> web.Response:
         if not session.is_subagent:
             session_manager._exporting_sessions.add(session_id)
             try:
+                # 修复 exit_status 竞态：等待所有 pending 的 record_response_async 完成
+                await _drain_pending_writes(session)
                 await collector.export_session_async(session)
                 total_pairs = len(session.pairs) + sum(len(c.pairs) for c in session.child_sessions)
                 logger.info("Turn 结束增量导出: %s | API 调用=%d", session_id[:8], total_pairs)
@@ -1263,6 +1349,8 @@ async def handle_session_event(request: web.Request) -> web.Response:
         session = session_manager._remove_session_and_children(session_id)
         if session and not session.is_subagent:
             try:
+                # 修复 exit_status 竞态：等待所有 pending 的 record_response_async 完成
+                await _drain_pending_writes(session)
                 await collector.export_session_async(session)
                 total_pairs = len(session.pairs) + sum(len(c.pairs) for c in session.child_sessions)
                 logger.info(

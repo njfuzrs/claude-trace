@@ -7,7 +7,7 @@
 PORT="${PORT:-4000}"
 UPSTREAM="${UPSTREAM:-https://api.anthropic.com}"
 OUTPUT="${OUTPUT:-}"
-FORCE_THINKING="${FORCE_THINKING:-0}"
+FORCE_THINKING="${FORCE_THINKING:-1}"
 PID_FILE="/tmp/claude-trace-proxy.pid"
 LOG_FILE="/tmp/claude-trace-proxy.log"
 
