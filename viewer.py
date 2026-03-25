@@ -13,6 +13,7 @@ viewer.py — 轨迹数据 HTML 查看器
 import argparse
 import html
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List
@@ -159,14 +160,10 @@ def _format_content_text(text: str) -> str:
     if not text:
         return ""
     escaped = _esc(text)
-    # 代码块 ```...```
-    import re
     def _code_block(m):
-        lang = m.group(1) or ""
         code = m.group(2)
         return f'<pre><code>{code}</code></pre>'
     escaped = re.sub(r'```(\w*)\n(.*?)```', _code_block, escaped, flags=re.DOTALL)
-    # 行内代码
     escaped = re.sub(r'`([^`]+)`', r'<code>\1</code>', escaped)
     return escaped
 
@@ -199,11 +196,55 @@ def _format_usage(usage: Dict) -> str:
 # 渲染单个 .traj 文件
 # ─────────────────────────────────────────────
 
+def _build_tool_name_map(history: List[Dict]) -> Dict[str, str]:
+    """从 history 中构建 tool_use_id -> tool_name 的映射"""
+    mapping = {}
+    for entry in history:
+        if entry.get("role") != "assistant":
+            continue
+        content = entry.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                tid = b.get("id", "")
+                if tid:
+                    mapping[tid] = b.get("name", "unknown")
+        # 也从 tool_calls 字段补充（OpenAI 格式）
+        for tc in (entry.get("tool_calls") or []):
+            if isinstance(tc, dict):
+                tid = tc.get("id", "")
+                name = tc.get("function", {}).get("name", "")
+                if tid and name:
+                    mapping[tid] = name
+    return mapping
+
+
+def _tool_call_summary(tool_name: str, tool_input: Dict) -> str:
+    """为工具调用生成摘要后缀"""
+    if tool_name in ("Read", "read"):
+        return f' — {_esc(tool_input.get("file_path", "")[-60:])}'
+    elif tool_name in ("Edit", "edit", "Write", "write"):
+        return f' — {_esc(tool_input.get("file_path", "")[-60:])}'
+    elif tool_name in ("Bash", "bash"):
+        cmd = tool_input.get("command", "")
+        return f' — {_esc(cmd[:80])}'
+    elif tool_name in ("Glob", "glob"):
+        return f' — {_esc(tool_input.get("pattern", ""))}'
+    elif tool_name in ("Grep", "grep"):
+        return f' — {_esc(tool_input.get("pattern", "")[:40])}'
+    elif tool_name == "Agent":
+        return f' — {_esc(tool_input.get("description", "")[:50])}'
+    elif tool_name in ("TaskCreate", "TaskUpdate"):
+        return f' — {_esc(tool_input.get("subject", tool_input.get("taskId", ""))[:50])}'
+    return ""
+
+
 def render_traj(traj: Dict) -> str:
     """将 .traj 数据渲染为 HTML body 内容"""
     metadata = traj.get("metadata", {})
-    info = traj.get("info", {})
     history = traj.get("history", [])
+    tool_name_map = _build_tool_name_map(history)
 
     parts: List[str] = []
 
@@ -249,14 +290,18 @@ def render_traj(traj: Dict) -> str:
 
     # ── 对话流 ──
     turn_num = 0
-    for idx, entry in enumerate(history):
+    for entry in history:
         role = entry.get("role", "")
         content = entry.get("content", "")
-        timestamp = entry.get("timestamp", "")[:19]
+        timestamp = entry.get("timestamp", "")
+        if isinstance(timestamp, str):
+            timestamp = timestamp[:19]
+        else:
+            timestamp = ""
         usage = entry.get("usage", {})
         stop_reason = entry.get("stop_reason", "")
         thinking_blocks = entry.get("thinking_blocks")
-        tool_calls = entry.get("tool_calls")
+        tool_calls = entry.get("tool_calls") or []
 
         if role == "system":
             # System prompt — 折叠
@@ -272,7 +317,6 @@ def render_traj(traj: Dict) -> str:
 
         elif role == "user":
             if isinstance(content, str):
-                # 纯文本用户输入
                 if not content.strip():
                     continue
                 parts.append(f"""
@@ -282,14 +326,12 @@ def render_traj(traj: Dict) -> str:
                 </div>
                 """)
             elif isinstance(content, list):
-                # Content blocks (tool_result 或 text blocks)
-                has_text = any(b.get("type") == "text" for b in content if isinstance(b, dict))
-                has_tool_result = any(b.get("type") == "tool_result" for b in content if isinstance(b, dict))
+                # 先渲染 text blocks（如果有且不混合 tool_result）
+                text_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                tool_results = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
 
-                if has_text and not has_tool_result:
-                    # 纯文本 blocks
-                    texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
-                    combined = "\n".join(t for t in texts if t.strip())
+                if text_blocks and not tool_results:
+                    combined = "\n".join(b.get("text", "") for b in text_blocks if b.get("text", "").strip())
                     if combined.strip():
                         parts.append(f"""
                         <div class="msg msg-user">
@@ -298,13 +340,11 @@ def render_traj(traj: Dict) -> str:
                         </div>
                         """)
 
-                if has_tool_result:
-                    # Tool results
+                if tool_results:
                     result_parts = []
-                    for b in content:
-                        if not isinstance(b, dict) or b.get("type") != "tool_result":
-                            continue
-                        tool_id = b.get("tool_use_id", "")
+                    for b in tool_results:
+                        tool_use_id = b.get("tool_use_id", "")
+                        tool_name = tool_name_map.get(tool_use_id, "")
                         is_error = b.get("is_error", False)
                         result_content = b.get("content", "")
                         if isinstance(result_content, list):
@@ -314,9 +354,10 @@ def render_traj(traj: Dict) -> str:
                         result_content = _truncate(str(result_content), 8000)
                         error_cls = " is-error" if is_error else ""
                         error_label = " [ERROR]" if is_error else ""
+                        name_label = f" [{_esc(tool_name)}]" if tool_name else ""
                         result_parts.append(f"""
                         <details class="tool-result{error_cls}">
-                          <summary>Result{_esc(error_label)} ({len(result_content):,} chars)</summary>
+                          <summary>Result{name_label}{_esc(error_label)} ({len(result_content):,} chars)</summary>
                           <div class="detail-body"><pre>{_esc(result_content)}</pre></div>
                         </details>
                         """)
@@ -336,7 +377,7 @@ def render_traj(traj: Dict) -> str:
 
             inner_parts = []
 
-            # Thinking blocks
+            # Thinking blocks（优先从顶层字段读取）
             if thinking_blocks:
                 for tb in thinking_blocks:
                     thinking_text = tb.get("thinking", "") if isinstance(tb, dict) else str(tb)
@@ -355,7 +396,7 @@ def render_traj(traj: Dict) -> str:
                         continue
                     btype = b.get("type", "")
                     if btype == "thinking":
-                        # 已在上面处理
+                        # 从 content blocks 中补充（仅当顶层 thinking_blocks 为空时）
                         if not thinking_blocks:
                             thinking_text = b.get("thinking", "")
                             if thinking_text:
@@ -365,32 +406,22 @@ def render_traj(traj: Dict) -> str:
                                   <div class="detail-body">{_esc(_truncate(thinking_text, 8000))}</div>
                                 </details>
                                 """)
+                    elif btype == "redacted_thinking":
+                        inner_parts.append("""
+                        <details class="thinking">
+                          <summary>Redacted Thinking</summary>
+                          <div class="detail-body">[content redacted by API]</div>
+                        </details>
+                        """)
                     elif btype == "text":
                         text = b.get("text", "")
                         if text.strip():
                             inner_parts.append(f'<div class="msg-text">{_format_content_text(text)}</div>')
                     elif btype == "tool_use":
                         tool_name = b.get("name", "unknown")
-                        tool_input = b.get("input", {})
+                        tool_input = b.get("input", {}) or {}
                         input_str = json.dumps(tool_input, ensure_ascii=False, indent=2)
-                        # 对常见工具显示关键参数摘要
-                        summary_extra = ""
-                        if tool_name in ("Read", "read"):
-                            summary_extra = f' — {_esc(tool_input.get("file_path", "")[-60:])}'
-                        elif tool_name in ("Edit", "edit"):
-                            summary_extra = f' — {_esc(tool_input.get("file_path", "")[-60:])}'
-                        elif tool_name in ("Write", "write"):
-                            summary_extra = f' — {_esc(tool_input.get("file_path", "")[-60:])}'
-                        elif tool_name in ("Bash", "bash"):
-                            cmd = tool_input.get("command", "")
-                            summary_extra = f' — {_esc(cmd[:60])}'
-                        elif tool_name in ("Glob", "glob"):
-                            summary_extra = f' — {_esc(tool_input.get("pattern", ""))}'
-                        elif tool_name in ("Grep", "grep"):
-                            summary_extra = f' — {_esc(tool_input.get("pattern", "")[:40])}'
-                        elif tool_name == "Agent":
-                            summary_extra = f' — {_esc(tool_input.get("description", "")[:50])}'
-
+                        summary_extra = _tool_call_summary(tool_name, tool_input)
                         inner_parts.append(f"""
                         <details class="tool-call">
                           <summary>Tool: {_esc(tool_name)}{summary_extra}</summary>
@@ -400,14 +431,45 @@ def render_traj(traj: Dict) -> str:
             elif isinstance(content, str) and content.strip():
                 inner_parts.append(f'<div class="msg-text">{_format_content_text(content)}</div>')
 
+            # 当 content 为空但有 tool_calls 字段时，从 tool_calls 补充渲染
+            if not inner_parts and tool_calls:
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    func = tc.get("function", {})
+                    tool_name = func.get("name", "unknown")
+                    try:
+                        tool_input = json.loads(func.get("arguments", "{}"))
+                    except (json.JSONDecodeError, TypeError):
+                        tool_input = {"_raw": func.get("arguments", "")}
+                    input_str = json.dumps(tool_input, ensure_ascii=False, indent=2)
+                    summary_extra = _tool_call_summary(tool_name, tool_input)
+                    inner_parts.append(f"""
+                    <details class="tool-call">
+                      <summary>Tool: {_esc(tool_name)}{summary_extra}</summary>
+                      <div class="detail-body"><pre>{_esc(_truncate(input_str, 5000))}</pre></div>
+                    </details>
+                    """)
+
+            # 始终渲染 assistant 消息（即使 content 为空，也显示元信息）
+            ts_html = f'<span class="msg-ts">{_esc(timestamp)}</span>' if timestamp else ''
             if inner_parts:
                 parts.append(f"""
                 <div class="msg msg-assistant">
                   <div class="msg-label">Assistant <span class="turn-num">#{turn_num}</span>
-                    {usage_html}{stop_html}
-                    {f'<span class="msg-ts">{_esc(timestamp)}</span>' if timestamp else ''}
+                    {usage_html}{stop_html}{ts_html}
                   </div>
                   {"".join(inner_parts)}
+                </div>
+                """)
+            elif usage or stop_reason or timestamp:
+                # 空 content 的 assistant 消息 — 显示占位信息
+                parts.append(f"""
+                <div class="msg msg-assistant" style="opacity: 0.6">
+                  <div class="msg-label">Assistant <span class="turn-num">#{turn_num}</span>
+                    {usage_html}{stop_html}{ts_html}
+                  </div>
+                  <div class="msg-text" style="color: var(--system-fg); font-style: italic; font-size: 12px">[empty response]</div>
                 </div>
                 """)
 
@@ -452,7 +514,6 @@ def generate_index_html(traj_dir: Path) -> str:
             api_calls = meta.get("total_api_calls", 0)
             cost = meta.get("total_cost_usd", 0)
             exit_status = meta.get("exit_status", "")
-            tools = meta.get("tools_used", [])
             size_kb = f.stat().st_size / 1024
             html_name = f.stem + ".html"
             rows.append(f"""
