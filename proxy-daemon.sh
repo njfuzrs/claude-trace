@@ -1,6 +1,8 @@
 #!/bin/bash
 # proxy-daemon.sh — 自动重启的代理守护进程
 # 被 kill 后自动重启，直到收到 SIGTERM 两次或删除 PID 文件
+#
+# 支持 launchd 环境：所有路径使用绝对路径，不依赖 $PWD
 
 PORT="${PORT:-4000}"
 UPSTREAM="${UPSTREAM:-https://api.anthropic.com}"
@@ -8,8 +10,13 @@ OUTPUT="${OUTPUT:-}"
 FORCE_THINKING="${FORCE_THINKING:-0}"
 PID_FILE="/tmp/claude-trace-proxy.pid"
 LOG_FILE="/tmp/claude-trace-proxy.log"
+
+# launchd 启动时 $0 可能是绝对路径，确保 SCRIPT_DIR 正确解析
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUTPUT="${OUTPUT:-$SCRIPT_DIR/trajectories}"
+
+# 确保输出目录存在
+mkdir -p "$OUTPUT"
 
 echo $$ > "$PID_FILE"
 

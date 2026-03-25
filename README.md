@@ -34,11 +34,19 @@ Claude Code 轨迹采集工具。通过 HTTP 代理 + Hooks 双通道采集 Clau
 # 1. 安装依赖
 pip install aiohttp
 
-# 2. 一键启动（自动配置 Hooks + 启动代理 + 启动 Claude Code）
-./start.sh
+# 2. 安装代理服务（开机自启 + 崩溃重启，只需执行一次）
+./install-daemon.sh install
+
+# 3. 配置 Hooks（只需执行一次）
+python3 setup_hooks.py
+
+# 4. 配置 settings.json（只需执行一次）
+# 确保 ANTHROPIC_BASE_URL 指向本地代理：http://127.0.0.1:4000
 ```
 
-启动后正常使用 Claude Code 即可，所有交互数据会自动采集到 `./trajectories/` 目录。
+配置完成后，以后每次正常启动 `claude` 即可，所有请求自动经过代理采集到 `./trajectories/` 目录。代理开机自启，无需手动管理。
+
+> **核心原则：代理永不中断。** 所有 Claude Code 请求必须经过本地代理（`localhost:4000`）转发到上游 API。代理通过 macOS launchd 服务管理，开机自启 + 崩溃自动重启，确保采集不丢数据。如果代理未运行而 `ANTHROPIC_BASE_URL` 指向 `localhost:4000`，Claude Code 会报 403 错误。
 
 ---
 
@@ -102,21 +110,45 @@ Claude Code 退出后，代理自动停止。
 
 ### 方式二：守护进程模式（推荐日常使用）
 
-代理常驻后台，被 kill 后自动重启。适合长期使用，不需要每次手动启动代理。
+代理常驻后台，开机自启 + 崩溃自动重启。配置一次后无需再管。
 
-**第一步：启动守护进程**
-
-```bash
-nohup ./proxy-daemon.sh > /dev/null 2>&1 &
-```
-
-**第二步：配置 Hooks（只需执行一次）**
+**方法 A：launchd 自启动（推荐 macOS）**
 
 ```bash
+# 一键安装（开机自启 + 崩溃重启）
+./install-daemon.sh install
+
+# 配置 Hooks（只需执行一次）
 python3 setup_hooks.py
+
+# 配置 settings.json（只需执行一次）
+# 将 ANTHROPIC_BASE_URL 改为 http://127.0.0.1:4000
 ```
 
-**第三步：配置 settings.json（只需执行一次）**
+安装后重启电脑也会自动启动代理，无需手动操作。
+
+```bash
+# 管理命令
+./install-daemon.sh status     # 查看状态
+./install-daemon.sh restart    # 重启服务
+./install-daemon.sh uninstall  # 卸载服务
+```
+
+自定义参数通过环境变量传入：
+
+```bash
+# 自定义上游和端口
+PORT=5000 UPSTREAM=https://api.anthropic.com ./install-daemon.sh install
+```
+
+**方法 B：手动 nohup 启动**
+
+```bash
+# 启动守护进程（终端关闭后继续运行，但重启后需要重新启动）
+UPSTREAM=https://api.anthropic.com nohup ./proxy-daemon.sh > /dev/null 2>&1 &
+```
+
+**配置 settings.json（两种方法都需要，只需执行一次）**
 
 编辑 `~/.claude/settings.json`，将 `ANTHROPIC_BASE_URL` 指向代理：
 
@@ -130,19 +162,6 @@ python3 setup_hooks.py
 
 配置完成后，以后每次正常启动 `claude` 即可，所有请求自动经过代理采集。
 
-**切换上游地址：** `proxy-daemon.sh` 通过环境变量配置，不需要改文件：
-
-```bash
-# 默认上游是 https://api.anthropic.com，直接启动即可
-nohup ./proxy-daemon.sh > /dev/null 2>&1 &
-
-# 使用第三方代理（如 api.anthropic.com）
-UPSTREAM=https://api.anthropic.com nohup ./proxy-daemon.sh > /dev/null 2>&1 &
-
-# 同时自定义端口和输出目录
-PORT=5000 OUTPUT=/data/traces UPSTREAM=https://api.anthropic.com nohup ./proxy-daemon.sh > /dev/null 2>&1 &
-```
-
 支持的环境变量：
 
 | 变量 | 默认值 | 说明 |
@@ -150,25 +169,16 @@ PORT=5000 OUTPUT=/data/traces UPSTREAM=https://api.anthropic.com nohup ./proxy-d
 | `PORT` | 4000 | 代理监听端口 |
 | `UPSTREAM` | `https://api.anthropic.com` | 上游 API 地址 |
 | `OUTPUT` | `./trajectories` | 轨迹数据输出目录 |
-
-切换上游时需要重启守护进程：
-
-```bash
-# 停掉旧的
-rm /tmp/claude-trace-proxy.pid && kill $(lsof -ti :4000)
-
-# 用新上游启动
-UPSTREAM=https://新地址 nohup ./proxy-daemon.sh > /dev/null 2>&1 &
-```
+| `FORCE_THINKING` | 0 | 非 0 时强制 thinking effort=max |
 
 **停止守护进程：**
 
 ```bash
-# 方法 1：删除 PID 文件后 kill（彻底停止，不会重启）
-rm /tmp/claude-trace-proxy.pid && kill $(lsof -ti :4000)
+# launchd 方式
+./install-daemon.sh uninstall
 
-# 方法 2：直接 kill 守护进程
-kill $(cat /tmp/claude-trace-proxy.pid)
+# nohup 方式：删除 PID 文件后 kill
+rm /tmp/claude-trace-proxy.pid && kill $(lsof -ti :4000)
 ```
 
 ### 方式三：手动分步启动
@@ -212,6 +222,8 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:4000 claude
 | `--session-timeout` | 300 | 会话超时时间（秒），超时后自动导出 .traj |
 | `--save-raw` | true | 保存原始请求/响应 JSON 文件 |
 | `--no-save-raw` | - | 只保留 JSONL + .traj，不保存单独的 JSON 文件 |
+| `--events-dir` | ~/.claude/trajectory_events | Hooks 事件数据目录 |
+| `--force-thinking` | 0 | 非 0 时将 adaptive thinking 的 effort 改写为 max，提高 thinking blocks 产生概率（仅 Opus 4.6） |
 | `--verbose` | false | 详细日志输出 |
 
 ### Hooks 配置
@@ -221,6 +233,7 @@ python3 setup_hooks.py              # 写入 ~/.claude/settings.json（全局）
 python3 setup_hooks.py --local      # 写入 .claude/settings.local.json（当前项目）
 python3 setup_hooks.py --show       # 只打印配置，不写入
 python3 setup_hooks.py --remove     # 移除已配置的 hooks
+python3 setup_hooks.py --collector /path/to/collector.py  # 指定 collector 路径
 ```
 
 订阅的事件：
@@ -420,10 +433,31 @@ python3 merger.py --all \
 | `combine_trajs.py` | 合并 + shuffle SFT 数据 |
 | `start.sh` | 一键启动脚本 |
 | `proxy-daemon.sh` | 自动重启的守护进程脚本 |
+| `install-daemon.sh` | 安装/卸载 launchd 自启动服务（macOS） |
+| `viewer.py` | 轨迹数据 HTML 查看器，将 .traj 转为可视化 HTML |
 
 ---
 
 ## 常见问题
+
+### Claude Code 报 403 错误
+
+最常见的原因是代理未运行。排查步骤：
+
+```bash
+# 1. 检查代理是否在运行
+./install-daemon.sh status
+
+# 2. 如果未运行，重启服务
+./install-daemon.sh restart
+
+# 3. 检查 settings.json 中 ANTHROPIC_BASE_URL 是否指向本地代理
+grep ANTHROPIC_BASE_URL ~/.claude/settings.json
+# 应该是: "ANTHROPIC_BASE_URL": "http://127.0.0.1:4000"
+
+# 4. 查看代理日志排查具体错误
+tail -20 /tmp/claude-trace-proxy.log
+```
 
 ### Claude Code 没有走代理
 
@@ -483,6 +517,11 @@ ls ~/.claude/trajectory_events/
 ### 如何查看采集到的数据
 
 ```bash
+# 可视化查看 .traj（推荐，生成 HTML 在浏览器中查看）
+python3 viewer.py trajectories/traj/<session_id>.traj
+python3 viewer.py trajectories/traj/              # 目录索引模式
+python3 viewer.py trajectories/traj/xxx.traj -o out.html  # 指定输出文件
+
 # 查看原始请求/响应
 cat trajectories/raw/<session_id>/001_request.json | python3 -m json.tool
 
@@ -508,13 +547,13 @@ cat ~/.claude/trajectory_events/<session_id>.jsonl | python3 -m json.tool --json
 ### 如何移除所有配置恢复原状
 
 ```bash
-# 1. 停止守护进程
-rm /tmp/claude-trace-proxy.pid && kill $(lsof -ti :4000) 2>/dev/null
+# 1. 卸载 launchd 服务
+./install-daemon.sh uninstall
 
 # 2. 移除 Hooks 配置
 python3 setup_hooks.py --remove
 
-# 3. 恢复 ANTHROPIC_BASE_URL（改回原来的值或删除）
+# 3. 恢复 ANTHROPIC_BASE_URL（改回原来的上游地址或删除）
 # 编辑 ~/.claude/settings.json
 
 # 4. 删除 hooks 脚本
@@ -529,7 +568,10 @@ rm -rf ~/.claude/trajectory_events
 ## 停止与清理
 
 ```bash
-# 停止守护进程（彻底停止，不重启）
+# 停止 launchd 服务（推荐）
+./install-daemon.sh uninstall
+
+# 停止手动启动的守护进程
 rm /tmp/claude-trace-proxy.pid && kill $(lsof -ti :4000)
 
 # 停止手动启动的代理
