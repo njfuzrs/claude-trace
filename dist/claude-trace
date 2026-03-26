@@ -1,0 +1,567 @@
+#!/bin/bash
+# claude-trace — 统一 CLI 入口
+#
+# 用法：
+#   claude-trace start       # 安装并启动 launchd 服务
+#   claude-trace stop        # 停止服务
+#   claude-trace status      # 查看服务状态
+#   claude-trace restart     # 重启服务
+#   claude-trace switch <ch> # 切换渠道
+#   claude-trace switch list # 列出所有渠道
+#   claude-trace logs        # 查看日志
+#   claude-trace uninstall   # 完整卸载
+#   claude-trace version     # 显示版本
+
+set -euo pipefail
+
+INSTALL_DIR="$HOME/.claude-trace"
+LABEL="com.claude-trace.proxy"
+PLIST_PATH="$HOME/Library/LaunchAgents/${LABEL}.plist"
+LOG_FILE="/tmp/claude-trace-proxy.log"
+PID_FILE="/tmp/claude-trace-proxy.pid"
+SETTINGS="$HOME/.claude/settings.json"
+CONFIG="$INSTALL_DIR/channels.json"
+PORT="${PORT:-4000}"
+
+# ─── 工具函数 ───
+
+check_installed() {
+    if [ ! -f "$INSTALL_DIR/bin/claude-trace-proxy" ]; then
+        echo "错误：claude-trace 未安装或安装不完整"
+        echo "请重新安装：curl -fsSL <release-url>/install.sh | bash"
+        exit 1
+    fi
+}
+
+# ─── start ───
+
+do_start() {
+    check_installed
+    mkdir -p "$HOME/Library/LaunchAgents"
+    mkdir -p "$INSTALL_DIR/trajectories"
+
+    # 如果已安装，先卸载
+    if launchctl list "$LABEL" &>/dev/null; then
+        echo "检测到已有服务，先停止..."
+        launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    fi
+
+    # 从 channels.json 读取当前渠道配置
+    local UPSTREAM FORCE_THINKING TRAJ_PLATFORM_URL TRAJ_UPLOAD_TOKEN TRAJ_USER_ID TRAJ_DEVICE_ID TRAJ_CLEANUP_AFTER_UPLOAD
+    if [ -f "$CONFIG" ]; then
+        local _cfg
+        _cfg=$(python3 -c "
+import json, sys
+config = json.load(open(sys.argv[1]))
+channels = config.get('channels', {})
+active = config.get('active_channel', '')
+if active and active in channels:
+    ch = channels[active]
+elif 'default' in channels:
+    ch = channels['default']
+elif channels:
+    ch = next(iter(channels.values()))
+else:
+    ch = {}
+upload = config.get('upload', {})
+vals = [
+    ch.get('upstream', 'https://api.anthropic.com'),
+    str(ch.get('force_thinking', 0)),
+    upload.get('platform_url', ''),
+    upload.get('upload_token', ''),
+    upload.get('user_id', ''),
+    upload.get('device_id', ''),
+    str(upload.get('cleanup_after_upload', 'true')),
+]
+print('\n'.join(vals))
+" "$CONFIG")
+        UPSTREAM="$(echo "$_cfg" | sed -n '1p')"
+        FORCE_THINKING="$(echo "$_cfg" | sed -n '2p')"
+        TRAJ_PLATFORM_URL="$(echo "$_cfg" | sed -n '3p')"
+        TRAJ_UPLOAD_TOKEN="$(echo "$_cfg" | sed -n '4p')"
+        TRAJ_USER_ID="$(echo "$_cfg" | sed -n '5p')"
+        TRAJ_DEVICE_ID="$(echo "$_cfg" | sed -n '6p')"
+        TRAJ_CLEANUP_AFTER_UPLOAD="$(echo "$_cfg" | sed -n '7p')"
+    else
+        UPSTREAM="${UPSTREAM:-https://api.anthropic.com}"
+        FORCE_THINKING="${FORCE_THINKING:-0}"
+        TRAJ_PLATFORM_URL=""
+        TRAJ_UPLOAD_TOKEN=""
+        TRAJ_USER_ID=""
+        TRAJ_DEVICE_ID=""
+        TRAJ_CLEANUP_AFTER_UPLOAD="true"
+    fi
+
+    # 生成 plist
+    cat > "$PLIST_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${INSTALL_DIR}/proxy-daemon.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PORT</key>
+        <string>${PORT}</string>
+        <key>UPSTREAM</key>
+        <string>${UPSTREAM}</string>
+        <key>OUTPUT</key>
+        <string>${INSTALL_DIR}/trajectories</string>
+        <key>FORCE_THINKING</key>
+        <string>${FORCE_THINKING}</string>
+        <key>TRAJ_PLATFORM_URL</key>
+        <string>${TRAJ_PLATFORM_URL}</string>
+        <key>TRAJ_UPLOAD_TOKEN</key>
+        <string>${TRAJ_UPLOAD_TOKEN}</string>
+        <key>TRAJ_USER_ID</key>
+        <string>${TRAJ_USER_ID}</string>
+        <key>TRAJ_DEVICE_ID</key>
+        <string>${TRAJ_DEVICE_ID}</string>
+        <key>TRAJ_CLEANUP_AFTER_UPLOAD</key>
+        <string>${TRAJ_CLEANUP_AFTER_UPLOAD}</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${LOG_FILE}</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_FILE}</string>
+    <key>WorkingDirectory</key>
+    <string>${INSTALL_DIR}</string>
+</dict>
+</plist>
+PLIST
+
+    launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+
+    echo "✅ 服务已启动"
+    echo "   端口:  $PORT"
+    echo "   上游:  $UPSTREAM"
+    echo "   日志:  $LOG_FILE"
+    echo ""
+    echo "验证: claude-trace status"
+}
+
+# ─── stop ───
+
+do_stop() {
+    if launchctl list "$LABEL" &>/dev/null; then
+        launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+        echo "✅ 服务已停止"
+    else
+        echo "服务未运行"
+    fi
+
+    # 清理残留进程
+    local pid
+    pid=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+    if [ -n "$pid" ]; then
+        kill "$pid" 2>/dev/null || true
+    fi
+}
+
+# ─── status ───
+
+do_status() {
+    echo "=== claude-trace 状态 ==="
+    echo ""
+
+    # 版本
+    if [ -f "$INSTALL_DIR/version" ]; then
+        echo "版本: $(cat "$INSTALL_DIR/version")"
+    else
+        echo "版本: 未知"
+    fi
+    echo ""
+
+    # launchd 服务
+    echo "=== launchd 服务 ==="
+    if launchctl list "$LABEL" &>/dev/null; then
+        launchctl list "$LABEL"
+        echo ""
+        echo "状态: 运行中"
+    else
+        echo "状态: 未安装或未运行"
+    fi
+
+    echo ""
+    echo "=== 端口 $PORT ==="
+    if lsof -i :"$PORT" &>/dev/null; then
+        lsof -i :"$PORT"
+    else
+        echo "无进程监听"
+    fi
+
+    echo ""
+    echo "=== 健康检查 ==="
+    curl -s "http://127.0.0.1:$PORT/_internal/health" 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "代理未响应"
+
+    echo ""
+    echo "=== 最近日志 ==="
+    if [ -f "$LOG_FILE" ]; then
+        tail -5 "$LOG_FILE"
+    else
+        echo "无日志文件"
+    fi
+}
+
+# ─── restart ───
+
+do_restart() {
+    if launchctl list "$LABEL" &>/dev/null; then
+        launchctl kickstart -k "gui/$(id -u)/$LABEL"
+        echo "✅ 服务已重启"
+    else
+        echo "服务未安装，执行 start..."
+        do_start
+    fi
+}
+
+# ─── switch ───
+
+do_switch() {
+    local subcmd="${1:-}"
+
+    if [ -z "$subcmd" ]; then
+        echo "用法: claude-trace switch {list | status | <渠道名>}"
+        return 1
+    fi
+
+    if [ ! -f "$CONFIG" ]; then
+        echo "错误：找不到渠道配置文件 $CONFIG"
+        echo "请编辑 $INSTALL_DIR/channels.json.example 并重命名为 channels.json"
+        return 1
+    fi
+
+    case "$subcmd" in
+        list|l)
+            python3 - "$CONFIG" <<'PYEOF'
+import json, sys
+config = json.load(open(sys.argv[1]))
+channels = config.get("channels", {})
+active = config.get("active_channel", "")
+print("可用渠道：")
+for key, ch in channels.items():
+    upstream = ch.get("upstream", "?")
+    name = ch.get("name", key)
+    ft = ch.get("force_thinking", 0)
+    token = ch.get("token", "")
+    token_preview = token[:12] + "…" if token else "?"
+    marker = " ← 当前" if key == active else ""
+    print(f"  {key:<12} {name}  ({upstream}){marker}")
+    print(f"             token={token_preview}  force_thinking={ft}")
+PYEOF
+            ;;
+        status|s)
+            echo "=== 当前渠道配置 ==="
+            if [ -f "$SETTINGS" ]; then
+                TOKEN=$(python3 -c "import json; d=json.load(open('$SETTINGS')); print(d.get('env',{}).get('ANTHROPIC_AUTH_TOKEN','?'))" 2>/dev/null || echo "?")
+                BASE_URL=$(python3 -c "import json; d=json.load(open('$SETTINGS')); print(d.get('env',{}).get('ANTHROPIC_BASE_URL','?'))" 2>/dev/null || echo "?")
+                echo "  token    : ${TOKEN:0:12}…"
+                echo "  base_url : $BASE_URL"
+            fi
+            if [ -f "$PLIST_PATH" ]; then
+                UPSTREAM=$(python3 -c "
+import plistlib
+with open('$PLIST_PATH','rb') as f: d=plistlib.load(f)
+print(d.get('EnvironmentVariables',{}).get('UPSTREAM','?'))
+" 2>/dev/null || echo "?")
+                FT=$(python3 -c "
+import plistlib
+with open('$PLIST_PATH','rb') as f: d=plistlib.load(f)
+print(d.get('EnvironmentVariables',{}).get('FORCE_THINKING','?'))
+" 2>/dev/null || echo "?")
+                echo "  upstream : $UPSTREAM"
+                echo "  force_thinking : $FT"
+            fi
+            ;;
+        *)
+            # 切换到指定渠道
+            local channel="$subcmd"
+
+            read -r TOKEN UPSTREAM FORCE_THINKING NAME < <(python3 - "$CONFIG" "$channel" <<'PYEOF'
+import json, sys
+config = json.load(open(sys.argv[1]))
+key = sys.argv[2]
+channels = config.get("channels", {})
+if key not in channels:
+    print(f"错误：渠道 '{key}' 不存在，可用: {list(channels.keys())}", file=sys.stderr)
+    sys.exit(1)
+ch = channels[key]
+print(ch["token"], ch["upstream"], ch.get("force_thinking", 0), ch.get("name", key))
+PYEOF
+)
+
+            echo "切换到: $NAME"
+
+            # 1. 更新 settings.json
+            python3 - "$SETTINGS" "$TOKEN" "$PORT" <<'PYEOF'
+import sys, json
+path, token, port = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    data = json.load(f)
+if "env" not in data:
+    data["env"] = {}
+data["env"]["ANTHROPIC_AUTH_TOKEN"] = token
+data["env"]["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
+with open(path, "w") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+print("  ✅ settings.json 已更新")
+PYEOF
+
+            # 2. 更新 channels.json 的 active_channel
+            python3 - "$CONFIG" "$channel" <<'PYEOF'
+import json, sys
+path, channel = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    data = json.load(f)
+data["active_channel"] = channel
+with open(path, "w") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PYEOF
+
+            # 3. 更新 plist 并重启
+            if [ -f "$PLIST_PATH" ]; then
+                python3 - "$PLIST_PATH" "$UPSTREAM" "$FORCE_THINKING" <<'PYEOF'
+import sys, plistlib
+path, upstream, ft = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path, "rb") as f:
+    data = plistlib.load(f)
+data["EnvironmentVariables"]["UPSTREAM"] = upstream
+data["EnvironmentVariables"]["FORCE_THINKING"] = ft
+with open(path, "wb") as f:
+    plistlib.dump(data, f)
+print("  ✅ plist 已更新")
+PYEOF
+
+                # 重启服务
+                local was_running=false
+                if launchctl list "$LABEL" &>/dev/null; then
+                    was_running=true
+                    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+                fi
+
+                # 确保端口释放
+                local proxy_pid
+                proxy_pid=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+                if [ -n "$proxy_pid" ]; then
+                    kill "$proxy_pid" 2>/dev/null || true
+                    for i in 1 2 3; do
+                        lsof -ti tcp:"$PORT" -sTCP:LISTEN &>/dev/null || break
+                        sleep 1
+                    done
+                fi
+
+                launchctl load "$PLIST_PATH" 2>/dev/null
+                if launchctl list "$LABEL" &>/dev/null; then
+                    echo "  ✅ 代理已重启"
+                else
+                    echo "  ❌ 代理启动失败，请检查: claude-trace logs"
+                fi
+            else
+                echo "  ⚠️  plist 不存在，请先执行: claude-trace start"
+            fi
+
+            echo ""
+            echo "已切换到 $NAME → $UPSTREAM"
+            ;;
+    esac
+}
+
+# ─── logs ───
+
+do_logs() {
+    if [ -f "$LOG_FILE" ]; then
+        tail -f "$LOG_FILE"
+    else
+        echo "无日志文件: $LOG_FILE"
+    fi
+}
+
+# ─── uninstall ───
+
+do_uninstall() {
+    echo "=== 卸载 claude-trace ==="
+    echo ""
+
+    # 1. 停止 launchd 服务
+    if launchctl list "$LABEL" &>/dev/null; then
+        launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+        echo "✅ 服务已停止"
+    fi
+
+    # 2. 删除 plist
+    rm -f "$PLIST_PATH"
+    echo "✅ plist 已删除"
+
+    # 3. 杀掉残留进程
+    local pid
+    pid=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+    if [ -n "$pid" ]; then
+        kill "$pid" 2>/dev/null || true
+    fi
+
+    # 4. 从 settings.json 移除 hooks 和代理配置
+    if [ -f "$SETTINGS" ]; then
+        python3 - "$SETTINGS" <<'PYEOF'
+import json, sys
+
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except (json.JSONDecodeError, FileNotFoundError):
+    sys.exit(0)
+
+changed = False
+
+# 移除 hooks 中包含 collector.py 的条目
+if "hooks" in data:
+    events_to_check = [
+        "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop",
+        "PostToolUse", "SubagentStart", "SubagentStop", "PostCompact",
+        "PreToolUse", "PermissionRequest", "InstructionsLoaded", "StopFailure",
+    ]
+    for event in events_to_check:
+        if event not in data["hooks"]:
+            continue
+        hook_groups = data["hooks"][event]
+        filtered = []
+        for group in hook_groups:
+            kept = [h for h in group.get("hooks", []) if "collector.py" not in h.get("command", "")]
+            if kept:
+                group["hooks"] = kept
+                filtered.append(group)
+        if filtered:
+            data["hooks"][event] = filtered
+        else:
+            del data["hooks"][event]
+        changed = True
+    if not data.get("hooks"):
+        data.pop("hooks", None)
+
+# 移除 ANTHROPIC_BASE_URL（如果指向本地代理）
+env = data.get("env", {})
+base_url = env.get("ANTHROPIC_BASE_URL", "")
+if "127.0.0.1" in base_url or "localhost" in base_url:
+    del env["ANTHROPIC_BASE_URL"]
+    changed = True
+
+if changed:
+    # 备份
+    import shutil
+    shutil.copy2(path, path + ".bak")
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    print("  ✅ settings.json 已清理（备份: settings.json.bak）")
+else:
+    print("  ℹ️  settings.json 无需修改")
+PYEOF
+    fi
+
+    # 5. 删除 collector
+    rm -f "$HOME/.claude/hooks/collector.py"
+    echo "✅ collector.py 已删除"
+
+    # 6. 询问是否保留轨迹数据
+    local keep_data="y"
+    if [ -t 0 ]; then
+        echo ""
+        read -rp "是否保留轨迹数据 ($INSTALL_DIR/trajectories)? [Y/n] " keep_data
+        keep_data="${keep_data:-y}"
+    fi
+
+    if [[ "$keep_data" =~ ^[Nn] ]]; then
+        rm -rf "$INSTALL_DIR/trajectories"
+        echo "✅ 轨迹数据已删除"
+    else
+        if [ -d "$INSTALL_DIR/trajectories" ]; then
+            # 移动到临时位置
+            local backup_dir="$HOME/claude-trace-trajectories-backup"
+            mv "$INSTALL_DIR/trajectories" "$backup_dir"
+            echo "ℹ️  轨迹数据已备份到: $backup_dir"
+        fi
+    fi
+
+    # 7. 删除安装目录
+    rm -rf "$INSTALL_DIR"
+    echo "✅ 安装目录已删除: $INSTALL_DIR"
+
+    # 8. 清理运行时文件
+    rm -f "$LOG_FILE" "$PID_FILE"
+    rm -f /tmp/claude-trace-watch.log
+    rm -rf /tmp/claude-trace-watch.lock
+
+    echo ""
+    echo "✅ 卸载完成"
+    echo ""
+    echo "注意：如需清理 hook 事件数据，请手动删除："
+    echo "  rm -rf ~/.claude/trajectory_events/"
+}
+
+# ─── version ───
+
+do_version() {
+    if [ -f "$INSTALL_DIR/version" ]; then
+        echo "claude-trace v$(cat "$INSTALL_DIR/version")"
+    else
+        echo "claude-trace（版本未知）"
+    fi
+}
+
+# ─── usage ───
+
+usage() {
+    echo "claude-trace — Claude Code 轨迹采集工具"
+    echo ""
+    echo "用法: claude-trace <命令>"
+    echo ""
+    echo "服务管理："
+    echo "  start       启动代理服务（launchd 自启动）"
+    echo "  stop        停止代理服务"
+    echo "  status      查看服务状态"
+    echo "  restart     重启代理服务"
+    echo "  logs        查看实时日志"
+    echo ""
+    echo "渠道管理："
+    echo "  switch list     列出所有渠道"
+    echo "  switch status   查看当前渠道"
+    echo "  switch <名称>   切换到指定渠道"
+    echo ""
+    echo "其他："
+    echo "  version     显示版本"
+    echo "  uninstall   完整卸载"
+    exit 0
+}
+
+# ─── 主入口 ───
+
+case "${1:-}" in
+    start)      do_start ;;
+    stop)       do_stop ;;
+    status)     do_status ;;
+    restart)    do_restart ;;
+    switch)     shift; do_switch "$@" ;;
+    logs|log)   do_logs ;;
+    uninstall)  do_uninstall ;;
+    version|-v|--version) do_version ;;
+    help|-h|--help|"")    usage ;;
+    *)
+        echo "未知命令: $1"
+        echo ""
+        usage
+        ;;
+esac

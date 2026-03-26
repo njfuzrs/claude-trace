@@ -5,3 +5,10 @@ trajectories/
 *.traj
 .env
 channels.json
+
+# 构建产物
+build/_build/
+dist/arm64/
+dist/x86_64/
+dist/*.tar.gz
+*.spec.bak

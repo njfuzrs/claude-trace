@@ -1,16 +1,18 @@
 {
+  "active_channel": "default",
   "channels": {
-    "company": {
-      "name": "公司渠道",
-      "token": "sk-xxx",
-      "upstream": "https://your-company-api.example.com",
-      "force_thinking": 0
-    },
-    "monthly": {
-      "name": "个人月卡",
-      "token": "sk-xxx",
+    "default": {
+      "name": "默认渠道",
+      "token": "sk-xxx（替换为你的 API Token）",
       "upstream": "https://api.anthropic.com",
-      "force_thinking": 1
+      "force_thinking": 0
     }
+  },
+  "upload": {
+    "platform_url": "http://127.0.0.1/traj",
+    "upload_token": "<REDACTED_TOKEN>",
+    "user_id": "",
+    "device_id": "",
+    "cleanup_after_upload": true
   }
 }

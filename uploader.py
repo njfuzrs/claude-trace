@@ -320,6 +320,7 @@ class UploadManager:
         data.add_field("session_id", item.session_id)
         data.add_field("file_type", item.file_type)
         data.add_field("tool_source", "claude-code")
+        data.add_field("compressed", "true")
         data.add_field("user_id", self._user_id)
         data.add_field("device_id", self._device_id)
 
