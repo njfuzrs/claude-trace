@@ -22,6 +22,9 @@ OUTPUT="${OUTPUT:-$SCRIPT_DIR/trajectories}"
 FORCE_THINKING="${FORCE_THINKING:-1}"
 TRAJ_PLATFORM_URL="${TRAJ_PLATFORM_URL:-}"
 TRAJ_UPLOAD_TOKEN="${TRAJ_UPLOAD_TOKEN:-}"
+TRAJ_USER_ID="${TRAJ_USER_ID:-}"
+TRAJ_DEVICE_ID="${TRAJ_DEVICE_ID:-}"
+TRAJ_CLEANUP_AFTER_UPLOAD="${TRAJ_CLEANUP_AFTER_UPLOAD:-true}"
 
 usage() {
     echo "用法: $0 {install|uninstall|status|restart}"
@@ -86,6 +89,12 @@ do_install() {
         <string>${TRAJ_PLATFORM_URL}</string>
         <key>TRAJ_UPLOAD_TOKEN</key>
         <string>${TRAJ_UPLOAD_TOKEN}</string>
+        <key>TRAJ_USER_ID</key>
+        <string>${TRAJ_USER_ID}</string>
+        <key>TRAJ_DEVICE_ID</key>
+        <string>${TRAJ_DEVICE_ID}</string>
+        <key>TRAJ_CLEANUP_AFTER_UPLOAD</key>
+        <string>${TRAJ_CLEANUP_AFTER_UPLOAD}</string>
         <key>PATH</key>
         <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>

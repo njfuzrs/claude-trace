@@ -25,6 +25,7 @@ import aiohttp
 from aiohttp import web
 
 from builder import SessionMetadata, build_trajectory, save_trajectory
+from uploader import UploadManager
 
 # ─────────────────────────────────────────────
 # 日志配置
@@ -651,22 +652,26 @@ def reassemble_sse_response(raw_data: bytes) -> Dict:
 # ─────────────────────────────────────────────
 
 class DataCollector:
-    def __init__(self, output_dir: Path, save_raw: bool = True, events_dir: Optional[Path] = None):
+    def __init__(self, output_dir: Path, save_raw: bool = False, events_dir: Optional[Path] = None):
         self.output_dir = output_dir
         self.sessions_dir = output_dir / "sessions"
-        self.save_raw = save_raw  # P2 #18: 控制是否保存原始 JSON 文件
+        self.save_raw = save_raw  # P2 #18: 控制是否保存原始 JSON 文件到 raw/ 子目录
         self.events_dir = events_dir or (Path.home() / ".claude" / "trajectory_events")
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        # 自动上传配置：环境变量为空或未设置时禁用自动上传
-        self._upload_url = os.environ.get("TRAJ_PLATFORM_URL", "").strip()
-        self._upload_token = os.environ.get("TRAJ_UPLOAD_TOKEN", "").strip()
-        self._upload_enabled = bool(self._upload_url and self._upload_token)
-        if self._upload_enabled:
-            # 拼接上传 API 路径（会话维度上传端点）
-            base = self._upload_url.rstrip("/")
-            self._upload_endpoint = f"{base}/api/v1/upload/session-file"
-            logger.info("自动上传已启用: %s", self._upload_endpoint)
+        # 可靠上传管理器（替代原有的 fire-and-forget 上传）
+        upload_url = os.environ.get("TRAJ_PLATFORM_URL", "").strip()
+        upload_token = os.environ.get("TRAJ_UPLOAD_TOKEN", "").strip()
+        if upload_url and upload_token:
+            cleanup_env = os.environ.get("TRAJ_CLEANUP_AFTER_UPLOAD", "true").strip().lower()
+            self._uploader: Optional[UploadManager] = UploadManager(
+                upload_url=upload_url,
+                upload_token=upload_token,
+                cleanup_after_upload=(cleanup_env != "false"),
+            )
+            logger.info("可靠上传已启用: %s", upload_url)
+        else:
+            self._uploader = None
 
     def _session_dir(self, session_id: str) -> Path:
         """获取会话目录，按需创建"""
@@ -944,15 +949,15 @@ class DataCollector:
         logger.info("轨迹已导出: %s | 步骤=%d (含 %d 子会话)",
                      session.id[:8], total_pairs, len(session.child_sessions))
 
-        # 最终导出成功后，复制 events 并 fire-and-forget 自动上传到云端平台
+        # 最终导出成功后，复制 events 并触发可靠上传
         if is_final and traj_path:
             # 将 hook events 复制到会话目录（无论是否上传都保留）
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self._copy_events_to_session, session.id)
 
-            if self._upload_enabled:
+            if self._uploader:
                 session_dir = self._session_dir(session.id)
-                task = asyncio.create_task(self._auto_upload(session_dir, session.id))
+                task = asyncio.create_task(self._uploader.upload_session(session_dir, session.id))
                 task.add_done_callback(_log_task_exception)
 
     def _copy_events_to_session(self, session_id: str):
@@ -963,54 +968,6 @@ class DataCollector:
             dst = self._session_dir(session_id) / "events.jsonl"
             shutil.copy2(src, dst)
 
-    async def _auto_upload(self, session_dir: Path, session_id: str):
-        """会话结束后自动上传所有文件到云端平台（fire-and-forget，失败不影响主流程）
-
-        按 session_id + file_type 逐个上传 session.traj、raw.jsonl、events.jsonl。
-        """
-        upload_files = [
-            ("traj", "session.traj"),
-            ("raw", "raw.jsonl"),
-            ("events", "events.jsonl"),
-        ]
-        try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=120),
-            ) as http_session:
-                for file_type, filename in upload_files:
-                    filepath = session_dir / filename
-                    if not filepath.exists():
-                        continue
-                    try:
-                        data = aiohttp.FormData()
-                        data.add_field(
-                            "file",
-                            open(filepath, "rb"),
-                            filename=filename,
-                            content_type="application/octet-stream",
-                        )
-                        data.add_field("session_id", session_id)
-                        data.add_field("file_type", file_type)
-                        data.add_field("tool_source", "claude-code")
-
-                        async with http_session.post(
-                            self._upload_endpoint,
-                            data=data,
-                            headers={"X-Upload-Token": self._upload_token},
-                        ) as resp:
-                            if resp.status == 200:
-                                body = await resp.json()
-                                logger.info("自动上传成功: %s/%s → %s", session_id[:8], filename, body.get("status", "ok"))
-                            elif resp.status == 409:
-                                logger.debug("自动上传跳过（已存在）: %s/%s", session_id[:8], filename)
-                            else:
-                                text = await resp.text()
-                                logger.warning("自动上传失败: %s/%s HTTP %d: %s", session_id[:8], filename, resp.status, text[:200])
-                    except Exception as e:
-                        logger.debug("自动上传异常: %s/%s — %s", session_id[:8], filename, e)
-        except Exception as e:
-            logger.debug("自动上传连接异常（静默）: %s — %s", session_id[:8], e)
-
     def _write_pair_files(self, session: Session, pair: RequestResponsePair,
                           pairs_snapshot: List[RequestResponsePair],
                           children_snapshot: Optional[List[tuple]] = None):
@@ -1020,15 +977,15 @@ class DataCollector:
         不在此方法中直接访问 session 的可变字段（pairs / child_sessions / last_activity）。
         session.id / start_time / model / cwd / source / is_subagent 在创建后不可变，安全读取。
         """
-        session_dir = self._session_dir(session.id) / "raw"
-        session_dir.mkdir(parents=True, exist_ok=True)
-
         idx = pair.index
 
-        # P2 #18: 仅在 save_raw=True 时写入单独的 JSON 文件
+        # P2 #18: 仅在 save_raw=True 时写入单独的 JSON 文件到 raw/ 子目录
         if self.save_raw:
-            req_file = session_dir / f"{idx:03d}_request.json"
-            resp_file = session_dir / f"{idx:03d}_response.json"
+            raw_dir = self._session_dir(session.id) / "raw"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+
+            req_file = raw_dir / f"{idx:03d}_request.json"
+            resp_file = raw_dir / f"{idx:03d}_response.json"
 
             req_data = {
                 "timestamp": pair.timestamp,
@@ -1048,7 +1005,7 @@ class DataCollector:
             req_file.write_text(json.dumps(req_data, ensure_ascii=False, indent=2))
             resp_file.write_text(json.dumps(resp_data, ensure_ascii=False, indent=2))
 
-        # 追加写入 raw JSONL（双格式并行输出）
+        # 追加写入 raw JSONL（始终执行，不受 save_raw 控制）
         jsonl_path = self._session_dir(session.id) / "raw.jsonl"
         self._append_raw_jsonl(jsonl_path, pair)
 
@@ -1472,7 +1429,7 @@ async def create_app(
     upstream_base: str,
     output_dir: Path,
     session_timeout: int,
-    save_raw: bool = True,
+    save_raw: bool = False,
     events_dir: Optional[Path] = None,
     force_thinking: int = 0,
 ) -> web.Application:
@@ -1484,15 +1441,21 @@ async def create_app(
     app["collector"] = DataCollector(output_dir, save_raw=save_raw, events_dir=events_dir)
     app["force_thinking"] = force_thinking
 
-    # 应用启动时创建全局 ClientSession（连接池复用）
+    # 应用启动时创建全局 ClientSession（连接池复用）+ 启动上传管理器
     async def on_startup(app):
         app["upstream_session"] = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=300, sock_read=300),
         )
+        collector = app["collector"]
+        if collector._uploader:
+            await collector._uploader.start()
         logger.info("ClientSession 已创建（连接池复用）")
 
-    # 应用关闭时销毁 ClientSession
+    # 应用关闭时停止上传管理器 + 销毁 ClientSession
     async def on_cleanup(app):
+        collector = app["collector"]
+        if collector._uploader:
+            await collector._uploader.stop()
         await app["upstream_session"].close()
         logger.info("ClientSession 已关闭")
 
@@ -1533,8 +1496,8 @@ def parse_args():
         default=str(Path.home() / ".claude" / "trajectory_events"),
         help="Hooks 事件数据目录",
     )
-    parser.add_argument("--save-raw", action="store_true", default=True, help="保存原始请求/响应 JSON 文件")
-    parser.add_argument("--no-save-raw", dest="save_raw", action="store_false", help="不保存原始请求/响应 JSON 文件（只保留 JSONL + .traj）")
+    parser.add_argument("--save-raw", action="store_true", default=False, help="保存原始请求/响应 JSON 文件到 raw/ 子目录（默认不保存，raw.jsonl 已包含全部数据）")
+    parser.add_argument("--no-save-raw", dest="save_raw", action="store_false", help="不保存原始请求/响应 JSON 文件（默认行为）")
     parser.add_argument(
         "--force-thinking", type=int, default=0, metavar="BUDGET",
         help="强制提高 thinking blocks 产生概率。设为非 0 值时，将 adaptive thinking 的 effort 改写为 max。"
@@ -1618,6 +1581,9 @@ async def main():
         # 等待所有写入完成后再 cleanup
         if pending_futures:
             await asyncio.gather(*pending_futures, return_exceptions=True)
+        # 优雅退出：持久化上传队列
+        if collector._uploader:
+            await collector._uploader.stop()
         await runner.cleanup()
         logger.info("代理已停止，数据保存在: %s", output_dir.resolve())
 
