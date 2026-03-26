@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -515,7 +516,7 @@ class SessionManager:
                 if collector and (session.pairs or session.child_sessions):
                     # 修复 exit_status 竞态：等待 pending 写入完成
                     await _drain_pending_writes(session)
-                    await collector.export_session_async(session)
+                    await collector.export_session_async(session, is_final=True)
                 logger.info("会话超时清理: %s (pairs=%d, children=%d)",
                             sid[:8], len(session.pairs), len(session.child_sessions))
             except Exception as e:
@@ -658,6 +659,16 @@ class DataCollector:
         self.events_dir = events_dir or (Path.home() / ".claude" / "trajectory_events")
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.traj_dir.mkdir(parents=True, exist_ok=True)
+
+        # 自动上传配置：环境变量为空或未设置时禁用自动上传
+        self._upload_url = os.environ.get("TRAJ_PLATFORM_URL", "").strip()
+        self._upload_token = os.environ.get("TRAJ_UPLOAD_TOKEN", "").strip()
+        self._upload_enabled = bool(self._upload_url and self._upload_token)
+        if self._upload_enabled:
+            # 拼接上传 API 路径
+            base = self._upload_url.rstrip("/")
+            self._upload_endpoint = f"{base}/api/v1/upload/traj"
+            logger.info("自动上传已启用: %s", self._upload_endpoint)
 
     def record_request(
         self,
@@ -897,11 +908,15 @@ class DataCollector:
         logger.info("轨迹已导出: %s | 步骤=%d (含 %d 子会话)",
                      session.id[:8], total_pairs, len(session.child_sessions))
 
-    async def export_session_async(self, session: Session):
+    async def export_session_async(self, session: Session, is_final: bool = False):
         """导出会话的 .traj 文件（async 版本）
 
         子会话不单独导出 traj，它们的数据会在父会话导出时合并。
         标题生成的孤立会话（没有 parent）也跳过导出。
+
+        Args:
+            session: 要导出的会话
+            is_final: 是否为最终导出（end 事件或超时清理），为 True 时触发自动上传
         """
         if session.is_subagent:
             return
@@ -920,9 +935,46 @@ class DataCollector:
                 await loop.run_in_executor(None, save_trajectory, traj_path, traj)
             except Exception as e:
                 logger.warning("异步导出 .traj 失败: %s", e)
+                traj_path = None  # 导出失败，不触发上传
         total_pairs = len(session.pairs) + sum(len(c.pairs) for c in session.child_sessions)
         logger.info("轨迹已导出: %s | 步骤=%d (含 %d 子会话)",
                      session.id[:8], total_pairs, len(session.child_sessions))
+
+        # 最终导出成功后，fire-and-forget 自动上传到云端平台
+        if is_final and traj_path and self._upload_enabled:
+            task = asyncio.create_task(self._auto_upload(traj_path))
+            task.add_done_callback(_log_task_exception)
+
+    async def _auto_upload(self, traj_path: Path):
+        """会话结束后自动上传 .traj 到云端平台（fire-and-forget，失败不影响主流程）"""
+        try:
+            data = aiohttp.FormData()
+            data.add_field(
+                "file",
+                open(traj_path, "rb"),
+                filename=traj_path.name,
+                content_type="application/json",
+            )
+            data.add_field("tool_source", "claude-code")
+
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as session:
+                async with session.post(
+                    self._upload_endpoint,
+                    data=data,
+                    headers={"X-Upload-Token": self._upload_token},
+                ) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        logger.info("自动上传成功: %s → %s", traj_path.name, body.get("status", "ok"))
+                    elif resp.status == 409:
+                        logger.debug("自动上传跳过（已存在）: %s", traj_path.name)
+                    else:
+                        text = await resp.text()
+                        logger.warning("自动上传失败: %s HTTP %d: %s", traj_path.name, resp.status, text[:200])
+        except Exception as e:
+            logger.debug("自动上传异常（静默）: %s — %s", traj_path.name, e)
 
     def _write_pair_files(self, session: Session, pair: RequestResponsePair,
                           pairs_snapshot: List[RequestResponsePair],
@@ -1351,7 +1403,7 @@ async def handle_session_event(request: web.Request) -> web.Response:
             try:
                 # 修复 exit_status 竞态：等待所有 pending 的 record_response_async 完成
                 await _drain_pending_writes(session)
-                await collector.export_session_async(session)
+                await collector.export_session_async(session, is_final=True)
                 total_pairs = len(session.pairs) + sum(len(c.pairs) for c in session.child_sessions)
                 logger.info(
                     "会话结束: %s | API 调用=%d 次 (含 %d 个子会话)",

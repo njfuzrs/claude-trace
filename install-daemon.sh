@@ -20,6 +20,8 @@ PORT="${PORT:-4000}"
 UPSTREAM="${UPSTREAM:-https://api.anthropic.com}"
 OUTPUT="${OUTPUT:-$SCRIPT_DIR/trajectories}"
 FORCE_THINKING="${FORCE_THINKING:-1}"
+TRAJ_PLATFORM_URL="${TRAJ_PLATFORM_URL:-}"
+TRAJ_UPLOAD_TOKEN="${TRAJ_UPLOAD_TOKEN:-}"
 
 usage() {
     echo "用法: $0 {install|uninstall|status|restart}"
@@ -34,6 +36,8 @@ usage() {
     echo "  UPSTREAM=$UPSTREAM"
     echo "  OUTPUT=$OUTPUT"
     echo "  FORCE_THINKING=$FORCE_THINKING"
+    echo "  TRAJ_PLATFORM_URL=$TRAJ_PLATFORM_URL"
+    echo "  TRAJ_UPLOAD_TOKEN=${TRAJ_UPLOAD_TOKEN:+***已设置***}"
     exit 1
 }
 
@@ -78,6 +82,10 @@ do_install() {
         <string>${OUTPUT}</string>
         <key>FORCE_THINKING</key>
         <string>${FORCE_THINKING}</string>
+        <key>TRAJ_PLATFORM_URL</key>
+        <string>${TRAJ_PLATFORM_URL}</string>
+        <key>TRAJ_UPLOAD_TOKEN</key>
+        <string>${TRAJ_UPLOAD_TOKEN}</string>
         <key>PATH</key>
         <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
