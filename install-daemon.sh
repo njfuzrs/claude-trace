@@ -11,9 +11,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LABEL="com.claude-trace.proxy"
+WATCH_LABEL="com.claude-trace.watch-reload"
 PLIST_PATH="$HOME/Library/LaunchAgents/${LABEL}.plist"
+WATCH_PLIST_PATH="$HOME/Library/LaunchAgents/${WATCH_LABEL}.plist"
 DAEMON_SCRIPT="$SCRIPT_DIR/proxy-daemon.sh"
+WATCH_SCRIPT="$SCRIPT_DIR/watch-reload.sh"
 LOG_FILE="/tmp/claude-trace-proxy.log"
+WATCH_LOG="/tmp/claude-trace-watch.log"
 
 # 可通过环境变量覆盖
 PORT="${PORT:-4000}"
@@ -42,6 +46,58 @@ usage() {
     echo "  TRAJ_PLATFORM_URL=$TRAJ_PLATFORM_URL"
     echo "  TRAJ_UPLOAD_TOKEN=${TRAJ_UPLOAD_TOKEN:+***已设置***}"
     exit 1
+}
+
+install_watch() {
+    # 安装文件监听服务（自动重启代理）
+    if ! command -v fswatch &>/dev/null; then
+        echo "⚠️  fswatch 未安装，跳过文件监听服务（brew install fswatch）"
+        return
+    fi
+
+    # 停止已有的监听服务
+    launchctl bootout "gui/$(id -u)/$WATCH_LABEL" 2>/dev/null || true
+    rm -rf /tmp/claude-trace-watch.lock
+
+    cat > "$WATCH_PLIST_PATH" <<WPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${WATCH_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${WATCH_SCRIPT}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>${WATCH_LOG}</string>
+    <key>StandardErrorPath</key>
+    <string>${WATCH_LOG}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
+WPLIST
+
+    launchctl bootstrap "gui/$(id -u)" "$WATCH_PLIST_PATH"
+    echo "✅ 文件监听服务已安装（修改 .py 自动重启代理）"
+}
+
+uninstall_watch() {
+    launchctl bootout "gui/$(id -u)/$WATCH_LABEL" 2>/dev/null || true
+    pkill -f "watch-reload.sh" 2>/dev/null || true
+    rm -rf /tmp/claude-trace-watch.lock
+    rm -f "$WATCH_PLIST_PATH"
+    echo "✅ 文件监听服务已卸载"
 }
 
 do_install() {
@@ -122,6 +178,9 @@ PLIST
     echo "   上游:  $UPSTREAM"
     echo ""
     echo "验证: curl -s http://127.0.0.1:$PORT/_internal/health"
+
+    # 安装文件监听服务
+    install_watch
 }
 
 do_uninstall() {
@@ -142,6 +201,10 @@ do_uninstall() {
 
     # 杀掉残留进程
     kill $(lsof -ti :$PORT) 2>/dev/null || true
+
+    # 卸载文件监听服务
+    uninstall_watch
+
     echo "✅ 卸载完成"
 }
 
@@ -153,6 +216,17 @@ do_status() {
         echo "状态: 运行中"
     else
         echo "状态: 未安装或未运行"
+    fi
+
+    echo ""
+    echo "=== 文件监听服务 ==="
+    if launchctl list "$WATCH_LABEL" &>/dev/null; then
+        echo "状态: 运行中"
+        echo "日志: $WATCH_LOG"
+    elif pgrep -f "watch-reload.sh" &>/dev/null; then
+        echo "状态: 运行中（非 launchd）"
+    else
+        echo "状态: 未运行"
     fi
 
     echo ""

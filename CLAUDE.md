@@ -44,6 +44,7 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 ├── start.sh            # 一键启动脚本（代理 + Claude Code 生命周期绑定）
 ├── proxy-daemon.sh     # 守护进程脚本（自动重启循环）
 ├── install-daemon.sh   # 安装/卸载 launchd 自启动服务（macOS）
+├── watch-reload.sh     # 文件监听脚本，.py 变更后自动重启代理（需 fswatch）
 ├── switch-channel.sh   # 快速切换 API 渠道（token + 上游）
 ├── channels.json       # 渠道配置文件（含 token，已加入 .gitignore）
 ├── channels.json.example  # 渠道配置模板（可提交）
