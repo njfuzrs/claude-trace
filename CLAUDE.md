@@ -31,6 +31,7 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 ## 项目结构
 
 ```
+├── migrate_storage.py  # 存储迁移脚本（旧 raw/+traj/ → 新 sessions/）
 ├── proxy.py            # HTTP 代理服务器，SSE Tee 模式采集 API 请求/响应
 ├── builder.py          # 轨迹构建器，请求/响应对 → .traj 格式
 ├── collector.py        # Hooks 采集脚本，部署到 ~/.claude/hooks/
@@ -47,8 +48,12 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 ├── channels.json       # 渠道配置文件（含 token，已加入 .gitignore）
 ├── channels.json.example  # 渠道配置模板（可提交）
 ├── trajectories/
-│   ├── raw/            # 原始请求/响应数据
-│   └── traj/           # 构建好的 .traj 文件
+│   └── sessions/        # 按会话维度存储（每个 session_id 一个目录）
+│       └── {session_id}/
+│           ├── session.traj    # 构建好的轨迹文件
+│           ├── raw.jsonl       # 原始 API 请求/响应（紧凑 JSONL）
+│           ├── events.jsonl    # Hook 事件数据
+│           └── raw/            # 每轮请求/响应 JSON 文件
 └── docs/               # 设计文档
 ```
 
@@ -76,8 +81,10 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 ## 关键设计决策
 
 - 代理永不中断：launchd 自启动 + daemon 自动重启，确保采集不丢数据
+- 会话维度存储：所有数据按 `sessions/{session_id}/` 组织，一个会话的 traj、raw、events 放在一起
 - 增量存储：JSONL 首行保存完整 request_body，后续行只保存 new_messages，避免 O(n²) 膨胀
 - 双通道采集：proxy（API 流量）+ hooks（会话事件）通过 session_id 关联
+- 自动上传：会话结束时自动上传 session.traj + raw.jsonl + events.jsonl 到云端平台
 - 安全：API Key 自动脱敏，代理默认绑定 127.0.0.1
 - 代理使用 SSE Tee 模式，零延迟转发 + 后台记录，不影响 Claude Code 正常使用
 
