@@ -778,7 +778,10 @@ def generate_html(traj: Dict, title: str = "Trajectory Viewer") -> str:
 
 def generate_index_html(traj_dir: Path) -> str:
     """生成目录索引页"""
-    traj_files = sorted(traj_dir.glob("*.traj"), key=lambda f: f.stat().st_mtime, reverse=True)
+    # 新布局：sessions/*/session.traj；旧布局：*.traj
+    traj_files = sorted(traj_dir.glob("*/session.traj"), key=lambda f: f.stat().st_mtime, reverse=True)
+    if not traj_files:
+        traj_files = sorted(traj_dir.glob("*.traj"), key=lambda f: f.stat().st_mtime, reverse=True)
 
     rows = []
     for f in traj_files:
@@ -853,15 +856,18 @@ def main():
         if args.output:
             out_dir.mkdir(parents=True, exist_ok=True)
 
-        # 生成每个 traj 的 HTML
-        traj_files = sorted(path.glob("*.traj"))
+        # 生成每个 traj 的 HTML（新布局 + 旧布局）
+        traj_files = sorted(path.glob("*/session.traj"))
+        if not traj_files:
+            traj_files = sorted(path.glob("*.traj"))
         for f in traj_files:
             try:
+                sid = f.parent.name if f.name == "session.traj" else f.stem
                 traj = json.loads(f.read_text())
-                html_content = generate_html(traj, title=f"Session {f.stem[:12]}")
-                html_path = out_dir / (f.stem + ".html")
+                html_content = generate_html(traj, title=f"Session {sid[:12]}")
+                html_path = out_dir / (sid + ".html")
                 html_path.write_text(html_content)
-                print(f"  {f.name} -> {html_path.name}")
+                print(f"  {sid}.traj -> {html_path.name}")
             except Exception as e:
                 print(f"  ERROR {f.name}: {e}", file=sys.stderr)
 

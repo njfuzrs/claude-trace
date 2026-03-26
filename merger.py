@@ -110,11 +110,23 @@ def load_raw_pairs_from_jsonl(jsonl_path: Path) -> List[RawPair]:
 
 
 def load_raw_pairs(raw_dir: Path, session_id: str) -> List[RawPair]:
-    """自动检测并加载原始数据（目录或 JSONL）"""
+    """自动检测并加载原始数据（目录或 JSONL）
+
+    支持新布局（sessions/{sid}/raw/ 和 sessions/{sid}/raw.jsonl）和旧布局（raw/{sid}/ 和 raw/{sid}.jsonl）。
+    当 raw_dir 指向 sessions/ 时，按新布局查找；否则按旧布局查找。
+    """
+    # 新布局：raw_dir 是 sessions/，数据在 sessions/{sid}/raw/ 和 sessions/{sid}/raw.jsonl
+    session_dir_new = raw_dir / session_id / "raw"
+    jsonl_new = raw_dir / session_id / "raw.jsonl"
+    if session_dir_new.is_dir():
+        return load_raw_pairs_from_dir(session_dir_new)
+    if jsonl_new.exists():
+        return load_raw_pairs_from_jsonl(jsonl_new)
+
+    # 旧布局：raw_dir 是 raw/，数据在 raw/{sid}/ 和 raw/{sid}.jsonl
     session_dir = raw_dir / session_id
     if session_dir.is_dir():
         return load_raw_pairs_from_dir(session_dir)
-
     jsonl_path = raw_dir / f"{session_id}.jsonl"
     if jsonl_path.exists():
         return load_raw_pairs_from_jsonl(jsonl_path)
@@ -127,9 +139,17 @@ def load_raw_pairs(raw_dir: Path, session_id: str) -> List[RawPair]:
 # ─────────────────────────────────────────────
 
 def load_hook_events(events_dir: Path, session_id: str) -> List[Dict]:
-    """加载 Hooks 采集的事件流"""
-    events_file = events_dir / f"{session_id}.jsonl"
-    if not events_file.exists():
+    """加载 Hooks 采集的事件流
+
+    支持新布局（sessions/{sid}/events.jsonl）和旧布局（events_dir/{sid}.jsonl）。
+    """
+    # 新布局：events_dir 指向 sessions/，事件在 sessions/{sid}/events.jsonl
+    new_path = events_dir / session_id / "events.jsonl"
+    # 旧布局：events_dir/{sid}.jsonl
+    old_path = events_dir / f"{session_id}.jsonl"
+
+    events_file = new_path if new_path.exists() else (old_path if old_path.exists() else None)
+    if not events_file:
         return []
     events = []
     for line in events_file.read_text().splitlines():
@@ -197,8 +217,11 @@ class DataMerger:
         validation = _cross_validate_tool_calls(traj, post_tool_uses)
         traj["metadata"]["tool_call_validation"] = validation
 
-        # 8. 保存 .traj 文件
-        traj_path = self.output_dir / f"{session_id}.traj"
+        # 8. 保存 .traj 文件（新布局：sessions/{sid}/session.traj）
+        traj_path = self.output_dir / session_id / "session.traj"
+        if not traj_path.parent.exists():
+            # 旧布局 fallback：output_dir/{sid}.traj
+            traj_path = self.output_dir / f"{session_id}.traj"
         save_trajectory(traj_path, traj)
 
         logger.info(
@@ -215,14 +238,22 @@ class DataMerger:
         return traj
 
     def merge_all(self) -> List[str]:
-        """合并 raw_dir 下所有会话"""
+        """合并 raw_dir 下所有会话
+
+        支持新布局（sessions/ 子目录）和旧布局（raw/ 下的目录和 JSONL）。
+        """
         session_ids = set()
 
         # 从目录结构发现会话
         if self.raw_dir.exists():
             for p in self.raw_dir.iterdir():
                 if p.is_dir():
-                    session_ids.add(p.name)
+                    # 新布局：sessions/{sid}/raw.jsonl 存在则为有效会话
+                    if (p / "raw.jsonl").exists() or (p / "raw").is_dir():
+                        session_ids.add(p.name)
+                    # 旧布局：raw/{sid}/ 目录本身就是会话
+                    elif any(p.glob("*_request.json")):
+                        session_ids.add(p.name)
                 elif p.suffix == ".jsonl":
                     session_ids.add(p.stem)
 
@@ -345,13 +376,13 @@ def main():
     )
     parser.add_argument("--session-id", help="指定会话 ID（不指定则用 --all）")
     parser.add_argument("--all", action="store_true", help="合并所有会话")
-    parser.add_argument("--raw-dir", default="./trajectories/raw", help="原始数据目录")
+    parser.add_argument("--raw-dir", default="./trajectories/sessions", help="原始数据目录（新布局 sessions/ 或旧布局 raw/）")
     parser.add_argument(
         "--events-dir",
-        default=str(Path.home() / ".claude" / "trajectory_events"),
-        help="Hooks 事件数据目录",
+        default="./trajectories/sessions",
+        help="事件数据目录（新布局 sessions/ 或旧布局 ~/.claude/trajectory_events）",
     )
-    parser.add_argument("--output", default="./trajectories/traj", help=".traj 输出目录")
+    parser.add_argument("--output", default="./trajectories/sessions", help=".traj 输出目录")
     args = parser.parse_args()
 
     merger = DataMerger(

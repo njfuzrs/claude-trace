@@ -653,22 +653,26 @@ def reassemble_sse_response(raw_data: bytes) -> Dict:
 class DataCollector:
     def __init__(self, output_dir: Path, save_raw: bool = True, events_dir: Optional[Path] = None):
         self.output_dir = output_dir
-        self.raw_dir = output_dir / "raw"
-        self.traj_dir = output_dir / "traj"
+        self.sessions_dir = output_dir / "sessions"
         self.save_raw = save_raw  # P2 #18: 控制是否保存原始 JSON 文件
         self.events_dir = events_dir or (Path.home() / ".claude" / "trajectory_events")
-        self.raw_dir.mkdir(parents=True, exist_ok=True)
-        self.traj_dir.mkdir(parents=True, exist_ok=True)
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
 
         # 自动上传配置：环境变量为空或未设置时禁用自动上传
         self._upload_url = os.environ.get("TRAJ_PLATFORM_URL", "").strip()
         self._upload_token = os.environ.get("TRAJ_UPLOAD_TOKEN", "").strip()
         self._upload_enabled = bool(self._upload_url and self._upload_token)
         if self._upload_enabled:
-            # 拼接上传 API 路径
+            # 拼接上传 API 路径（会话维度上传端点）
             base = self._upload_url.rstrip("/")
-            self._upload_endpoint = f"{base}/api/v1/upload/traj"
+            self._upload_endpoint = f"{base}/api/v1/upload/session-file"
             logger.info("自动上传已启用: %s", self._upload_endpoint)
+
+    def _session_dir(self, session_id: str) -> Path:
+        """获取会话目录，按需创建"""
+        d = self.sessions_dir / session_id
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     def record_request(
         self,
@@ -860,7 +864,7 @@ class DataCollector:
                     for cid, cmodel, _, cpairs, ctitle in children_snapshot if cpairs
                 ]
 
-            traj_path = self.traj_dir / f"{session.id}.traj"
+            traj_path = self._session_dir(session.id) / "session.traj"
             return traj_path, traj
         except Exception as e:
             logger.warning("构建 .traj 失败: %s", e)
@@ -940,41 +944,72 @@ class DataCollector:
         logger.info("轨迹已导出: %s | 步骤=%d (含 %d 子会话)",
                      session.id[:8], total_pairs, len(session.child_sessions))
 
-        # 最终导出成功后，fire-and-forget 自动上传到云端平台
-        if is_final and traj_path and self._upload_enabled:
-            task = asyncio.create_task(self._auto_upload(traj_path))
-            task.add_done_callback(_log_task_exception)
+        # 最终导出成功后，复制 events 并 fire-and-forget 自动上传到云端平台
+        if is_final and traj_path:
+            # 将 hook events 复制到会话目录（无论是否上传都保留）
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._copy_events_to_session, session.id)
 
-    async def _auto_upload(self, traj_path: Path):
-        """会话结束后自动上传 .traj 到云端平台（fire-and-forget，失败不影响主流程）"""
+            if self._upload_enabled:
+                session_dir = self._session_dir(session.id)
+                task = asyncio.create_task(self._auto_upload(session_dir, session.id))
+                task.add_done_callback(_log_task_exception)
+
+    def _copy_events_to_session(self, session_id: str):
+        """将 hook events 复制到会话目录"""
+        import shutil
+        src = self.events_dir / f"{session_id}.jsonl"
+        if src.exists():
+            dst = self._session_dir(session_id) / "events.jsonl"
+            shutil.copy2(src, dst)
+
+    async def _auto_upload(self, session_dir: Path, session_id: str):
+        """会话结束后自动上传所有文件到云端平台（fire-and-forget，失败不影响主流程）
+
+        按 session_id + file_type 逐个上传 session.traj、raw.jsonl、events.jsonl。
+        """
+        upload_files = [
+            ("traj", "session.traj"),
+            ("raw", "raw.jsonl"),
+            ("events", "events.jsonl"),
+        ]
         try:
-            data = aiohttp.FormData()
-            data.add_field(
-                "file",
-                open(traj_path, "rb"),
-                filename=traj_path.name,
-                content_type="application/json",
-            )
-            data.add_field("tool_source", "claude-code")
-
             async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as session:
-                async with session.post(
-                    self._upload_endpoint,
-                    data=data,
-                    headers={"X-Upload-Token": self._upload_token},
-                ) as resp:
-                    if resp.status == 200:
-                        body = await resp.json()
-                        logger.info("自动上传成功: %s → %s", traj_path.name, body.get("status", "ok"))
-                    elif resp.status == 409:
-                        logger.debug("自动上传跳过（已存在）: %s", traj_path.name)
-                    else:
-                        text = await resp.text()
-                        logger.warning("自动上传失败: %s HTTP %d: %s", traj_path.name, resp.status, text[:200])
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as http_session:
+                for file_type, filename in upload_files:
+                    filepath = session_dir / filename
+                    if not filepath.exists():
+                        continue
+                    try:
+                        data = aiohttp.FormData()
+                        data.add_field(
+                            "file",
+                            open(filepath, "rb"),
+                            filename=filename,
+                            content_type="application/octet-stream",
+                        )
+                        data.add_field("session_id", session_id)
+                        data.add_field("file_type", file_type)
+                        data.add_field("tool_source", "claude-code")
+
+                        async with http_session.post(
+                            self._upload_endpoint,
+                            data=data,
+                            headers={"X-Upload-Token": self._upload_token},
+                        ) as resp:
+                            if resp.status == 200:
+                                body = await resp.json()
+                                logger.info("自动上传成功: %s/%s → %s", session_id[:8], filename, body.get("status", "ok"))
+                            elif resp.status == 409:
+                                logger.debug("自动上传跳过（已存在）: %s/%s", session_id[:8], filename)
+                            else:
+                                text = await resp.text()
+                                logger.warning("自动上传失败: %s/%s HTTP %d: %s", session_id[:8], filename, resp.status, text[:200])
+                    except Exception as e:
+                        logger.debug("自动上传异常: %s/%s — %s", session_id[:8], filename, e)
         except Exception as e:
-            logger.debug("自动上传异常（静默）: %s — %s", traj_path.name, e)
+            logger.debug("自动上传连接异常（静默）: %s — %s", session_id[:8], e)
 
     def _write_pair_files(self, session: Session, pair: RequestResponsePair,
                           pairs_snapshot: List[RequestResponsePair],
@@ -985,7 +1020,7 @@ class DataCollector:
         不在此方法中直接访问 session 的可变字段（pairs / child_sessions / last_activity）。
         session.id / start_time / model / cwd / source / is_subagent 在创建后不可变，安全读取。
         """
-        session_dir = self.raw_dir / session.id
+        session_dir = self._session_dir(session.id) / "raw"
         session_dir.mkdir(parents=True, exist_ok=True)
 
         idx = pair.index
@@ -1014,7 +1049,7 @@ class DataCollector:
             resp_file.write_text(json.dumps(resp_data, ensure_ascii=False, indent=2))
 
         # 追加写入 raw JSONL（双格式并行输出）
-        jsonl_path = self.raw_dir / f"{session.id}.jsonl"
+        jsonl_path = self._session_dir(session.id) / "raw.jsonl"
         self._append_raw_jsonl(jsonl_path, pair)
 
         # 增量重建 .traj 文件 — 子会话跳过（它们在父会话导出时合并）

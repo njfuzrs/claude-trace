@@ -191,11 +191,14 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     count = 0
-    for traj_file in sorted(input_dir.glob("*.traj")):
+    # 新布局：sessions/*/session.traj；旧布局：*.traj
+    traj_files = sorted(input_dir.glob("*/session.traj")) or sorted(input_dir.glob("*.traj"))
+    for traj_file in traj_files:
         traj = json.loads(traj_file.read_text())
         record = convert_traj(traj, args.style)
 
-        out_file = output_dir / f"{traj_file.stem}.jsonl"
+        sid = traj_file.parent.name if traj_file.name == "session.traj" else traj_file.stem
+        out_file = output_dir / f"{sid}.jsonl"
         out_file.write_text(json.dumps(record, ensure_ascii=False) + "\n")
         count += 1
 

@@ -113,7 +113,9 @@ def main():
 
     total = passed = 0
     all_metrics = []
-    for traj_file in sorted(input_dir.glob("*.traj")):
+    # 新布局：sessions/*/session.traj；旧布局：*.traj
+    traj_files = sorted(input_dir.glob("*/session.traj")) or sorted(input_dir.glob("*.traj"))
+    for traj_file in traj_files:
         total += 1
         traj = load_traj(traj_file)
         ok, reason = passes_filter(traj, args)
@@ -121,11 +123,11 @@ def main():
             passed += 1
             shutil.copy2(traj_file, output_dir / traj_file.name)
         else:
-            logger.info("过滤: %s — %s", traj_file.stem[:12], reason)
+            logger.info("过滤: %s — %s", traj_file.parent.name if traj_file.name == "session.traj" else traj_file.stem[:12], reason)
 
         if args.report:
             metrics = compute_quality_metrics(traj)
-            metrics["session_id"] = traj_file.stem
+            metrics["session_id"] = traj_file.parent.name if traj_file.name == "session.traj" else traj_file.stem
             metrics["passed_filter"] = ok
             all_metrics.append(metrics)
 
