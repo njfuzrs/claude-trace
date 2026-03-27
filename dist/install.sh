@@ -19,7 +19,7 @@ set -euo pipefail
 
 INSTALL_DIR="$HOME/.claude-trace"
 VERSION_URL=""  # 将在发布时填入
-RELEASE_BASE="${RELEASE_BASE:-http://127.0.0.1/releases/0.1.0}"
+RELEASE_BASE="${RELEASE_BASE:-http://127.0.0.1/releases/0.1.1}"
 PORT="${PORT:-4000}"
 LABEL="com.claude-trace.proxy"
 PLIST_PATH="$HOME/Library/LaunchAgents/${LABEL}.plist"
@@ -185,14 +185,28 @@ echo "=== 安装文件 ==="
 
 if [ -n "$RELEASE_BASE" ]; then
     # 从远程下载
-    TARBALL_URL="${RELEASE_BASE}/claude-trace-darwin-${ARCH}.tar.gz"
-    info "下载: $TARBALL_URL"
-
     TMPDIR_DL="$(mktemp -d)"
     trap "rm -rf '$TMPDIR_DL'" EXIT
 
-    if ! curl -fsSL "$TARBALL_URL" -o "$TMPDIR_DL/claude-trace.tar.gz"; then
-        fail "下载失败: $TARBALL_URL"
+    RELEASE_NAME="$(basename "$RELEASE_BASE")"
+    TARBALL_CANDIDATES=()
+    if [[ "$RELEASE_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]]; then
+        TARBALL_CANDIDATES+=("claude-trace-${RELEASE_NAME}-darwin-${ARCH}.tar.gz")
+    fi
+    TARBALL_CANDIDATES+=("claude-trace-darwin-${ARCH}.tar.gz")
+
+    TARBALL_URL=""
+    for tarball_name in "${TARBALL_CANDIDATES[@]}"; do
+        candidate_url="${RELEASE_BASE}/${tarball_name}"
+        info "尝试下载: $candidate_url"
+        if curl -fsSL "$candidate_url" -o "$TMPDIR_DL/claude-trace.tar.gz"; then
+            TARBALL_URL="$candidate_url"
+            break
+        fi
+    done
+
+    if [ -z "$TARBALL_URL" ]; then
+        fail "下载失败: ${RELEASE_BASE}/claude-trace-<version>-darwin-${ARCH}.tar.gz"
     fi
 
     # 解压
