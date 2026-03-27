@@ -120,6 +120,54 @@ DEFAULT_SYSTEM_MESSAGE = (
 )
 
 
+def _extract_shell_command(tool_input: dict) -> str:
+    arguments = tool_input.get("arguments", {})
+    if not isinstance(arguments, dict):
+        arguments = {}
+    command = (
+        tool_input.get("command")
+        or tool_input.get("cmd")
+        or arguments.get("command")
+        or arguments.get("cmd")
+        or ""
+    )
+    if isinstance(command, list):
+        return " ".join(str(part) for part in command)
+    return command
+
+
+def _extract_codex_apply_patch(tool_input: dict) -> str:
+    arguments = tool_input.get("arguments", {})
+    if not isinstance(arguments, dict):
+        arguments = {}
+    return arguments.get("input") or tool_input.get("input", "")
+
+
+def _extract_codex_file_change(tool_input: dict) -> List[str]:
+    edits: List[str] = []
+    for change in tool_input.get("changes", []) or []:
+        kind = (change.get("kind") or {}).get("type", "")
+        path = change.get("path") or change.get("newPath") or change.get("oldPath") or ""
+        diff = change.get("diff", "")
+        if not path and not diff:
+            continue
+        if kind == "add":
+            edits.append(f"--- /dev/null\n+++ {path}\n{diff}")
+        elif kind == "delete":
+            edits.append(f"--- {path}\n+++ /dev/null\n{diff}")
+        elif diff.startswith("*** Begin Patch"):
+            edits.append(diff)
+        elif diff.startswith("@@"):
+            edits.append(f"--- {path}\n+++ {path}\n{diff}")
+        else:
+            edits.append(f"--- {path}\n+++ {path}\n{diff}")
+    return edits
+
+
+def _is_resolved_status(status: str) -> bool:
+    return status in {"end_turn", "completed"}
+
+
 def _extract_patch(traj: dict) -> str:
     """P1 fix: 从轨迹中提取 patch（文件编辑的 diff 内容）
 
@@ -148,8 +196,14 @@ def _extract_patch(traj: dict) -> str:
             new = tool_input.get("new_string", tool_input.get("new_text", ""))
             if fp and (old or new):
                 edits.append(f"--- {fp}\n+++ {fp}\n-{old}\n+{new}")
-        elif tool_name == "bash":
-            cmd = tool_input.get("command", "")
+        elif tool_name == "apply_patch":
+            patch = _extract_codex_apply_patch(tool_input)
+            if patch:
+                edits.append(patch)
+        elif tool_name == "file_change":
+            edits.extend(_extract_codex_file_change(tool_input))
+        elif tool_name in {"bash", "exec_command", "shell_command"}:
+            cmd = _extract_shell_command(tool_input)
             # 检测 sed/patch 等常见文件修改命令
             if cmd and any(kw in cmd for kw in ("sed -i", "patch ", "tee ", "cat >", "echo >")):
                 edits.append(f"# bash: {cmd}")
@@ -172,7 +226,7 @@ def convert_traj(traj: dict, style: str, system_message: str = DEFAULT_SYSTEM_ME
         "messages": messages,
         "instance_id": meta.get("session_id", ""),
         "model": meta.get("model", ""),
-        "resolved": meta.get("exit_status") == "end_turn",
+        "resolved": _is_resolved_status(meta.get("exit_status", "")),
         "tools_used": meta.get("tools_used", []),
         "total_steps": meta.get("total_steps", 0),
         "patch": patch,

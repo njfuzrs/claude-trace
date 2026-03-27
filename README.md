@@ -1,6 +1,6 @@
 # claude-trace
 
-Claude Code 轨迹采集工具。通过 HTTP 代理 + Hooks 双通道采集 Claude Code 的完整交互数据，输出 SWE-agent 兼容的 `.traj` 格式。
+Claude Code / Codex 轨迹采集工具。Claude Code 通过 HTTP 代理 + Hooks 双通道在线采集，Codex 通过本机 `~/.codex` 数据离线导出，统一输出 SWE-agent 兼容的 `.traj` 格式。
 
 ## 目录
 
@@ -12,6 +12,7 @@ Claude Code 轨迹采集工具。通过 HTTP 代理 + Hooks 双通道采集 Clau
   - [方式二：守护进程模式（推荐日常使用）](#方式二守护进程模式推荐日常使用)
   - [方式三：手动分步启动](#方式三手动分步启动)
   - [方式四：仅代理模式（不配置 Hooks）](#方式四仅代理模式不配置-hooks)
+  - [方式五：导入 Codex 本地会话](#方式五导入-codex-本地会话)
 - [配置说明](#配置说明)
   - [代理参数](#代理参数)
   - [Hooks 配置](#hooks-配置)
@@ -68,6 +69,25 @@ Claude Code
 - **通道 A（HTTP 代理）**：通过 `ANTHROPIC_BASE_URL` 环境变量劫持 API 请求，SSE Tee 模式零延迟转发 + 后台记录
 - **通道 B（Hooks）**：通过 Claude Code 原生 hooks 机制采集会话事件（session 生命周期、用户 prompt、sub-agent 等）
 - 两个通道通过 `session_id` 自动关联合并
+
+Codex 不能直接复用上面的 HTTP 代理方案。Codex CLI 的完整对话、工具轨迹和子代理关系主要保存在本机 `~/.codex/`，推荐导入链路如下：
+
+```
+Codex CLI
+    │
+    ├── app-server(thread/list, thread/read)
+    │        └── 官方语义线程结构：turn / item / source / sub-agent
+    │
+    ├── ~/.codex/sessions/.../rollout-*.jsonl
+    │        └── 原始事件流：旧版本工具调用、developer 指令、token 统计
+    │
+    └── ~/.codex/state_5.sqlite + logs_1.sqlite
+             └── 线程索引 / 父子线程关系 / 异常日志兜底
+```
+
+- **主通道（app-server）**：优先读取官方 `thread/read(includeTurns=true)` 结果，拿到结构化 turns/items
+- **补通道（rollout.jsonl）**：补 developer/system 指令、token 用量，并兼容旧版会话缺失的工具 item
+- **异常兜底（sqlite）**：保留 `thread_spawn_edges`、失败日志、索引信息，减少遗漏
 
 ---
 
@@ -208,6 +228,36 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:4000 claude
 
 此模式下缺少的数据：session_id（自动生成 UUID 替代）、用户原始 prompt、sub-agent 生命周期、context compaction 详情。
 
+### 方式五：导入 Codex 本地会话
+
+Codex 不走 Claude 的 HTTP 代理链路。要尽可能完整地采集 Codex 对话，直接读取本机 `~/.codex` 数据并导出到统一 `.traj` 格式：
+
+```bash
+# 导出指定线程
+python3 import_codex.py --thread-id <thread_id> --output ./trajectories/sessions
+
+# 导出当前可见的全部线程
+python3 import_codex.py --all --output ./trajectories/sessions
+```
+
+导出结果：
+
+```text
+trajectories/sessions/{thread_id}/
+├── session.traj
+├── codex_thread.json
+├── rollout.jsonl
+├── state_logs.jsonl
+└── feedback_logs.jsonl
+```
+
+说明：
+
+- `session.traj`：统一后的轨迹文件，已将 Codex `exit_status` 归一为 `end_turn / user_interrupt / error / partial`
+- `codex_thread.json`：`thread/read` 返回的官方线程结构原文
+- `rollout.jsonl`：原始事件流备份，便于后续补解析和回放
+- `state_logs.jsonl` / `feedback_logs.jsonl`：sqlite 中按 `thread_id` 抽出的异常与反馈日志
+
 ---
 
 ## 配置说明
@@ -322,6 +372,8 @@ UPSTREAM=https://your-proxy.com ./start.sh
 
 ## 数据目录结构
 
+Claude 在线采集输出：
+
 ```
 trajectories/
 ├── raw/                                    # 原始数据
@@ -336,6 +388,19 @@ trajectories/
 │   └── {session_id}.traj                   # 轨迹文件（trajectory + history + info + metadata）
 ~/.claude/trajectory_events/                # Hooks 事件数据（通道 B）
     └── {session_id}.jsonl                  # 按 session 分文件的事件流
+```
+
+Codex 离线导出输出：
+
+```text
+trajectories/
+└── sessions/
+    └── {thread_id}/
+        ├── session.traj
+        ├── codex_thread.json
+        ├── rollout.jsonl
+        ├── state_logs.jsonl
+        └── feedback_logs.jsonl
 ```
 
 **JSONL 格式说明：**
@@ -400,7 +465,7 @@ python3 filter_trajs.py \
 |------|------|
 | `--min-steps N` | 最少 N 个 TAO 步骤（过滤无效会话），默认 3 |
 | `--max-steps N` | 最多 N 个步骤（过滤死循环），0=不限 |
-| `--require-end-turn` | 必须以 end_turn 正常结束 |
+| `--require-end-turn` | 必须正常结束；兼容 `end_turn` 和历史 Codex `completed` |
 | `--require-tool-use` | 必须包含工具调用（过滤纯对话） |
 | `--report` | 输出质量指标报告 |
 

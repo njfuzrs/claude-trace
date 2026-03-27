@@ -16,6 +16,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("filter")
 
 
+def _is_normal_exit(exit_status: str) -> bool:
+    return exit_status in {"end_turn", "completed"}
+
+
 def load_traj(path: Path) -> dict:
     return json.loads(path.read_text())
 
@@ -39,7 +43,7 @@ def passes_filter(traj: dict, args) -> tuple[bool, str]:
     if args.max_steps and step_count > args.max_steps:
         return False, f"步骤数过多: {step_count} > {args.max_steps}"
 
-    if args.require_end_turn and exit_status != "end_turn":
+    if args.require_end_turn and not _is_normal_exit(exit_status):
         return False, f"非正常结束: {exit_status}"
 
     if args.require_tool_use and not has_tool_use:
