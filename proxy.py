@@ -957,7 +957,9 @@ class DataCollector:
 
             if self._uploader:
                 session_dir = self._session_dir(session.id)
-                task = asyncio.create_task(self._uploader.upload_session(session_dir, session.id))
+                task = asyncio.create_task(
+                    self._uploader.upload_session(session_dir, session.id, tool_source="claude-code")
+                )
                 task.add_done_callback(_log_task_exception)
 
     def _copy_events_to_session(self, session_id: str):

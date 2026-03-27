@@ -40,6 +40,7 @@ class UploadQueueItem:
     session_id: str
     file_type: str          # traj / raw / events
     filepath: str           # 原始文件绝对路径
+    tool_source: str = "claude-code"
     gz_path: str = ""       # 压缩后文件路径（首次压缩后填入）
     sha256: str = ""        # 压缩文件的 SHA256
     retry_count: int = 0
@@ -92,6 +93,39 @@ def compress_and_hash(filepath: Path) -> tuple:
                 break
             sha256.update(chunk)
     return gz_path, sha256.hexdigest()
+
+
+def infer_tool_source(session_dir: Path) -> str:
+    """根据会话目录内容推断工具来源。
+
+    默认 claude-code；Codex 导出目录会包含 codex_thread.json，
+    或在 session.traj metadata 中写入 codex 采集标记。
+    """
+    override = os.environ.get("TRAJ_TOOL_SOURCE", "").strip()
+    if override:
+        return override
+
+    if (session_dir / "codex_thread.json").exists():
+        return "codex"
+
+    traj_path = session_dir / "session.traj"
+    if not traj_path.exists():
+        return "claude-code"
+
+    try:
+        data = json.loads(traj_path.read_text())
+    except Exception:
+        return "claude-code"
+
+    metadata = data.get("metadata", {}) or {}
+    capture_channel = str(metadata.get("capture_channel", "") or "")
+    model = str(metadata.get("model", "") or "")
+    if capture_channel.startswith("codex_"):
+        return "codex"
+    if "codex" in model.lower():
+        return "codex"
+
+    return "claude-code"
 
 
 # ─────────────────────────────────────────────
@@ -225,7 +259,7 @@ class UploadManager:
     # 主入口：上传会话
     # ─────────────────────────────────────────
 
-    async def upload_session(self, session_dir: Path, session_id: str):
+    async def upload_session(self, session_dir: Path, session_id: str, tool_source: Optional[str] = None):
         """上传会话的所有文件（fire-and-forget，失败不影响主流程）
 
         每个文件独立处理：压缩 → 上传（带重试）→ 失败则入队。
@@ -233,6 +267,7 @@ class UploadManager:
         """
         results = {}  # file_type → {"sha256": ..., "gz_size": ...}
         all_confirmed = True
+        resolved_tool_source = tool_source or infer_tool_source(session_dir)
 
         for file_type, filename in self.UPLOAD_FILES:
             filepath = session_dir / filename
@@ -250,6 +285,7 @@ class UploadManager:
                 item = UploadQueueItem(
                     session_id=session_id,
                     file_type=file_type,
+                    tool_source=resolved_tool_source,
                     filepath=str(filepath),
                     gz_path=str(gz_path),
                     sha256=sha256,
@@ -319,7 +355,7 @@ class UploadManager:
         )
         data.add_field("session_id", item.session_id)
         data.add_field("file_type", item.file_type)
-        data.add_field("tool_source", "claude-code")
+        data.add_field("tool_source", item.tool_source)
         data.add_field("compressed", "true")
         data.add_field("user_id", self._user_id)
         data.add_field("device_id", self._device_id)
