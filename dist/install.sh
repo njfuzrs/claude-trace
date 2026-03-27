@@ -26,7 +26,10 @@ PLIST_PATH="$HOME/Library/LaunchAgents/${LABEL}.plist"
 SETTINGS="$HOME/.claude/settings.json"
 COLLECTOR_DEST="$HOME/.claude/hooks/collector.py"
 LOG_FILE="/tmp/claude-trace-proxy.log"
+CLI_SYMLINK_DIR="$HOME/.local/bin"
+CLI_SYMLINK_PATH="$CLI_SYMLINK_DIR/claude-trace"
 NON_INTERACTIVE=false
+PATH_SNIPPET_RC=""
 
 # Hook 事件列表（与 setup_hooks.py 保持一致）
 HOOK_EVENTS="SessionStart SessionEnd UserPromptSubmit Stop PostToolUse SubagentStart SubagentStop PostCompact PreToolUse PermissionRequest InstructionsLoaded StopFailure"
@@ -74,6 +77,43 @@ prompt_input() {
         read -rp "  $prompt: " value
     fi
     eval "$var_name=\"$value\""
+}
+
+detect_shell_rc() {
+    case "$(basename "${SHELL:-}")" in
+        zsh)  echo "$HOME/.zshrc" ;;
+        bash) echo "$HOME/.bashrc" ;;
+        *)    echo "" ;;
+    esac
+}
+
+ensure_cli_command() {
+    mkdir -p "$CLI_SYMLINK_DIR"
+    ln -sf "$INSTALL_DIR/claude-trace" "$CLI_SYMLINK_PATH"
+    info "命令入口: $CLI_SYMLINK_PATH"
+
+    if echo "$PATH" | tr ':' '\n' | grep -qx "$CLI_SYMLINK_DIR"; then
+        return
+    fi
+
+    local shell_rc
+    shell_rc="$(detect_shell_rc)"
+    if [ -z "$shell_rc" ]; then
+        warn "未识别当前 shell，请手动加入 PATH: export PATH=\"\$HOME/.local/bin:\$PATH\""
+        return
+    fi
+
+    touch "$shell_rc"
+    if ! grep -qF '# >>> claude-trace >>>' "$shell_rc"; then
+        cat >> "$shell_rc" <<'EOF'
+
+# >>> claude-trace >>>
+export PATH="$HOME/.local/bin:$PATH"
+# <<< claude-trace <<<
+EOF
+        PATH_SNIPPET_RC="$shell_rc"
+        ok "已写入命令 PATH 到 $shell_rc"
+    fi
 }
 
 # ─── 前置检查 ───
@@ -179,7 +219,7 @@ else
         REPO_DIR="$(cd .. && pwd)"
     fi
 
-    if [ -z "$REPO_DIR" ] || [ ! -f "$REPO_DIR/proxy.py" ]; then
+    if [ -z "$REPO_DIR" ] || [ ! -f "$REPO_DIR/trace_agent.py" ]; then
         fail "请设置 RELEASE_BASE 环境变量指向下载地址，或从项目目录运行: bash dist/install.sh"
     fi
 
@@ -198,13 +238,13 @@ else
         # 创建一个 wrapper 脚本代替二进制
         cat > "$INSTALL_DIR/bin/claude-trace-proxy" <<'WRAPPER'
 #!/bin/bash
-# 开发模式 wrapper：直接调用 python3 proxy.py
+# 开发模式 wrapper：直接调用 python3 统一采集入口
 REPO_DIR="$(cat "$HOME/.claude-trace/.repo_dir" 2>/dev/null)"
-if [ -z "$REPO_DIR" ] || [ ! -f "$REPO_DIR/proxy.py" ]; then
-    echo "错误：找不到 proxy.py，请重新安装或先构建二进制"
+if [ -z "$REPO_DIR" ] || [ ! -f "$REPO_DIR/trace_agent.py" ]; then
+    echo "错误：找不到 trace_agent.py，请重新安装或先构建二进制"
     exit 1
 fi
-exec python3 "$REPO_DIR/proxy.py" "$@"
+exec python3 "$REPO_DIR/trace_agent.py" "$@"
 WRAPPER
         echo "$REPO_DIR" > "$INSTALL_DIR/.repo_dir"
     fi
@@ -414,10 +454,10 @@ print(f"     hooks: {len(hook_events)} 个事件")
 print(f"     ANTHROPIC_BASE_URL: http://127.0.0.1:{port}")
 PYEOF
 
-# ─── 安装 launchd 服务 ───
+# ─── 安装 launchd 统一采集服务 ───
 
 echo ""
-echo "=== 启动服务 ==="
+echo "=== 启动统一采集服务 ==="
 
 # 从 channels.json 读取上游配置
 _svc_config=$(python3 -c "
@@ -509,11 +549,11 @@ cat > "$PLIST_PATH" <<PLIST
 PLIST
 
 launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
-ok "launchd 服务已启动"
+ok "launchd 统一采集服务已启动"
 
-# ─── 等待健康检查 ───
+# ─── 等待统一采集器健康检查 ───
 
-info "等待代理启动（首次启动约需 10 秒）..."
+info "等待统一采集器启动（首次启动约需 10 秒，Codex 可能顺带补采历史会话）..."
 HEALTH_OK=false
 for i in $(seq 1 20); do
     if curl -s "http://127.0.0.1:$PORT/_internal/health" &>/dev/null; then
@@ -525,19 +565,26 @@ done
 
 echo ""
 if [ "$HEALTH_OK" = true ]; then
-    ok "代理已就绪 (http://127.0.0.1:$PORT)"
+    ok "统一采集器已就绪 (http://127.0.0.1:$PORT)"
 else
-    warn "代理尚未响应，请检查日志: tail -20 $LOG_FILE"
+    warn "统一采集器尚未响应，请检查日志: tail -20 $LOG_FILE"
 fi
 
-# ─── 添加 PATH ───
+# ─── 配置 CLI 命令 ───
 
-# 创建符号链接到 ~/.local/bin（如果该目录在 PATH 中）
-SYMLINK_DIR="$HOME/.local/bin"
-if echo "$PATH" | tr ':' '\n' | grep -q "^$SYMLINK_DIR$"; then
-    mkdir -p "$SYMLINK_DIR"
-    ln -sf "$INSTALL_DIR/claude-trace" "$SYMLINK_DIR/claude-trace"
-    info "已创建符号链接: $SYMLINK_DIR/claude-trace"
+ensure_cli_command
+
+CLI_START_CMD="claude-trace start"
+CLI_STATUS_CMD="claude-trace status"
+CLI_SWITCH_LIST_CMD="claude-trace switch list"
+CLI_LOGS_CMD="claude-trace logs"
+CLI_UNINSTALL_CMD="claude-trace uninstall"
+if ! command -v claude-trace >/dev/null 2>&1; then
+    CLI_START_CMD="$CLI_SYMLINK_PATH start"
+    CLI_STATUS_CMD="$CLI_SYMLINK_PATH status"
+    CLI_SWITCH_LIST_CMD="$CLI_SYMLINK_PATH switch list"
+    CLI_LOGS_CMD="$CLI_SYMLINK_PATH logs"
+    CLI_UNINSTALL_CMD="$CLI_SYMLINK_PATH uninstall"
 fi
 
 # ─── 完成 ───
@@ -553,25 +600,21 @@ echo "║   安装完成！v$NEW_VERSION"
 fi
 echo "╚══════════════════════════════════════╝"
 echo ""
-echo "  常用命令："
-echo "    $INSTALL_DIR/claude-trace status      # 查看状态"
-echo "    $INSTALL_DIR/claude-trace switch list  # 列出渠道"
-echo "    $INSTALL_DIR/claude-trace logs         # 查看日志"
-echo "    $INSTALL_DIR/claude-trace uninstall    # 卸载"
+echo "  统一采集服务已默认启动。后续如需恢复或重启采集，只需一个命令："
+echo "    $CLI_START_CMD"
 echo ""
-echo "  现在可以正常使用 Claude Code，轨迹将自动采集。"
+echo "  常用命令："
+echo "    $CLI_STATUS_CMD       # 查看状态"
+echo "    $CLI_SWITCH_LIST_CMD  # 列出渠道"
+echo "    $CLI_LOGS_CMD         # 查看日志"
+echo "    $CLI_UNINSTALL_CMD    # 卸载"
+echo ""
+echo "  现在可以正常使用 Claude Code，Claude + Codex 轨迹都会默认自动采集。"
 echo ""
 
-# 提示添加 PATH
-if ! echo "$PATH" | tr ':' '\n' | grep -q "^$INSTALL_DIR$"; then
-    SHELL_RC=""
-    case "$(basename "$SHELL")" in
-        zsh)  SHELL_RC="~/.zshrc" ;;
-        bash) SHELL_RC="~/.bashrc" ;;
-    esac
-    if [ -n "$SHELL_RC" ]; then
-        echo "  提示：将以下行添加到 $SHELL_RC 以便直接使用 claude-trace 命令："
-        echo "    export PATH=\"\$HOME/.claude-trace:\$PATH\""
-        echo ""
-    fi
+# 提示刷新 shell
+if [ -n "$PATH_SNIPPET_RC" ]; then
+    echo "  当前 shell 还未加载 PATH。若要直接使用 claude-trace，请先执行一次："
+    echo "    source $PATH_SNIPPET_RC"
+    echo ""
 fi

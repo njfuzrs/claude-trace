@@ -1,6 +1,6 @@
 # claude-trace
 
-Claude Code / Codex 轨迹采集工具。Claude Code 通过 HTTP 代理 + Hooks 双通道在线采集，Codex 通过本机 `~/.codex` 数据离线导出，统一输出 SWE-agent 兼容的 `.traj` 格式。
+Claude Code / Codex 轨迹采集工具。默认通过一个统一执行入口同时采集两类数据：Claude Code 走 HTTP 统一采集器 + Hooks，Codex 走本机 `~/.codex` rollout watcher + app-server 线程读取，统一输出 SWE-agent 兼容的 `.traj` 格式。
 
 ## 目录
 
@@ -11,12 +11,12 @@ Claude Code / Codex 轨迹采集工具。Claude Code 通过 HTTP 代理 + Hooks 
   - [方式一：一键启动](#方式一一键启动)
   - [方式二：守护进程模式（推荐日常使用）](#方式二守护进程模式推荐日常使用)
   - [方式三：手动分步启动](#方式三手动分步启动)
-  - [方式四：仅代理模式（不配置 Hooks）](#方式四仅代理模式不配置-hooks)
+  - [方式四：仅统一采集器模式（不配置 Hooks）](#方式四仅统一采集器模式不配置-hooks)
   - [方式五：导入 Codex 本地会话](#方式五导入-codex-本地会话)
 - [配置说明](#配置说明)
-  - [代理参数](#代理参数)
+  - [统一采集器参数](#统一采集器参数)
   - [Hooks 配置](#hooks-配置)
-  - [第三方 API 代理](#第三方-api-代理)
+  - [第三方 API 统一采集器上游](#第三方-api-统一采集器上游)
 - [渠道管理](#渠道管理)
 - [数据目录结构](#数据目录结构)
 - [数据处理管道](#数据处理管道)
@@ -33,22 +33,20 @@ Claude Code / Codex 轨迹采集工具。Claude Code 通过 HTTP 代理 + Hooks 
 ## 快速开始
 
 ```bash
-# 1. 安装依赖
-pip install aiohttp
+# 1. 运行安装器（开机自启 + 崩溃重启 + 默认开启统一采集，只需执行一次）
+bash dist/install.sh
 
-# 2. 安装代理服务（开机自启 + 崩溃重启，只需执行一次）
-./install-daemon.sh install
+# 2. 安装完成后，如需再次拉起统一采集，只需一个命令
+claude-trace start
 
-# 3. 配置 Hooks（只需执行一次）
-python3 setup_hooks.py
-
-# 4. 配置 settings.json（只需执行一次）
-# 确保 ANTHROPIC_BASE_URL 指向本地代理：http://127.0.0.1:4000
+# 3. 查看状态 / 日志
+claude-trace status
+claude-trace logs
 ```
 
-配置完成后，以后每次正常启动 `claude` 即可，所有请求自动经过代理采集到 `./trajectories/` 目录。代理开机自启，无需手动管理。
+安装器会自动部署 Hooks、写入 `~/.claude/settings.json`，并立即拉起统一采集服务。配置完成后，以后每次正常启动 `claude` 即可，Claude 请求会自动经过本地统一采集器；同时统一守护进程也会默认持续监听本机 `~/.codex`，增量采集 Codex 会话到 `./trajectories/` 目录，无需额外配置。
 
-> **核心原则：代理永不中断。** 所有 Claude Code 请求必须经过本地代理（`localhost:4000`）转发到上游 API。代理通过 macOS launchd 服务管理，开机自启 + 崩溃自动重启，确保采集不丢数据。如果代理未运行而 `ANTHROPIC_BASE_URL` 指向 `localhost:4000`，Claude Code 会报 403 错误。
+> **核心原则：统一采集进程永不中断。** Claude Code 请求必须经过本地统一采集器（`localhost:4000`）转发到上游 API；Codex 会话则由同一守护进程默认持续监听 `~/.codex/sessions/**/rollout-*.jsonl`。统一进程通过 macOS launchd 服务管理，开机自启 + 崩溃自动重启，确保采集不丢数据。
 
 ---
 
@@ -57,7 +55,7 @@ python3 setup_hooks.py
 ```
 Claude Code
     │
-    ├── API 请求 ──→ HTTP 代理 (localhost:4000) ──→ 上游 API
+    ├── API 请求 ──→ HTTP 统一采集器 (localhost:4000) ──→ 上游 API
     │                    │
     │                    └── 记录: 请求体 / SSE 响应 / token 用量
     │
@@ -66,11 +64,11 @@ Claude Code
                          └── 记录: session_id / 用户 prompt / 工具调用 / sub-agent
 ```
 
-- **通道 A（HTTP 代理）**：通过 `ANTHROPIC_BASE_URL` 环境变量劫持 API 请求，SSE Tee 模式零延迟转发 + 后台记录
+- **通道 A（HTTP 统一采集器）**：通过 `ANTHROPIC_BASE_URL` 环境变量劫持 API 请求，SSE Tee 模式零延迟转发 + 后台记录
 - **通道 B（Hooks）**：通过 Claude Code 原生 hooks 机制采集会话事件（session 生命周期、用户 prompt、sub-agent 等）
 - 两个通道通过 `session_id` 自动关联合并
 
-Codex 不能直接复用上面的 HTTP 代理方案。Codex CLI 的完整对话、工具轨迹和子代理关系主要保存在本机 `~/.codex/`，推荐导入链路如下：
+Codex 不能直接复用 Claude 的 HTTP 统一采集器方案。统一守护进程会默认监听本机 `~/.codex/`，并在需要时结合 app-server + rollout + sqlite 做增量刷新；手工导入模式仍保留，便于补历史数据。Codex 数据链路如下：
 
 ```
 Codex CLI
@@ -115,51 +113,48 @@ pip install -r requirements.txt   # 只需要 aiohttp
 1. 检查 aiohttp 依赖
 2. 部署 `collector.py` 到 `~/.claude/hooks/`
 3. 配置 `~/.claude/settings.json` 的 hooks
-4. 后台启动代理（端口 4000）
+4. 后台启动统一采集器（端口 4000）
 5. 前台启动 Claude Code（自动设置 `ANTHROPIC_BASE_URL`）
 
-Claude Code 退出后，代理自动停止。
+Claude Code 退出后，统一采集器自动停止。
 
 **自定义参数：**
 
 ```bash
 ./start.sh --port 5000              # 自定义端口
 ./start.sh --output /data/traces    # 自定义输出目录
-./start.sh --proxy-only             # 只启动代理，不启动 Claude Code
+./start.sh --proxy-only             # 只启动统一采集器，不启动 Claude Code
 ./start.sh -- -p "hello"            # -- 之后的参数传给 claude
 ```
 
 ### 方式二：守护进程模式（推荐日常使用）
 
-代理常驻后台，开机自启 + 崩溃自动重启。配置一次后无需再管。
+统一采集进程常驻后台，开机自启 + 崩溃自动重启。配置一次后无需再管。
 
 **方法 A：launchd 自启动（推荐 macOS）**
 
 ```bash
-# 一键安装（开机自启 + 崩溃重启）
-./install-daemon.sh install
-
-# 配置 Hooks（只需执行一次）
-python3 setup_hooks.py
-
-# 配置 settings.json（只需执行一次）
-# 将 ANTHROPIC_BASE_URL 改为 http://127.0.0.1:4000
+# 一键安装并启动（开机自启 + 崩溃重启）
+bash dist/install.sh
 ```
 
-安装后重启电脑也会自动启动代理，无需手动操作。
+安装器会自动部署 Hooks、配置 `~/.claude/settings.json`，并启动统一采集服务。重启电脑后也会自动拉起，无需手动操作。默认行为是：
+
+- Claude Code：通过本地统一采集器采集
+- Codex：自动监听 `~/.codex/sessions/**/rollout-*.jsonl` 并增量刷新
 
 ```bash
 # 管理命令
-./install-daemon.sh status     # 查看状态
-./install-daemon.sh restart    # 重启服务
-./install-daemon.sh uninstall  # 卸载服务
+claude-trace status       # 查看状态
+claude-trace restart      # 重启服务
+claude-trace uninstall    # 卸载服务
 ```
 
 自定义参数通过环境变量传入：
 
 ```bash
 # 自定义上游和端口
-PORT=5000 UPSTREAM=https://api.anthropic.com ./install-daemon.sh install
+PORT=5000 UPSTREAM_URL=https://api.anthropic.com bash dist/install.sh --non-interactive
 ```
 
 **方法 B：手动 nohup 启动**
@@ -171,7 +166,7 @@ UPSTREAM=https://api.anthropic.com nohup ./proxy-daemon.sh > /dev/null 2>&1 &
 
 **配置 settings.json（两种方法都需要，只需执行一次）**
 
-编辑 `~/.claude/settings.json`，将 `ANTHROPIC_BASE_URL` 指向代理：
+编辑 `~/.claude/settings.json`，将 `ANTHROPIC_BASE_URL` 指向统一采集器：
 
 ```json
 {
@@ -181,13 +176,13 @@ UPSTREAM=https://api.anthropic.com nohup ./proxy-daemon.sh > /dev/null 2>&1 &
 }
 ```
 
-配置完成后，以后每次正常启动 `claude` 即可，所有请求自动经过代理采集。
+配置完成后，以后每次正常启动 `claude` 即可，所有请求自动经过统一采集器采集；同一守护进程也会默认持续采集 Codex，无需额外配置。
 
 支持的环境变量：
 
 | 变量 | 默认值 | 说明 |
 | ---- | ------ | ---- |
-| `PORT` | 4000 | 代理监听端口 |
+| `PORT` | 4000 | 统一采集器监听端口 |
 | `UPSTREAM` | `https://api.anthropic.com` | 上游 API 地址 |
 | `OUTPUT` | `./trajectories` | 轨迹数据输出目录 |
 | `FORCE_THINKING` | 0 | 非 0 时强制 thinking effort=max |
@@ -196,7 +191,7 @@ UPSTREAM=https://api.anthropic.com nohup ./proxy-daemon.sh > /dev/null 2>&1 &
 
 ```bash
 # launchd 方式
-./install-daemon.sh uninstall
+claude-trace uninstall
 
 # nohup 方式：删除 PID 文件后 kill
 rm /tmp/claude-trace-proxy.pid && kill $(lsof -ti :4000)
@@ -207,22 +202,22 @@ rm /tmp/claude-trace-proxy.pid && kill $(lsof -ti :4000)
 适合调试或自定义场景。
 
 ```bash
-# 终端 1：启动代理
-python3 proxy.py --port 4000 --output ./trajectories --verbose
+# 终端 1：启动统一采集器
+python3 trace_agent.py --port 4000 --output ./trajectories --verbose
 
 # 终端 2：配置 Hooks（首次使用）
 python3 setup_hooks.py
 
-# 终端 2：通过代理启动 Claude Code
+# 终端 2：通过统一采集器启动 Claude Code
 ANTHROPIC_BASE_URL=http://127.0.0.1:4000 claude
 ```
 
-### 方式四：仅代理模式（不配置 Hooks）
+### 方式四：仅统一采集器模式（不配置 Hooks）
 
-如果不想配置 Hooks，代理可以独立工作。会话识别退回到对话内容连续性匹配（准确度略低）。
+如果不想配置 Hooks，统一采集器也可以独立工作。会话识别退回到对话内容连续性匹配（准确度略低）。
 
 ```bash
-python3 proxy.py --port 4000
+python3 trace_agent.py --port 4000 --output ./trajectories --verbose
 ANTHROPIC_BASE_URL=http://127.0.0.1:4000 claude
 ```
 
@@ -230,7 +225,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:4000 claude
 
 ### 方式五：导入 Codex 本地会话
 
-Codex 不走 Claude 的 HTTP 代理链路。要尽可能完整地采集 Codex 对话，直接读取本机 `~/.codex` 数据并导出到统一 `.traj` 格式：
+Codex 不走 Claude 的 HTTP 统一采集器链路。要尽可能完整地采集 Codex 对话，直接读取本机 `~/.codex` 数据并导出到统一 `.traj` 格式：
 
 ```bash
 # 导出指定线程
@@ -238,6 +233,18 @@ python3 import_codex.py --thread-id <thread_id> --output ./trajectories/sessions
 
 # 导出当前可见的全部线程
 python3 import_codex.py --all --output ./trajectories/sessions
+
+# 扫描 rollout 增量变化并导出一次（适合测试 / cron）
+python3 import_codex.py --once --output ./trajectories/sessions
+
+# 常驻 watcher：监听 ~/.codex/sessions/**/rollout-*.jsonl 的新增和追加
+python3 import_codex.py --watch --output ./trajectories/sessions
+
+# 安装 macOS launchd 守护进程
+./install-codex-daemon.sh install
+./install-codex-daemon.sh status
+./install-codex-daemon.sh restart
+./install-codex-daemon.sh uninstall
 ```
 
 导出结果：
@@ -257,16 +264,20 @@ trajectories/sessions/{thread_id}/
 - `codex_thread.json`：`thread/read` 返回的官方线程结构原文
 - `rollout.jsonl`：原始事件流备份，便于后续补解析和回放
 - `state_logs.jsonl` / `feedback_logs.jsonl`：sqlite 中按 `thread_id` 抽出的异常与反馈日志
+- watcher 会监听 `~/.codex/sessions/**/rollout-*.jsonl` 的新增与追加，并按同一个 `thread_id` 增量刷新导出目录
+- 每次刷新都会同步维护 `codex_thread.json / rollout.jsonl / state_logs.jsonl / feedback_logs.jsonl`，不只保留转换后的 `session.traj`
+- watcher 状态默认保存在 `trajectories/sessions/.codex_watch_state.json`，重启后只补采新增或变化的 rollout 文件
+- 为了尽量减少 sqlite 延迟带来的漏采，watcher 会在 rollout 变化后做一次快速导出，并在安静期后再做一次确认导出
 
 ---
 
 ## 配置说明
 
-### 代理参数
+### 统一采集器参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--port` | 4000 | 代理监听端口 |
+| `--port` | 4000 | 统一采集器监听端口 |
 | `--host` | 127.0.0.1 | 监听地址（默认只监听本地，防止局域网访问） |
 | `--output` | ./trajectories | 轨迹数据输出目录 |
 | `--upstream` | https://api.anthropic.com | 上游 API 地址 |
@@ -303,20 +314,20 @@ python3 setup_hooks.py --collector /path/to/collector.py  # 指定 collector 路
 | P2 | InstructionsLoaded | CLAUDE.md 加载 |
 | P2 | StopFailure | API 错误详情 |
 
-### 第三方 API 代理
+### 第三方 API 统一采集器上游
 
-如果你使用第三方 API 代理（而非 Anthropic 官方 API），需要将 `--upstream` 设置为你的代理地址：
+如果你使用第三方 API 统一采集器上游（而非 Anthropic 官方 API），需要将 `--upstream` 设置为你的上游地址：
 
 ```bash
 # 手动启动
-python3 proxy.py --upstream https://your-proxy.com
+python3 trace_agent.py --upstream https://your-proxy.com
 
 # 或修改 proxy-daemon.sh 中的 --upstream 参数
 # 或修改 start.sh 的 UPSTREAM 变量
 UPSTREAM=https://your-proxy.com ./start.sh
 ```
 
-同时确保 `~/.claude/settings.json` 中的 `ANTHROPIC_BASE_URL` 指向本地代理：
+同时确保 `~/.claude/settings.json` 中的 `ANTHROPIC_BASE_URL` 指向本地统一采集器：
 
 ```json
 {
@@ -326,7 +337,7 @@ UPSTREAM=https://your-proxy.com ./start.sh
 }
 ```
 
-请求链路：`Claude Code → localhost:4000（代理采集）→ your-proxy.com → Anthropic API`
+请求链路：`Claude Code → localhost:4000（统一采集器采集）→ your-proxy.com → Anthropic API`
 
 ---
 
@@ -341,7 +352,7 @@ UPSTREAM=https://your-proxy.com ./start.sh
 ./switch-channel.sh status     # 查看当前渠道
 ```
 
-切换时会同时更新：`ANTHROPIC_AUTH_TOKEN`（token）、代理上游地址（`UPSTREAM`）、`FORCE_THINKING` 参数，并自动重启代理。
+切换时会同时更新：`ANTHROPIC_AUTH_TOKEN`（token）、统一采集器上游地址（`UPSTREAM`）、`FORCE_THINKING` 参数，并自动重启统一采集器。
 
 **渠道配置文件 `channels.json`**（复制 `channels.json.example` 创建）：
 
@@ -436,7 +447,7 @@ trajectories/
 **安全说明：**
 
 - 所有 raw 文件中的 API Key 已自动脱敏（`Authorization: Bearer sk-***`）
-- 代理默认绑定 `127.0.0.1`，不暴露到局域网
+- 统一采集器默认绑定 `127.0.0.1`，不暴露到局域网
 
 ---
 
@@ -505,7 +516,7 @@ python3 combine_trajs.py \
 
 ### 双通道数据合并
 
-如果同时使用了代理和 Hooks，可以用 `merger.py` 将两个通道的数据合并为增强版 `.traj`：
+如果同时使用了统一采集器和 Hooks，可以用 `merger.py` 将两个通道的数据合并为增强版 `.traj`：
 
 ```bash
 # 合并指定会话
@@ -529,7 +540,8 @@ python3 merger.py --all \
 
 | 文件 | 作用 |
 |------|------|
-| `proxy.py` | HTTP 代理服务器，SSE Tee 模式采集 API 请求/响应 |
+| `proxy.py` | HTTP 统一采集器服务器，SSE Tee 模式采集 API 请求/响应 |
+| `trace_agent.py` | Claude + Codex 统一采集入口，默认同时启动 HTTP 统一采集器与 Codex watcher |
 | `builder.py` | 轨迹构建器，将请求/响应对转换为 .traj 格式 |
 | `collector.py` | Hooks 采集脚本，部署到 `~/.claude/hooks/` |
 | `setup_hooks.py` | 自动配置 settings.json 的 hooks |
@@ -539,8 +551,13 @@ python3 merger.py --all \
 | `combine_trajs.py` | 合并 + shuffle SFT 数据 |
 | `start.sh` | 一键启动脚本 |
 | `proxy-daemon.sh` | 自动重启的守护进程脚本 |
-| `install-daemon.sh` | 安装/卸载 launchd 自启动服务（macOS） |
-| `switch-channel.sh` | 快速切换 API 渠道（同步更新 token + 代理上游） |
+| `dist/install.sh` | 一键安装器，安装后默认拉起统一采集服务，并创建 `claude-trace` 命令 |
+| `dist/claude-trace` | 安装后的统一 CLI 入口，用于 `start/status/logs/uninstall` |
+| `install-daemon.sh` | 旧版 launchd 安装脚本（保留兼容） |
+| `import_codex.py` | Codex 手工导入 + rollout watcher 持续采集 |
+| `codex-daemon.sh` | 自动重启的 Codex watcher 守护进程脚本 |
+| `install-codex-daemon.sh` | 安装/卸载 Codex watcher 的 launchd 自启动服务（macOS） |
+| `switch-channel.sh` | 快速切换 API 渠道（同步更新 token + 统一采集器上游） |
 | `channels.json` | 渠道配置文件，含 token/upstream/force_thinking（已加入 .gitignore） |
 | `channels.json.example` | 渠道配置模板，可提交到 git |
 | `viewer.py` | 轨迹数据 HTML 查看器，将 .traj 转为可视化 HTML |
@@ -551,24 +568,24 @@ python3 merger.py --all \
 
 ### Claude Code 报 403 错误
 
-最常见的原因是代理未运行。排查步骤：
+最常见的原因是统一采集器未运行。排查步骤：
 
 ```bash
-# 1. 检查代理是否在运行
-./install-daemon.sh status
+# 1. 检查统一采集器是否在运行
+claude-trace status
 
 # 2. 如果未运行，重启服务
-./install-daemon.sh restart
+claude-trace restart
 
-# 3. 检查 settings.json 中 ANTHROPIC_BASE_URL 是否指向本地代理
+# 3. 检查 settings.json 中 ANTHROPIC_BASE_URL 是否指向本地统一采集器
 grep ANTHROPIC_BASE_URL ~/.claude/settings.json
 # 应该是: "ANTHROPIC_BASE_URL": "http://127.0.0.1:4000"
 
-# 4. 查看代理日志排查具体错误
+# 4. 查看统一采集器日志排查具体错误
 tail -20 /tmp/claude-trace-proxy.log
 ```
 
-### Claude Code 没有走代理
+### Claude Code 没有走统一采集器
 
 检查 `ANTHROPIC_BASE_URL` 是否生效：
 
@@ -576,18 +593,18 @@ tail -20 /tmp/claude-trace-proxy.log
 # 方法 1：检查 settings.json
 cat ~/.claude/settings.json | grep ANTHROPIC_BASE_URL
 
-# 方法 2：检查代理日志
+# 方法 2：检查统一采集器日志
 tail -f /tmp/claude-trace-proxy.log
 
-# 方法 3：检查代理健康状态
+# 方法 3：检查统一采集器健康状态
 curl http://127.0.0.1:4000/_internal/health
 ```
 
-如果 settings.json 中已有全局的 `ANTHROPIC_BASE_URL`（如第三方代理地址），需要：
+如果 settings.json 中已有全局的 `ANTHROPIC_BASE_URL`（如第三方上游地址），需要：
 1. 将 settings.json 中的 `ANTHROPIC_BASE_URL` 改为 `http://127.0.0.1:4000`
-2. 将代理的 `--upstream` 设为原来的地址
+2. 将统一采集器的 `--upstream` 设为原来的地址
 
-### 代理启动报端口占用
+### 统一采集器启动报端口占用
 
 ```bash
 # 查看占用端口的进程
@@ -619,9 +636,9 @@ ls ~/.claude/trajectory_events/
 - 每次记录请求/响应后增量更新
 - SessionEnd hook 触发时导出
 - 会话超时（默认 5 分钟无活动）时导出
-- 代理 Ctrl+C 退出时导出所有活跃会话
+- 统一采集器 Ctrl+C 退出时导出所有活跃会话
 
-如果 .traj 缺失，检查代理日志中是否有 `构建 .traj 失败` 的错误。
+如果 .traj 缺失，检查统一采集器日志中是否有 `构建 .traj 失败` 的错误。
 
 ### 如何查看采集到的数据
 
@@ -657,7 +674,7 @@ cat ~/.claude/trajectory_events/<session_id>.jsonl | python3 -m json.tool --json
 
 ```bash
 # 1. 卸载 launchd 服务
-./install-daemon.sh uninstall
+claude-trace uninstall
 
 # 2. 移除 Hooks 配置
 python3 setup_hooks.py --remove
@@ -678,12 +695,12 @@ rm -rf ~/.claude/trajectory_events
 
 ```bash
 # 停止 launchd 服务（推荐）
-./install-daemon.sh uninstall
+claude-trace uninstall
 
 # 停止手动启动的守护进程
 rm /tmp/claude-trace-proxy.pid && kill $(lsof -ti :4000)
 
-# 停止手动启动的代理
+# 停止手动启动的统一采集器
 # 直接 Ctrl+C，会自动导出所有活跃会话的轨迹
 
 # 清理采集数据
@@ -692,6 +709,6 @@ rm -rf trajectories/raw trajectories/traj
 # 清理 Hooks 事件数据
 rm -rf ~/.claude/trajectory_events
 
-# 查看代理日志
+# 查看统一采集器日志
 tail -f /tmp/claude-trace-proxy.log
 ```

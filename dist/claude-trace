@@ -2,10 +2,10 @@
 # claude-trace — 统一 CLI 入口
 #
 # 用法：
-#   claude-trace start       # 安装并启动 launchd 服务
-#   claude-trace stop        # 停止服务
+#   claude-trace start       # 安装并启动统一采集服务
+#   claude-trace stop        # 停止统一采集服务
 #   claude-trace status      # 查看服务状态
-#   claude-trace restart     # 重启服务
+#   claude-trace restart     # 重启统一采集服务
 #   claude-trace switch <ch> # 切换渠道
 #   claude-trace switch list # 列出所有渠道
 #   claude-trace logs        # 查看日志
@@ -148,6 +148,7 @@ PLIST
     echo "   端口:  $PORT"
     echo "   上游:  $UPSTREAM"
     echo "   日志:  $LOG_FILE"
+    echo "   默认:  Claude 统一采集 + Codex watcher 采集"
     echo ""
     echo "验证: claude-trace status"
 }
@@ -203,8 +204,8 @@ do_status() {
     fi
 
     echo ""
-    echo "=== 健康检查 ==="
-    curl -s "http://127.0.0.1:$PORT/_internal/health" 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "代理未响应"
+    echo "=== Claude 统一采集器健康检查 ==="
+    curl -s "http://127.0.0.1:$PORT/_internal/health" 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "统一采集器未响应"
 
     echo ""
     echo "=== 最近日志 ==="
@@ -366,9 +367,9 @@ PYEOF
 
                 launchctl load "$PLIST_PATH" 2>/dev/null
                 if launchctl list "$LABEL" &>/dev/null; then
-                    echo "  ✅ 代理已重启"
+                    echo "  ✅ 统一采集器已重启"
                 else
-                    echo "  ❌ 代理启动失败，请检查: claude-trace logs"
+                    echo "  ❌ 统一采集器启动失败，请检查: claude-trace logs"
                 fi
             else
                 echo "  ⚠️  plist 不存在，请先执行: claude-trace start"
@@ -413,7 +414,7 @@ do_uninstall() {
         kill "$pid" 2>/dev/null || true
     fi
 
-    # 4. 从 settings.json 移除 hooks 和代理配置
+    # 4. 从 settings.json 移除 hooks 和统一采集器配置
     if [ -f "$SETTINGS" ]; then
         python3 - "$SETTINGS" <<'PYEOF'
 import json, sys
@@ -452,7 +453,7 @@ if "hooks" in data:
     if not data.get("hooks"):
         data.pop("hooks", None)
 
-# 移除 ANTHROPIC_BASE_URL（如果指向本地代理）
+# 移除 ANTHROPIC_BASE_URL（如果指向本地统一采集器）
 env = data.get("env", {})
 base_url = env.get("ANTHROPIC_BASE_URL", "")
 if "127.0.0.1" in base_url or "localhost" in base_url:
@@ -525,15 +526,15 @@ do_version() {
 # ─── usage ───
 
 usage() {
-    echo "claude-trace — Claude Code 轨迹采集工具"
+    echo "claude-trace — Claude Code + Codex 统一轨迹采集工具"
     echo ""
     echo "用法: claude-trace <命令>"
     echo ""
     echo "服务管理："
-    echo "  start       启动代理服务（launchd 自启动）"
-    echo "  stop        停止代理服务"
+    echo "  start       启动统一采集服务（Claude 统一采集器 + Codex watcher）"
+    echo "  stop        停止统一采集服务"
     echo "  status      查看服务状态"
-    echo "  restart     重启代理服务"
+    echo "  restart     重启统一采集服务"
     echo "  logs        查看实时日志"
     echo ""
     echo "渠道管理："

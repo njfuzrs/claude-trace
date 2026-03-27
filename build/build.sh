@@ -14,6 +14,7 @@ ARCH="$(uname -m)"
 VERSION="$(cat "$ROOT/version")"
 DIST_DIR="$ROOT/dist"
 BUILD_TMP="$ROOT/build/_build"
+BUILD_VENV="$ROOT/build/_venv"
 OUTPUT_DIR="$DIST_DIR/$ARCH"
 
 echo "=== claude-trace 构建 ==="
@@ -34,15 +35,24 @@ if ! command -v python3 &>/dev/null; then
     exit 1
 fi
 
-# 确保 PyInstaller 和 aiohttp 已安装
+# 使用独立虚拟环境，避免污染系统 Python
 echo "检查 Python 依赖..."
-python3 -c "import PyInstaller" 2>/dev/null || {
+if [ ! -x "$BUILD_VENV/bin/python3" ]; then
+    echo "创建构建虚拟环境..."
+    python3 -m venv "$BUILD_VENV"
+fi
+
+VENV_PYTHON="$BUILD_VENV/bin/python3"
+VENV_PIP="$BUILD_VENV/bin/pip"
+PYINSTALLER="$BUILD_VENV/bin/pyinstaller"
+
+"$VENV_PYTHON" -c "import PyInstaller" 2>/dev/null || {
     echo "安装 PyInstaller..."
-    pip3 install pyinstaller
+    "$VENV_PIP" install pyinstaller
 }
-python3 -c "import aiohttp" 2>/dev/null || {
+"$VENV_PYTHON" -c "import aiohttp" 2>/dev/null || {
     echo "安装 aiohttp..."
-    pip3 install "aiohttp>=3.9.0"
+    "$VENV_PIP" install "aiohttp>=3.9.0"
 }
 
 # 构建
@@ -50,7 +60,7 @@ echo ""
 echo "开始 PyInstaller 打包..."
 mkdir -p "$OUTPUT_DIR" "$BUILD_TMP"
 
-pyinstaller "$SCRIPT_DIR/claude-trace-proxy.spec" \
+"$PYINSTALLER" "$SCRIPT_DIR/claude-trace-proxy.spec" \
     --distpath "$OUTPUT_DIR" \
     --workpath "$BUILD_TMP" \
     --noconfirm

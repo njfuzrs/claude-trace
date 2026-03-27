@@ -1,8 +1,8 @@
 #!/bin/bash
-# proxy-daemon.sh — 自动重启的代理守护进程（安装版）
+# proxy-daemon.sh — 自动重启的统一采集守护进程（安装版）
 #
 # 与开发版的区别：
-#   - 调用 PyInstaller 打包的二进制而非 python3 proxy.py
+#   - 调用 PyInstaller 打包的统一采集二进制而非 python3 脚本
 #   - 所有路径基于 INSTALL_DIR，不依赖 cwd
 
 INSTALL_DIR="$HOME/.claude-trace"
@@ -28,7 +28,7 @@ cleanup() {
 trap cleanup SIGTERM SIGINT
 
 while true; do
-    echo "$(date '+%H:%M:%S') [DAEMON] 启动代理..." >> "$LOG_FILE"
+    echo "$(date '+%H:%M:%S') [DAEMON] 启动统一采集器（Claude + Codex）..." >> "$LOG_FILE"
 
     if [ ! -x "$BINARY" ]; then
         echo "$(date '+%H:%M:%S') [DAEMON] 错误：找不到可执行文件 $BINARY" >> "$LOG_FILE"
@@ -55,6 +55,6 @@ while true; do
         exit 0
     fi
 
-    echo "$(date '+%H:%M:%S') [DAEMON] 代理退出 (code=$EXIT_CODE)，2 秒后重启..." >> "$LOG_FILE"
+    echo "$(date '+%H:%M:%S') [DAEMON] 统一采集器退出 (code=$EXIT_CODE)，2 秒后重启..." >> "$LOG_FILE"
     sleep 2
 done

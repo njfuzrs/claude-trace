@@ -20,13 +20,14 @@ import_codex.py — 导入 Codex CLI 会话到统一轨迹格式
 import argparse
 import json
 import logging
+import re
 import shutil
 import sqlite3
 import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from builder import save_trajectory
 
@@ -61,6 +62,18 @@ ACTION_ITEM_TYPES = {
     "imageView",
     "imageGeneration",
 }
+
+ROLLOUT_FILENAME_RE = re.compile(
+    r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(?P<thread_id>.+)\.jsonl$"
+)
+WATCH_STATE_VERSION = 1
+SESSION_ARTIFACTS = (
+    "session.traj",
+    "codex_thread.json",
+    "rollout.jsonl",
+    "state_logs.jsonl",
+    "feedback_logs.jsonl",
+)
 
 
 def _json_default(value):
@@ -533,6 +546,60 @@ def _write_jsonl(path: Path, rows: Iterable[Dict]):
     path.parent.mkdir(parents=True, exist_ok=True)
     content = "".join(json.dumps(row, ensure_ascii=False, default=_json_default) + "\n" for row in rows)
     path.write_text(content)
+
+
+def _write_watch_state(path: Path, state: Dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True))
+    tmp_path.replace(path)
+
+
+def _read_watch_state(path: Path) -> Dict:
+    if not path.exists():
+        return {"version": WATCH_STATE_VERSION, "files": {}}
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        logger.warning("watch 状态文件损坏，重新初始化: %s", path)
+        return {"version": WATCH_STATE_VERSION, "files": {}}
+    if not isinstance(data, dict):
+        return {"version": WATCH_STATE_VERSION, "files": {}}
+    if not isinstance(data.get("files"), dict):
+        data["files"] = {}
+    data["version"] = WATCH_STATE_VERSION
+    return data
+
+
+def _path_fingerprint(path: Path) -> Dict:
+    stat = path.stat()
+    return {
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def _fingerprint_changed(previous: Optional[Dict], current: Dict) -> bool:
+    if not previous:
+        return True
+    return (
+        previous.get("size") != current.get("size")
+        or previous.get("mtime_ns") != current.get("mtime_ns")
+    )
+
+
+def _parse_thread_id_from_rollout_path(rollout_path: Path) -> Optional[str]:
+    match = ROLLOUT_FILENAME_RE.match(rollout_path.name)
+    if not match:
+        return None
+    return match.group("thread_id")
+
+
+def _session_artifacts_missing(session_dir: Path) -> bool:
+    for filename in SESSION_ARTIFACTS:
+        if not (session_dir / filename).exists():
+            return True
+    return False
 
 
 def _load_sqlite_rows(db_path: Path, query: str, params: Tuple = ()) -> List[Dict]:
@@ -1008,7 +1075,11 @@ class CodexImporter:
                     logger.warning("导出失败 %s: %s", thread_id[:12], exc)
             logger.info("Codex 导出完成: %d 个线程", exported)
 
-    def export_thread(self, client: CodexAppServerClient, thread_id: str):
+    def export_thread_once(self, thread_id: str) -> Dict:
+        with CodexAppServerClient(codex_cmd=self.codex_cmd) as client:
+            return self.export_thread(client, thread_id)
+
+    def export_thread(self, client: CodexAppServerClient, thread_id: str) -> Dict:
         thread = client.read_thread(thread_id)
         if not thread:
             raise RuntimeError("thread/read 返回空数据")
@@ -1039,22 +1110,29 @@ class CodexImporter:
         save_trajectory(session_dir / "session.traj", traj)
         _write_json(session_dir / "codex_thread.json", thread)
 
+        rollout_output_path = session_dir / "rollout.jsonl"
         if rollout_path and rollout_path.exists():
             shutil.copy2(rollout_path, session_dir / "rollout.jsonl")
+        elif not rollout_output_path.exists():
+            rollout_output_path.write_text("")
 
+        state_db = self.codex_home / "state_5.sqlite"
         state_logs = _load_sqlite_rows(
-            self.codex_home / "state_5.sqlite",
+            state_db,
             "select * from logs where thread_id = ? order by ts, ts_nanos, id",
             (thread_id,),
         )
+        feedback_db = self.codex_home / "logs_1.sqlite"
         feedback_logs = _load_sqlite_rows(
-            self.codex_home / "logs_1.sqlite",
+            feedback_db,
             "select * from logs where thread_id = ? order by ts, ts_nanos, id",
             (thread_id,),
         )
-        if state_logs:
+        state_logs_path = session_dir / "state_logs.jsonl"
+        feedback_logs_path = session_dir / "feedback_logs.jsonl"
+        if state_logs or state_db.exists() or not state_logs_path.exists():
             _write_jsonl(session_dir / "state_logs.jsonl", state_logs)
-        if feedback_logs:
+        if feedback_logs or feedback_db.exists() or not feedback_logs_path.exists():
             _write_jsonl(session_dir / "feedback_logs.jsonl", feedback_logs)
 
         logger.info(
@@ -1064,6 +1142,202 @@ class CodexImporter:
             traj["metadata"]["total_steps"],
             thread.get("_capture_fallback"),
         )
+        return {
+            "thread_id": thread_id,
+            "session_dir": session_dir,
+            "rollout_path": rollout_path,
+            "thread_status": (thread.get("status") or {}).get("type", ""),
+            "capture_fallback": thread.get("_capture_fallback"),
+            "total_steps": traj["metadata"]["total_steps"],
+        }
+
+
+class CodexRolloutWatcher:
+    def __init__(
+        self,
+        importer: CodexImporter,
+        codex_home: Path,
+        state_file: Path,
+        poll_interval: float = 2.0,
+        debounce_sec: float = 2.0,
+        finalize_sec: float = 8.0,
+        retry_sec: float = 10.0,
+        on_export: Optional[Callable[[Dict], None]] = None,
+    ):
+        self.importer = importer
+        self.codex_home = codex_home
+        self.state_file = state_file
+        self.poll_interval = poll_interval
+        self.debounce_sec = debounce_sec
+        self.finalize_sec = finalize_sec
+        self.retry_sec = retry_sec
+        self.on_export = on_export
+        self.state = _read_watch_state(state_file)
+        self.pending: Dict[str, Dict] = {}
+        self._client: Optional[CodexAppServerClient] = None
+
+    def _get_client(self) -> CodexAppServerClient:
+        if self._client is None:
+            self._client = CodexAppServerClient(codex_cmd=self.importer.codex_cmd)
+            self._client.__enter__()
+        return self._client
+
+    def _close_client(self):
+        if self._client is None:
+            return
+        try:
+            self._client.__exit__(None, None, None)
+        finally:
+            self._client = None
+
+    def _persist_state(self):
+        _write_watch_state(self.state_file, self.state)
+
+    def _mark_dirty(self, thread_id: str, rollout_path: Path, fingerprint: Dict, reason: str):
+        now = time.time()
+        item = self.pending.get(thread_id, {})
+        if (
+            item.get("rollout_path") == str(rollout_path)
+            and item.get("fingerprint") == fingerprint
+        ):
+            return
+        item.update({
+            "thread_id": thread_id,
+            "rollout_path": str(rollout_path),
+            "fingerprint": fingerprint,
+            "due_at": now + self.debounce_sec,
+            "final_due_at": now + self.finalize_sec,
+            "reason": reason,
+            "final_pass_scheduled": False,
+        })
+        self.pending[thread_id] = item
+        logger.info("检测到 Codex 线程变更，已排队刷新: %s | reason=%s", thread_id[:12], reason)
+
+    def _scan_rollouts(self):
+        sessions_root = self.codex_home / "sessions"
+        current_paths = set()
+        for rollout_path in sorted(sessions_root.rglob("rollout-*.jsonl")):
+            if not rollout_path.is_file():
+                continue
+            rollout_key = str(rollout_path)
+            current_paths.add(rollout_key)
+            thread_id = _parse_thread_id_from_rollout_path(rollout_path)
+            if not thread_id:
+                logger.debug("跳过无法识别 thread_id 的 rollout 文件: %s", rollout_path)
+                continue
+
+            fingerprint = _path_fingerprint(rollout_path)
+            previous = self.state.get("files", {}).get(rollout_key)
+            session_dir = self.importer.output_dir / thread_id
+
+            reason = ""
+            if _fingerprint_changed(previous, fingerprint):
+                reason = "new_or_appended_rollout"
+            elif _session_artifacts_missing(session_dir):
+                reason = "missing_export_artifacts"
+
+            if reason:
+                self._mark_dirty(thread_id, rollout_path, fingerprint, reason)
+
+        stale_paths = [
+            rollout_key
+            for rollout_key in self.state.get("files", {})
+            if rollout_key not in current_paths
+        ]
+        for rollout_key in stale_paths:
+            self.state["files"].pop(rollout_key, None)
+        if stale_paths:
+            self._persist_state()
+
+    def _export_thread(self, thread_id: str, force: bool = False):
+        item = self.pending.get(thread_id)
+        if not item:
+            return
+
+        rollout_key = item.get("rollout_path", "")
+        fingerprint = item.get("fingerprint", {})
+        try:
+            result = self.importer.export_thread(self._get_client(), thread_id)
+            if rollout_key:
+                self.state.setdefault("files", {})[rollout_key] = {
+                    "thread_id": thread_id,
+                    "size": fingerprint.get("size", 0),
+                    "mtime_ns": fingerprint.get("mtime_ns", 0),
+                    "exported_at": datetime.now(timezone.utc).isoformat(),
+                }
+                self._persist_state()
+
+            now = time.time()
+            if (
+                not force
+                and self.finalize_sec > 0
+                and not item.get("final_pass_scheduled")
+                and now < item.get("final_due_at", 0)
+            ):
+                item["due_at"] = item["final_due_at"]
+                item["final_pass_scheduled"] = True
+                self.pending[thread_id] = item
+                logger.info("线程已初次刷新，等待安静期后二次确认: %s", thread_id[:12])
+            else:
+                self.pending.pop(thread_id, None)
+                if self.on_export:
+                    try:
+                        self.on_export(result)
+                    except Exception as callback_exc:
+                        logger.warning("导出后回调失败: %s | %s", thread_id[:12], callback_exc)
+                logger.info(
+                    "线程刷新完成: %s | status=%s | steps=%s",
+                    thread_id[:12],
+                    result.get("thread_status", ""),
+                    result.get("total_steps", 0),
+                )
+        except Exception as exc:
+            self._close_client()
+            if force:
+                raise
+            item["due_at"] = time.time() + self.retry_sec
+            item["last_error"] = str(exc)
+            self.pending[thread_id] = item
+            logger.warning("刷新线程失败，稍后重试: %s | %s", thread_id[:12], exc)
+
+    def _drain_pending(self, force: bool = False):
+        now = time.time()
+        ready = [
+            thread_id
+            for thread_id, item in self.pending.items()
+            if force or item.get("due_at", 0) <= now
+        ]
+        for thread_id in sorted(ready):
+            self._export_thread(thread_id, force=force)
+
+    def run_once(self):
+        self._scan_rollouts()
+        self._drain_pending(force=True)
+        self._close_client()
+
+    def watch_forever(self, stop_event=None):
+        logger.info(
+            "Codex watcher 已启动: %s | poll=%.1fs debounce=%.1fs finalize=%.1fs",
+            self.codex_home / "sessions",
+            self.poll_interval,
+            self.debounce_sec,
+            self.finalize_sec,
+        )
+        try:
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    logger.info("收到停止信号，准备结束 Codex watcher")
+                    break
+                self._scan_rollouts()
+                self._drain_pending(force=False)
+                if stop_event is not None:
+                    stop_event.wait(self.poll_interval)
+                else:
+                    time.sleep(self.poll_interval)
+        except KeyboardInterrupt:
+            logger.info("收到中断信号，停止 Codex watcher")
+        finally:
+            self._close_client()
 
 
 def main():
@@ -1073,20 +1347,47 @@ def main():
     )
     parser.add_argument("--thread-id", action="append", help="指定 thread_id（可重复）")
     parser.add_argument("--all", action="store_true", help="导出所有可见线程")
+    parser.add_argument("--watch", action="store_true", help="监听 ~/.codex/sessions 下 rollout 文件变化并持续刷新")
+    parser.add_argument("--once", action="store_true", help="执行一次增量扫描后退出（适合测试或 cron）")
     parser.add_argument("--codex-home", default=str(Path.home() / ".codex"), help="Codex 数据目录")
     parser.add_argument("--output", default="./trajectories/sessions", help="输出目录")
     parser.add_argument("--codex-cmd", default="codex", help="Codex CLI 命令")
     parser.add_argument("--limit", type=int, default=200, help="thread/list 分页大小")
+    parser.add_argument("--state-file", default="", help="watch 模式状态文件路径")
+    parser.add_argument("--poll-interval", type=float, default=2.0, help="watch 扫描间隔（秒）")
+    parser.add_argument("--debounce-sec", type=float, default=2.0, help="rollout 变更后的等待时间（秒）")
+    parser.add_argument("--finalize-sec", type=float, default=8.0, help="安静期后二次确认导出时间（秒）")
+    parser.add_argument("--retry-sec", type=float, default=10.0, help="导出失败后的重试间隔（秒）")
     args = parser.parse_args()
 
-    if not args.all and not args.thread_id:
-        parser.error("必须指定 --all 或至少一个 --thread-id")
+    codex_home = Path(args.codex_home).expanduser()
+    output_dir = Path(args.output).expanduser()
+
+    if not args.watch and not args.once and not args.all and not args.thread_id:
+        parser.error("必须指定 --watch / --once / --all / --thread-id 中的至少一种模式")
 
     importer = CodexImporter(
-        codex_home=Path(args.codex_home).expanduser(),
-        output_dir=Path(args.output),
+        codex_home=codex_home,
+        output_dir=output_dir,
         codex_cmd=args.codex_cmd,
     )
+    if args.watch or args.once:
+        state_file = Path(args.state_file).expanduser() if args.state_file else output_dir / ".codex_watch_state.json"
+        watcher = CodexRolloutWatcher(
+            importer=importer,
+            codex_home=codex_home,
+            state_file=state_file,
+            poll_interval=args.poll_interval,
+            debounce_sec=args.debounce_sec,
+            finalize_sec=args.finalize_sec,
+            retry_sec=args.retry_sec,
+        )
+        if args.once:
+            watcher.run_once()
+        else:
+            watcher.watch_forever()
+        return
+
     importer.export_threads(thread_ids=args.thread_id, limit=args.limit)
 
 

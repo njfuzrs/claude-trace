@@ -4,6 +4,10 @@
 # 用法：
 #   cd build && pyinstaller claude-trace-proxy.spec
 #   或通过 build.sh 自动调用
+#
+# 说明：
+#   构建出的二进制仍保持 claude-trace-proxy 名称以兼容现有安装脚本，
+#   但入口已升级为统一 launcher，默认同时采集 Claude Code 和 Codex。
 
 import os
 import sys
@@ -12,9 +16,9 @@ import sys
 ROOT = os.path.abspath(os.path.join(os.path.dirname(SPEC), '..'))
 
 a = Analysis(
-    [os.path.join(ROOT, 'proxy.py')],
+    [os.path.join(ROOT, 'trace_agent.py')],
     pathex=[ROOT],
-    hiddenimports=['builder', 'uploader'],
+    hiddenimports=['builder', 'uploader', 'proxy', 'import_codex'],
     binaries=[],
     datas=[],
     hookspath=[],
