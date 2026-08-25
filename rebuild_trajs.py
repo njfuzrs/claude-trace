@@ -70,10 +70,39 @@ def load_hook_events(events_path: Path) -> List[Dict]:
     return events
 
 
+def _traj_has_steps(session_dir: Path) -> Optional[bool]:
+    """会话的 session.traj 是否含有 TAO 步骤
+
+    返回 None 表示无法判定（文件缺失或解析失败）。
+    大文件不做完整解析，只在头尾各读一段找 trajectory 的首个元素。
+    """
+    traj_path = session_dir / "session.traj"
+    if not traj_path.exists():
+        return None
+    size = traj_path.stat().st_size
+    try:
+        if size <= 400 * 1024:
+            data = json.loads(traj_path.read_text(errors="replace"))
+            if not isinstance(data, dict):
+                return None
+            return bool(data.get("trajectory"))
+        # 大文件：trajectory 是首个 key，读头部足够判断它是否为空数组
+        with traj_path.open(errors="replace") as f:
+            head = f.read(4096)
+        if '"trajectory"' not in head:
+            return None
+        tail = head.split('"trajectory"', 1)[1].lstrip()
+        if tail.startswith(":"):
+            tail = tail[1:].lstrip()
+        return not tail.startswith("[]")
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
 def classify_session(session_dir: Path) -> Tuple[str, str]:
     """判定会话类型，返回 (kind, reason)
 
-    kind ∈ {"garbage", "no_raw", "empty", "ok"}
+    kind ∈ {"garbage", "no_raw", "ok"}
     """
     raw_path = session_dir / "raw.jsonl"
     if not raw_path.exists() or raw_path.stat().st_size == 0:
@@ -85,8 +114,26 @@ def classify_session(session_dir: Path) -> Tuple[str, str]:
     except OSError as e:
         return "no_raw", f"raw.jsonl 读取失败: {e}"
 
-    # count_tokens 垃圾：首条记录就是 count_tokens 探测且上游报错
+    # count_tokens 垃圾：首条记录是 count_tokens 探测
     if any(m in first_line for m in _GARBAGE_MARKERS):
+        # 关键：首个请求恰好是 count_tokens 探测、但后续有真实请求的会话
+        # 是有效数据，不能只看首行就判垃圾。实测按首行判定会误隔离
+        # 80/1794（4.5%）个含完整轨迹的会话。有 TAO 步骤就一律放行。
+        if _traj_has_steps(session_dir):
+            return "ok", ""
+        # 轨迹为空时，再看后续记录里是否存在「非 count_tokens」的真实请求。
+        # 单纯多行 count_tokens 错误（探测被重试几次）仍是垃圾。
+        try:
+            with raw_path.open(errors="replace") as f:
+                for i, line in enumerate(f):
+                    if i == 0 or not line.strip():
+                        continue
+                    if i > 50:          # 只看前 50 行，够判定且不拖慢扫描
+                        break
+                    if not any(m in line for m in _GARBAGE_MARKERS):
+                        return "ok", ""
+        except OSError:
+            pass
         try:
             rec = json.loads(first_line)
         except json.JSONDecodeError:
