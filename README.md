@@ -459,6 +459,24 @@ trajectories/
 .traj → 过滤 → 格式转换 → 合并 → training_data.jsonl
 ```
 
+### 第零步（可选）：重建历史轨迹
+
+早期版本的构建逻辑存在几个缺陷（tool_result 查找窗口过小导致 orphan、
+`files_edited` 恒空、history 中 tool_result 重复、新模型成本算成 0），
+且 `count_tokens` 探测请求曾被误当成真实会话采集。原始数据是完整的，
+重跑构建即可修复：
+
+```bash
+# 先看会做什么（不写文件）
+python3 rebuild_trajs.py --dir trajectories/sessions --dry-run
+
+# 重建（原文件备份为 session.traj.bak）+ 隔离垃圾目录到 _trash/
+python3 rebuild_trajs.py --dir trajectories/sessions --quarantine-garbage
+```
+
+含 sub-agent 子会话的会话会被自动跳过：子会话的 pair 只在导出时合并进
+`session.traj`，从未单独落盘到 `raw.jsonl`，重建会丢数据。新采集的会话不受影响。
+
 ### 第一步：过滤
 
 ```bash
@@ -546,6 +564,7 @@ python3 merger.py --all \
 | `collector.py` | Hooks 采集脚本，部署到 `~/.claude/hooks/` |
 | `setup_hooks.py` | 自动配置 settings.json 的 hooks |
 | `merger.py` | 双通道数据合并器 |
+| `rebuild_trajs.py` | 用当前 builder 重建历史 .traj，并识别/隔离垃圾会话目录 |
 | `filter_trajs.py` | 轨迹过滤器 |
 | `convert_trajs.py` | 格式转换（.traj → SFT .jsonl） |
 | `combine_trajs.py` | 合并 + shuffle SFT 数据 |

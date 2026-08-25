@@ -19,7 +19,13 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
-from builder import SessionMetadata, build_trajectory, save_trajectory  # noqa: E402
+from builder import (  # noqa: E402
+    SessionMetadata,
+    apply_hook_events_to_metadata,
+    build_trajectory,
+    hook_event_name,
+    save_trajectory,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,10 +50,16 @@ class RawPair:
     is_partial: bool
     model: str
     new_messages: List[Dict] = None  # type: ignore[assignment]
+    # proxy 无法定位增量边界时的重放标记，builder 依此去重 history
+    is_full_replay: bool = False
+    # proxy 落盘时补齐的、增量边界外的 tool_result 块
+    recovered_tool_results: List[Dict] = None  # type: ignore[assignment]
 
     def __post_init__(self):
         if self.new_messages is None:
             self.new_messages = []
+        if self.recovered_tool_results is None:
+            self.recovered_tool_results = []
 
 
 def load_raw_pairs_from_dir(session_dir: Path) -> List[RawPair]:
@@ -78,6 +90,8 @@ def load_raw_pairs_from_dir(session_dir: Path) -> List[RawPair]:
             is_partial=resp_data.get("is_partial", False),
             model=req_data.get("model", ""),
             new_messages=req_data.get("new_messages", []),
+            is_full_replay=req_data.get("is_full_replay", False),
+            recovered_tool_results=req_data.get("_recovered_tool_results", []),
         ))
     return pairs
 
@@ -96,6 +110,7 @@ def load_raw_pairs_from_jsonl(jsonl_path: Path) -> List[RawPair]:
         request_data = record.get("request", {})
         # compact JSONL 中非首条记录的 new_messages 存在 request_data 内部
         new_messages = request_data.pop("new_messages", []) if "new_messages" in request_data else []
+        recovered = request_data.pop("_recovered_tool_results", []) or []
         pairs.append(RawPair(
             timestamp=record.get("timestamp", ""),
             request_body=request_data,
@@ -105,6 +120,8 @@ def load_raw_pairs_from_jsonl(jsonl_path: Path) -> List[RawPair]:
             is_partial=record.get("is_partial", False),
             model=record.get("model", ""),
             new_messages=new_messages,
+            is_full_replay=record.get("is_full_replay", False),
+            recovered_tool_results=recovered,
         ))
     return pairs
 
@@ -185,12 +202,13 @@ class DataMerger:
         hook_events = load_hook_events(self.events_dir, session_id)
 
         # 3. 从 Hook 事件提取元数据
-        session_start = next((e for e in hook_events if e.get("event") == "SessionStart"), {})
-        session_end = next((e for e in hook_events if e.get("event") == "SessionEnd"), {})
-        compactions = [e for e in hook_events if e.get("event") == "PostCompact"]
-        subagents = [e for e in hook_events if e.get("event") in ("SubagentStart", "SubagentStop")]
-        user_prompts = [e["prompt"] for e in hook_events if e.get("event") == "UserPromptSubmit" and "prompt" in e]
-        post_tool_uses = [e for e in hook_events if e.get("event") == "PostToolUse"]
+        # Fix: 事件名读取统一走 hook_event_name()（兼容 event / hook_event_name），
+        # 提取逻辑统一走 apply_hook_events_to_metadata()，避免 proxy / merger
+        # 两份实现漂移，并补上 PreCompact 等新事件。
+        session_start = next(
+            (e for e in hook_events if hook_event_name(e) == "SessionStart"), {}
+        )
+        post_tool_uses = [e for e in hook_events if hook_event_name(e) == "PostToolUse"]
 
         # 4. 构建 SessionMetadata
         model = session_start.get("model") or (raw_pairs[0].model if raw_pairs else "")
@@ -198,14 +216,8 @@ class DataMerger:
             session_id=session_id,
             start_time=raw_pairs[0].timestamp if raw_pairs else "",
             model=model,
-            working_directory=session_start.get("cwd", ""),
-            start_source=session_start.get("source", ""),
-            end_source=session_end.get("source", ""),
-            user_prompts=user_prompts,
-            compactions=compactions,
-            subagent_spans=subagents,
-            has_sub_agent=len(subagents) > 0,
         )
+        apply_hook_events_to_metadata(metadata, hook_events)
 
         # 5. 将 RawPair 适配为 builder 期望的格式
         adapted_pairs = [_adapt_raw_pair(p, i + 1) for i, p in enumerate(raw_pairs)]
@@ -345,10 +357,14 @@ class _AdaptedPair:
     model: str
     index: int = 0
     new_messages: List[Dict] = None  # type: ignore[assignment]
+    is_full_replay: bool = False
+    recovered_tool_results: List[Dict] = None  # type: ignore[assignment]
 
     def __post_init__(self):
         if self.new_messages is None:
             self.new_messages = []
+        if self.recovered_tool_results is None:
+            self.recovered_tool_results = []
 
 
 def _adapt_raw_pair(raw: RawPair, index: int) -> _AdaptedPair:
@@ -362,6 +378,8 @@ def _adapt_raw_pair(raw: RawPair, index: int) -> _AdaptedPair:
         model=raw.model,
         index=index,
         new_messages=raw.new_messages,
+        is_full_replay=raw.is_full_replay,
+        recovered_tool_results=raw.recovered_tool_results,
     )
 
 

@@ -95,6 +95,23 @@ def compress_and_hash(filepath: Path) -> tuple:
     return gz_path, sha256.hexdigest()
 
 
+def is_empty_trajectory(session_dir: Path) -> bool:
+    """判断会话是否为空轨迹（没有任何 TAO 步骤）
+
+    读不出 traj 时返回 False（保守放行，宁可多传也不丢数据）。
+    """
+    traj_path = session_dir / "session.traj"
+    if not traj_path.exists():
+        return False
+    try:
+        data = json.loads(traj_path.read_text())
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    return not (data.get("trajectory") or [])
+
+
 def infer_tool_source(session_dir: Path) -> str:
     """根据会话目录内容推断工具来源。
 
@@ -265,6 +282,14 @@ class UploadManager:
         每个文件独立处理：压缩 → 上传（带重试）→ 失败则入队。
         全部成功后写 .uploaded 标记，可选清理本地文件。
         """
+        # 空轨迹闸门：没有任何 TAO 步骤的会话没有训练价值，不上传。
+        # 主要防的是 count_tokens 之类的探测请求 —— proxy 的 _is_messages_request
+        # 已在采集侧拦掉，这里作为第二道防线，避免未来新增的探测端点再次污染
+        # 存储（历史上这类垃圾占了拉取数据的 21%）。
+        if is_empty_trajectory(session_dir):
+            logger.info("空轨迹会话，跳过上传: %s", session_id[:8])
+            return
+
         results = {}  # file_type → {"sha256": ..., "gz_size": ...}
         all_confirmed = True
         resolved_tool_source = tool_source or infer_tool_source(session_dir)

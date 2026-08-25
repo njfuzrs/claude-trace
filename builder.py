@@ -5,11 +5,13 @@ builder.py — 轨迹构建器
 从 DataCollector 采集的请求/响应对中构建 SWE-agent 兼容的 .traj 格式。
 
 Anthropic API → TAO 映射：
-  content[type=thinking]  → Thought
-  content[type=text]      → Thought（补充）
-  content[type=tool_use]  → Action
-  tool_result（下一请求）  → Observation
-  stop_reason=end_turn    → final_answer
+  content[type=thinking]           → Thought
+  content[type=text]               → Thought（补充）
+  content[type=tool_use]           → Action
+  content[type=server_tool_use]    → Action（服务端工具，如 web_search）
+  tool_result（下一请求）           → Observation
+  *_tool_result（同一响应内）       → Observation（服务端工具结果）
+  stop_reason=end_turn             → final_answer
 """
 
 import hashlib
@@ -18,7 +20,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 logger = logging.getLogger("builder")
 
@@ -37,9 +39,10 @@ class SessionMetadata:
     total_tokens_sent: int = 0
     total_tokens_received: int = 0
     total_cost_usd: float = 0.0     # P2 fix: 估算成本（基于模型定价）
-    exit_status: str = ""           # end_turn / tool_use_loop / user_interrupt / error
+    exit_status: str = ""           # end_turn / tool_use / interrupted / user_interrupt / unknown
     tools_used: List[str] = field(default_factory=list)
     files_edited: List[str] = field(default_factory=list)
+    files_read: List[str] = field(default_factory=list)
     step_count: int = 0
     has_thinking: bool = False
     has_sub_agent: bool = False
@@ -53,13 +56,77 @@ class SessionMetadata:
     subagent_spans: List[Dict] = field(default_factory=list)
 
 
-# 模型定价（USD per million tokens），用于估算成本
+# ─────────────────────────────────────────────
+# 模型定价
+# ─────────────────────────────────────────────
+
+# 模型定价（USD per million tokens）
 # 来源：https://docs.anthropic.com/en/docs/about-claude/pricing
+#
+# Fix: 原实现只有 claude-opus-4 / sonnet-4 / haiku-4 三条前缀，
+# 导致 claude-opus-5 / claude-sonnet-5 / claude-opus-4-8 等新模型
+# 全部匹配不到，total_cost_usd 恒为 0。
+# 现在按「精确名 → 最长前缀」两级匹配，并覆盖 4.x / 5 全系列。
 _MODEL_PRICING: Dict[str, Dict[str, float]] = {
+    # Opus 系列
+    "claude-opus-5": {"input": 15.0, "output": 75.0},
     "claude-opus-4": {"input": 15.0, "output": 75.0},
+    "claude-opus-3": {"input": 15.0, "output": 75.0},
+    # Sonnet 系列
+    "claude-sonnet-5": {"input": 3.0, "output": 15.0},
     "claude-sonnet-4": {"input": 3.0, "output": 15.0},
+    "claude-3-7-sonnet": {"input": 3.0, "output": 15.0},
+    "claude-3-5-sonnet": {"input": 3.0, "output": 15.0},
+    # Haiku 系列
     "claude-haiku-4": {"input": 0.80, "output": 4.0},
+    "claude-3-5-haiku": {"input": 0.80, "output": 4.0},
+    # Fable
+    "claude-fable-5": {"input": 3.0, "output": 15.0},
 }
+
+# 长上下文（1M）变体的价格倍率。Anthropic 对超长上下文按溢价计费，
+# 这里用保守倍率估算，避免 [1m] 模型成本被低估。
+_LONG_CONTEXT_MULTIPLIER = 2.0
+
+
+def _normalize_model_name(model: str) -> tuple:
+    """归一化模型名，返回 (基础名, 是否长上下文变体)
+
+    'claude-opus-4-8[1m]'          → ('claude-opus-4-8', True)
+    'claude-haiku-4-5-20251001'    → ('claude-haiku-4-5', False)
+    """
+    if not model:
+        return "", False
+    name = model.strip()
+    is_long = False
+    if name.endswith("[1m]"):
+        name = name[: -len("[1m]")]
+        is_long = True
+    # 去掉日期后缀（-20251001）
+    parts = name.rsplit("-", 1)
+    if len(parts) == 2 and len(parts[1]) == 8 and parts[1].isdigit():
+        name = parts[0]
+    return name, is_long
+
+
+def _lookup_pricing(model: str) -> Optional[Dict[str, float]]:
+    """按「精确名 → 最长前缀」匹配定价表，未知模型返回 None"""
+    name, is_long = _normalize_model_name(model)
+    if not name:
+        return None
+
+    pricing = _MODEL_PRICING.get(name)
+    if pricing is None:
+        # 最长前缀匹配，避免 'claude-sonnet-4-6' 被 'claude-opus-4' 之类误匹配
+        best_len = 0
+        for prefix, p in _MODEL_PRICING.items():
+            if name.startswith(prefix) and len(prefix) > best_len:
+                pricing, best_len = p, len(prefix)
+    if pricing is None:
+        return None
+    if is_long:
+        return {k: v * _LONG_CONTEXT_MULTIPLIER for k, v in pricing.items()}
+    return pricing
 
 
 def _estimate_cost(
@@ -68,18 +135,13 @@ def _estimate_cost(
 ) -> float:
     """根据模型和 token 用量估算成本（USD）
 
-    Fix 6: 加入 cache token 定价。
     Anthropic cache_read 是 input 价格的 10%，cache_creation 是 input 价格的 25%。
+    非 Anthropic 模型（deepseek / qwen 等）无定价表，返回 0。
     """
-    if not model:
-        return 0.0
-    # 模糊匹配模型名（claude-sonnet-4-20250514 → claude-sonnet-4）
-    pricing = None
-    for prefix, p in _MODEL_PRICING.items():
-        if model.startswith(prefix):
-            pricing = p
-            break
+    pricing = _lookup_pricing(model)
     if not pricing:
+        if model:
+            logger.debug("模型无定价数据，成本按 0 计: %s", model)
         return 0.0
     base_cost = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
     cache_read_cost = cache_read_tokens * pricing["input"] * 0.1 / 1_000_000
@@ -87,48 +149,262 @@ def _estimate_cost(
     return base_cost + cache_read_cost + cache_creation_cost
 
 
-def _extract_claude_md_hash(request_body: Dict) -> str:
-    """从首次请求的 system prompt 中提取 CLAUDE.md 内容 hash"""
+# ─────────────────────────────────────────────
+# 工具名归类
+# ─────────────────────────────────────────────
+
+# Fix: 原实现写成 ("write", "edit", "read") 小写，而 Claude Code 实际
+# 工具名是 Write / Edit / Read（首字母大写），导致 files_edited 恒为空。
+# 现在统一小写比较，并补全各类编辑/读取工具的别名。
+_EDIT_TOOLS: Set[str] = {
+    "write", "edit", "multiedit", "notebookedit", "notebook_edit",
+    "str_replace", "str_replace_editor", "str_replace_based_edit_tool",
+    "create", "applypatch", "apply_patch", "update_file", "write_file",
+}
+_READ_TOOLS: Set[str] = {
+    "read", "view", "readfile", "read_file", "notebookread", "notebook_read",
+}
+
+# tool_input 中可能承载文件路径的字段名
+_PATH_KEYS = ("file_path", "path", "notebook_path", "filePath", "filename", "file")
+
+
+def _extract_file_path(tool_input) -> str:
+    """从 tool_input 中提取文件路径（容忍非 dict 输入）"""
+    if not isinstance(tool_input, dict):
+        return ""
+    for key in _PATH_KEYS:
+        v = tool_input.get(key)
+        if isinstance(v, str) and v:
+            return v
+    return ""
+
+
+# ─────────────────────────────────────────────
+# 内容提取辅助
+# ─────────────────────────────────────────────
+
+def _extract_system_text(request_body: Dict) -> str:
+    """从 request_body 提取 system prompt 文本（支持字符串和 content block 列表）"""
     system = request_body.get("system")
     if not system:
         return ""
     if isinstance(system, list):
-        text = "\n".join(b.get("text", "") for b in system if isinstance(b, dict))
-    else:
-        text = str(system)
-    if not text:
+        return "\n".join(
+            b.get("text", "") for b in system
+            if isinstance(b, dict) and b.get("text")
+        )
+    return str(system)
+
+
+def _extract_claude_md_hash(system_text: str) -> str:
+    """从 system prompt 文本计算 hash（用于关联项目）"""
+    if not system_text:
         return ""
-    return hashlib.md5(text.encode()).hexdigest()
+    return hashlib.md5(system_text.encode()).hexdigest()
+
+
+def _stringify_result_content(content) -> str:
+    """将 tool_result / *_tool_result 的 content 序列化为文本
+
+    Fix: 原实现对所有 block 都取 b.get("text", "")，导致 image / 结构化
+    结果（web_search_result 等）被静默丢成空字符串。
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if not isinstance(b, dict):
+                parts.append(str(b))
+                continue
+            btype = b.get("type")
+            if btype == "text":
+                parts.append(b.get("text", ""))
+            elif btype == "image":
+                src = b.get("source", {}) or {}
+                parts.append(f"[image: {src.get('media_type', 'unknown')}]")
+            else:
+                parts.append(json.dumps(b, ensure_ascii=False))
+        return "\n".join(p for p in parts if p)
+    return json.dumps(content, ensure_ascii=False)
+
+
+def _msg_fingerprint(msg: Dict) -> str:
+    """消息内容指纹，用于识别 compaction 导致的历史重放"""
+    try:
+        payload = json.dumps(msg, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        payload = repr(msg)
+    return hashlib.md5(payload.encode()).hexdigest()
+
+
+def _strip_tool_results(msg: Dict) -> Optional[Dict]:
+    """剔除 user message 中的 tool_result 块
+
+    tool_result 由 observation 通道按 tool_use_id 单独记录，
+    如果同时保留在 user message 里会造成 history 中每个 tool_result 出现两次。
+    剔除后内容为空则返回 None（整条消息不记录）。
+    """
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return msg
+    kept = [
+        b for b in content
+        if not (isinstance(b, dict) and b.get("type") == "tool_result")
+    ]
+    if not kept:
+        return None
+    if len(kept) == len(content):
+        return msg
+    return {**msg, "content": kept}
 
 
 # ─────────────────────────────────────────────
-# tool_result 查找
+# Hook 事件 → metadata
 # ─────────────────────────────────────────────
 
-def find_tool_result(pairs: List, tool_use_id: str, max_lookahead: int = 3) -> Optional[Dict]:
+def hook_event_name(event: Dict) -> str:
+    """读取 hook 事件名
+
+    collector.py 写出的字段是 "event"，但 Claude Code 原始 payload 里叫
+    "hook_event_name"。历史数据两种都存在过，这里统一兼容。
+    """
+    return event.get("event") or event.get("hook_event_name") or ""
+
+
+def apply_hook_events_to_metadata(metadata: SessionMetadata, hook_events: List[Dict]) -> None:
+    """从 hook events 提取语义信息，就地丰富 metadata
+
+    Fix: proxy 和 merger 各有一份几乎相同的提取逻辑，且都只认旧事件名
+    （PostCompact / SubagentStart / SubagentStop），漏掉了新版 Claude Code 的
+    PreCompact、以及 SessionStart 带来的 cwd/model 补全。现在统一到这里。
+    """
+    if not hook_events:
+        return
+
+    by_name: Dict[str, List[Dict]] = {}
+    for e in hook_events:
+        by_name.setdefault(hook_event_name(e), []).append(e)
+
+    prompts = [
+        e["prompt"] for e in by_name.get("UserPromptSubmit", [])
+        if e.get("prompt")
+    ]
+    if prompts:
+        metadata.user_prompts = prompts
+
+    # PreCompact 与 PostCompact 都算一次压缩事件
+    compactions = by_name.get("PreCompact", []) + by_name.get("PostCompact", [])
+    if compactions:
+        metadata.compactions = compactions
+
+    spans = by_name.get("SubagentStart", []) + by_name.get("SubagentStop", [])
+    if spans:
+        metadata.subagent_spans = spans
+        metadata.has_sub_agent = True
+
+    session_start = (by_name.get("SessionStart") or [{}])[0]
+    session_end = (by_name.get("SessionEnd") or [{}])[0]
+    if not metadata.start_source:
+        metadata.start_source = session_start.get("source", "") or ""
+    if not metadata.end_source:
+        metadata.end_source = session_end.get("source", "") or ""
+    # cwd / model 兜底补全：SessionStart 未必先于首个 API 请求到达
+    if not metadata.working_directory:
+        for e in hook_events:
+            if e.get("cwd"):
+                metadata.working_directory = e["cwd"]
+                break
+    if not metadata.model and session_start.get("model"):
+        metadata.model = session_start["model"]
+
+
+# ─────────────────────────────────────────────
+# tool_result 索引
+# ─────────────────────────────────────────────
+
+def build_tool_result_index(pairs: List) -> Dict[str, Dict]:
+    """预建 tool_use_id → tool_result 的全局索引
+
+    Fix: 原实现 find_tool_result 用 max_lookahead=3 的滑动窗口向后查找。
+    sub-agent 请求插入主会话序列、或长耗时工具（Bash / Agent）把 tool_result
+    推到 3 个 pair 之外时就找不到，实测 orphan 率均值 30%、最坏 100%——
+    数据其实都采到了，只是构建阶段没匹配上。
+    改为一次性全量扫描建索引：O(n) 且无遗漏。
+
+    同时扫描两处来源：
+      - request_body["messages"]：代理实时路径 / raw.jsonl 首条基线记录
+      - pair.new_messages：raw.jsonl 增量记录（无完整 messages 字段）
+    """
+    index: Dict[str, Dict] = {}
+
+    def scan(messages) -> None:
+        if not messages:
+            return
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tid = block.get("tool_use_id")
+                if tid and tid not in index:
+                    index[tid] = block
+
+    def scan_blocks(blocks) -> None:
+        """直接扫描 tool_result 块列表（_recovered_tool_results 兜底通道）"""
+        for block in blocks or []:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tid = block.get("tool_use_id")
+            if tid and tid not in index:
+                index[tid] = block
+
+    for pair in pairs:
+        scan((pair.request_body or {}).get("messages"))
+        scan(getattr(pair, "new_messages", None))
+        # 代理落盘时补齐的、增量边界外的 tool_result
+        scan_blocks(getattr(pair, "recovered_tool_results", None))
+
+    return index
+
+
+def build_server_result_index(pairs: List) -> Dict[str, Dict]:
+    """预建服务端工具结果索引（web_search_tool_result 等）
+
+    服务端工具（server_tool_use）的结果在同一次响应的 content 数组里就返回了，
+    不会出现在下一个请求的 messages 中，因此需要单独扫描 response content。
+    """
+    index: Dict[str, Dict] = {}
+    for pair in pairs:
+        response = pair.response_body or {}
+        for block in response.get("content", []) or []:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type") or ""
+            if btype.endswith("_tool_result") and btype != "tool_result":
+                tid = block.get("tool_use_id")
+                if tid and tid not in index:
+                    index[tid] = block
+    return index
+
+
+def find_tool_result(pairs: List, tool_use_id: str, max_lookahead: Optional[int] = None) -> Optional[Dict]:
     """在后续请求的 messages 中查找对应的 tool_result
 
-    Claude Code 每次请求都带完整对话历史，tool_result 出现在
-    tool_use 之后的某个请求的 messages 里。
-    P1 #8: 限制搜索范围为后续 max_lookahead 个 pairs，避免 O(n*m) 性能问题。
-    找不到时记录 warning，便于排查 sub-agent 插入导致的遗漏。
+    保留此函数供外部调用者向后兼容。max_lookahead 参数已废弃并忽略——
+    限制查找窗口是 orphan 率过高的根因，现在总是全量查找。
+    内部构建流程请直接用 build_tool_result_index 避免重复扫描。
     """
-    for pair in pairs[:max_lookahead]:
-        messages = pair.request_body.get("messages", [])
-        for msg in messages:
-            if msg.get("role") != "user":
-                continue
-            content = msg.get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if (
-                        isinstance(block, dict)
-                        and block.get("type") == "tool_result"
-                        and block.get("tool_use_id") == tool_use_id
-                    ):
-                        return block
-    logger.debug("tool_result 未找到: tool_use_id=%s (lookahead=%d)", tool_use_id[:12], max_lookahead)
-    return None
+    if max_lookahead is not None:
+        logger.debug("find_tool_result: max_lookahead 参数已废弃，改为全量查找")
+    return build_tool_result_index(pairs).get(tool_use_id)
 
 
 # ─────────────────────────────────────────────
@@ -141,121 +417,176 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
     输出结构：
       trajectory  — TAO 步骤列表（action/observation 对）
       history     — 完整 LLM 对话历史（用于 SFT 训练）
-      info        — 会话统计信息
+      info        — 会话统计信息 + 数据质量指标
       metadata    — 扩展元数据（双通道数据）
     """
-    trajectory = []
-    history = []
+    trajectory: List[Dict] = []
+    history: List[Dict] = []
     total_input_tokens = 0
     total_output_tokens = 0
     total_cache_read_tokens = 0
     total_cache_creation_tokens = 0
-    tools_used = set()
-    files_edited = set()
+    tools_used: Set[str] = set()
+    files_edited: Set[str] = set()
+    files_read: Set[str] = set()
     has_thinking = False
 
-    for pair_idx, pair in enumerate(pairs):
-        response = pair.response_body
+    # 数据质量计数
+    n_tool_actions = 0
+    n_orphan = 0
+    n_partial_pairs = 0
+    n_dup_user_dropped = 0
+    n_dup_result_dropped = 0
+    n_error_responses = 0
+
+    # 全局索引：一次扫描，避免 O(n*m) 且不遗漏
+    tool_result_index = build_tool_result_index(pairs)
+    server_result_index = build_server_result_index(pairs)
+
+    # system prompt 与 messages 基线
+    system_text = ""
+    baseline_recorded = False
+    seen_user_fps: Set[str] = set()
+    seen_result_ids: Set[str] = set()
+    last_timestamp = ""
+
+    for pair in pairs:
+        response = pair.response_body or {}
+
+        # Fix: system prompt 原来只在 pair_idx == 0 时提取，而 raw.jsonl 的首条
+        # 记录经常不是 index=1（partial 或代理重启导致首个 pair 未落盘），
+        # 实测 40% 的会话 history 里没有 system。现在从任意第一个带 system 的
+        # pair 提取，并在最后插到 history 头部。
+        if not system_text:
+            system_text = _extract_system_text(pair.request_body or {})
+
+        if pair.timestamp:
+            last_timestamp = pair.timestamp
+        if getattr(pair, "is_partial", False):
+            n_partial_pairs += 1
+        if isinstance(response.get("error"), dict) or "error" in response:
+            n_error_responses += 1
+
+        # ── history：记录 user 侧消息 ──────────────────────
+        # 首个带完整 messages 的 pair 作为基线，其余用增量 new_messages。
+        request_body = pair.request_body or {}
+        if not baseline_recorded and request_body.get("messages"):
+            source_msgs = request_body["messages"]
+            baseline_recorded = True
+        else:
+            source_msgs = getattr(pair, "new_messages", None) or []
+
+        user_msgs = [
+            m for m in source_msgs
+            if isinstance(m, dict) and m.get("role") == "user"
+        ]
+        # Fix: 无法定位增量边界时 proxy 会返回完整历史，导致同一批 user 消息
+        # 被反复写进 history（实测一个会话里同一个 tool_result 出现几十次，
+        # 最坏 0 个 tool_use 对应 570 个 tool_result 块）。
+        # 优先用 proxy 落盘的 is_full_replay 显式标记；历史数据没有该字段时
+        # 退回内容指纹启发式（多条消息中出现已记录过的 → 判定为重放）。
+        # 单条消息（正常的一轮用户输入）不做去重，避免误删重复的 "继续"。
+        fingerprints = [_msg_fingerprint(m) for m in user_msgs]
+        is_replay = bool(getattr(pair, "is_full_replay", False)) or (
+            len(user_msgs) >= 2 and any(fp in seen_user_fps for fp in fingerprints)
+        )
+
+        for msg, fp in zip(user_msgs, fingerprints):
+            if is_replay and fp in seen_user_fps:
+                n_dup_user_dropped += 1
+                continue
+            seen_user_fps.add(fp)
+            trimmed = _strip_tool_results(msg)
+            if trimmed is None:
+                continue
+            history.append({
+                "role": "user",
+                "content": trimmed.get("content", ""),
+                "agent": "primary",
+            })
+
         if not response:
             continue
 
-        content_blocks = response.get("content", [])
-        stop_reason = response.get("stop_reason", "")
-        usage = response.get("usage", {})
+        content_blocks = [b for b in response.get("content", []) or [] if isinstance(b, dict)]
+        stop_reason = response.get("stop_reason", "") or ""
+        usage = response.get("usage", {}) or {}
 
         total_input_tokens += usage.get("input_tokens", 0)
         total_output_tokens += usage.get("output_tokens", 0)
         total_cache_read_tokens += usage.get("cache_read_input_tokens", 0)
         total_cache_creation_tokens += usage.get("cache_creation_input_tokens", 0)
 
-        # ── P2 #17: history 记录 system + user messages（首次请求） ──
-        if pair_idx == 0:
-            request_messages = pair.request_body.get("messages", [])
-            # 记录 system prompt（如果存在于 request_body 顶层）
-            system_content = pair.request_body.get("system")
-            if system_content:
-                if isinstance(system_content, list):
-                    # Anthropic 格式：system 是 content block 列表
-                    sys_text = "\n".join(
-                        b.get("text", "") for b in system_content if isinstance(b, dict)
-                    )
-                else:
-                    sys_text = str(system_content)
-                history.append({
-                    "role": "system",
-                    "content": sys_text,
-                    "agent": "primary",
-                })
-            # 记录首次请求中的 user messages
-            # P1 fix: 跳过 role=system 的 messages，避免与上面的 system prompt 重复
-            for msg in request_messages:
-                if msg.get("role") == "user":
-                    history.append({
-                        "role": msg["role"],
-                        "content": msg.get("content", ""),
-                        "agent": "primary",
-                    })
-        else:
-            # 非首次请求：只记录增量 user messages（new_messages）
-            new_msgs = getattr(pair, "new_messages", None) or []
-            for msg in new_msgs:
-                if msg.get("role") == "user":
-                    history.append({
-                        "role": "user",
-                        "content": msg.get("content", ""),
-                        "agent": "primary",
-                    })
-
         # ── 提取 Thought ──────────────────────────────────
         thought_parts = []
         thinking_blocks = []
         for block in content_blocks:
-            if block.get("type") == "thinking":
+            btype = block.get("type")
+            if btype == "thinking":
                 thought_parts.append(block.get("thinking", ""))
                 thinking_blocks.append(block)
                 has_thinking = True
-            elif block.get("type") == "text":
+            elif btype == "redacted_thinking":
+                thinking_blocks.append(block)
+                has_thinking = True
+            elif btype == "text":
                 thought_parts.append(block.get("text", ""))
         thought = "\n".join(p for p in thought_parts if p)
+
+        # ── Action blocks：tool_use + server_tool_use ─────
+        # Fix: 原实现只识别 tool_use，server_tool_use（web_search 等服务端工具）
+        # 及其结果被静默丢弃。
+        action_blocks = [
+            b for b in content_blocks
+            if b.get("type") in ("tool_use", "server_tool_use")
+        ]
+        has_tool_use = bool(action_blocks)
 
         # ── history：记录 assistant 消息 ──────────────────
         history.append({
             "role": "assistant",
             "content": content_blocks,
-            "message_type": "action" if any(b.get("type") == "tool_use" for b in content_blocks) else "thought",
+            "message_type": "action" if has_tool_use else "thought",
             "agent": "primary",
             "thought": thought,
             "thinking_blocks": thinking_blocks if thinking_blocks else None,
             "tool_calls": [
-                {"function": {"name": b["name"], "arguments": json.dumps(b.get("input", {}))}}
-                for b in content_blocks if b.get("type") == "tool_use"
+                {"function": {"name": b.get("name", ""), "arguments": json.dumps(b.get("input", {}), ensure_ascii=False)}}
+                for b in action_blocks
             ] or None,
             "usage": usage,
             "stop_reason": stop_reason,
             "timestamp": pair.timestamp,
         })
 
-        # ── Action 步骤（tool_use blocks） ────────────────
-        tool_use_blocks = [b for b in content_blocks if b.get("type") == "tool_use"]
-        for tool_idx, block in enumerate(tool_use_blocks):
+        # ── Action / Observation 步骤 ─────────────────────
+        for tool_idx, block in enumerate(action_blocks):
             tool_name = block.get("name", "")
-            tool_input = block.get("input", {})
+            tool_input = block.get("input", {}) or {}
             tool_use_id = block.get("id", "")
+            is_server_side = block.get("type") == "server_tool_use"
             tools_used.add(tool_name)
+            n_tool_actions += 1
 
-            # 提取编辑的文件（write/edit/read 工具）
-            if tool_name in ("write", "edit", "read"):
-                fp = tool_input.get("file_path") or tool_input.get("path", "")
-                if fp:
-                    files_edited.add(fp)
+            # 提取涉及的文件路径
+            lname = tool_name.lower()
+            fp_path = _extract_file_path(tool_input)
+            if fp_path:
+                if lname in _EDIT_TOOLS:
+                    files_edited.add(fp_path)
+                elif lname in _READ_TOOLS:
+                    files_read.add(fp_path)
 
             action_str = f"{tool_name}({json.dumps(tool_input, ensure_ascii=False)})"
 
             # 只在第一个 tool_use 中关联 thought，避免多工具调用时重复
             step_thought = thought if tool_idx == 0 else ""
-            content_str = (step_thought + f"\n\nTool: {tool_name}\nInput: {json.dumps(tool_input, ensure_ascii=False)}").strip()
+            content_str = (
+                step_thought
+                + f"\n\nTool: {tool_name}\nInput: {json.dumps(tool_input, ensure_ascii=False)}"
+            ).strip()
 
-            trajectory.append({
+            action_step = {
                 "message_type": "action",
                 "role": "assistant",
                 "content": content_str,
@@ -266,36 +597,62 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
                 "tool_use_id": tool_use_id,
                 "tool_name": tool_name,
                 "tool_input": tool_input,
-            })
+            }
+            if is_server_side:
+                action_step["_server_side"] = True
+            trajectory.append(action_step)
 
-            # ── Observation（tool_result） ─────────────────
-            tool_result = find_tool_result(pairs[pair_idx + 1:], tool_use_id)
-            if tool_result:
-                obs_content = tool_result.get("content", "")
-                if isinstance(obs_content, list):
-                    obs_content = "\n".join(
-                        b.get("text", "") for b in obs_content if isinstance(b, dict)
-                    )
+            # ── Observation ──────────────────────────────
+            tool_result = tool_result_index.get(tool_use_id)
+            server_result = server_result_index.get(tool_use_id) if is_server_side else None
 
+            if tool_result is not None:
+                obs_content = _stringify_result_content(tool_result.get("content"))
                 trajectory.append({
                     "message_type": "observation",
                     "role": "user",
                     "content": obs_content,
                     "agent": "primary",
-                    "is_error": tool_result.get("is_error", False),
+                    "is_error": bool(tool_result.get("is_error", False)),
                     "tool_use_id": tool_use_id,
                 })
-
-                # history：记录 tool_result
-                history.append({
-                    "role": "user",
-                    "content": [tool_result],
+                # history：tool_result 只记录一次（user message 侧已剔除）
+                if tool_use_id in seen_result_ids:
+                    n_dup_result_dropped += 1
+                else:
+                    seen_result_ids.add(tool_use_id)
+                    history.append({
+                        "role": "user",
+                        "content": [tool_result],
+                        "message_type": "observation",
+                        "agent": "primary",
+                        "tool_call_ids": [tool_use_id],
+                    })
+            elif server_result is not None:
+                obs_content = _stringify_result_content(server_result.get("content"))
+                trajectory.append({
                     "message_type": "observation",
+                    "role": "user",
+                    "content": obs_content,
                     "agent": "primary",
-                    "tool_call_ids": [tool_use_id],
+                    "is_error": False,
+                    "tool_use_id": tool_use_id,
+                    "_server_side": True,
                 })
+                if tool_use_id in seen_result_ids:
+                    n_dup_result_dropped += 1
+                else:
+                    seen_result_ids.add(tool_use_id)
+                    history.append({
+                        "role": "user",
+                        "content": [server_result],
+                        "message_type": "observation",
+                        "agent": "primary",
+                        "tool_call_ids": [tool_use_id],
+                    })
             else:
-                # Fix 3: 标记 orphan tool_use（会话中断或 sub-agent 导致的 tool_result 丢失）
+                # 全量索引后仍找不到 = 真正的孤儿（会话中断在工具执行途中）
+                n_orphan += 1
                 trajectory.append({
                     "message_type": "observation",
                     "role": "user",
@@ -306,10 +663,11 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
                     "_orphan": True,
                 })
 
-        # ── final_answer（end_turn + 有文本回复 + 无工具调用） ──
-        # P1 #9: 只在纯文本回复时生成 final_answer，避免与 tool_use action 重复
-        has_tool_use = any(b.get("type") == "tool_use" for b in content_blocks)
-        if stop_reason == "end_turn" and thought and not has_tool_use:
+        # ── final_answer（纯文本回复，无工具调用） ──────────
+        # Fix: 原条件要求 stop_reason == "end_turn"，但 SSE 中断的 pair
+        # stop_reason 为空，导致最后一轮纯文本回复不生成 final_answer。
+        # 现在放宽到所有非 tool_use 的终止原因。
+        if thought and not has_tool_use and stop_reason != "tool_use":
             trajectory.append({
                 "message_type": "action",
                 "role": "assistant",
@@ -318,7 +676,16 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
                 "action": "final_answer",
                 "agent": "primary",
                 "timestamp": pair.timestamp,
+                "stop_reason": stop_reason,
             })
+
+    # ── system prompt 插到 history 头部 ────────────────────
+    if system_text:
+        history.insert(0, {
+            "role": "system",
+            "content": system_text,
+            "agent": "primary",
+        })
 
     # ── 统计 ──────────────────────────────────────────────
     metadata.total_api_calls = len(pairs)
@@ -330,24 +697,48 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
     )
     metadata.tools_used = sorted(tools_used)
     metadata.files_edited = sorted(files_edited)
+    metadata.files_read = sorted(files_read)
     metadata.step_count = len(trajectory)
     metadata.has_thinking = has_thinking
-    metadata.end_time = datetime.now().isoformat()
 
-    # P2 fix: 从首次请求的 system prompt 提取 CLAUDE.md hash
-    if pairs and not metadata.claude_md_hash:
-        metadata.claude_md_hash = _extract_claude_md_hash(pairs[0].request_body)
+    # Fix: 原来 end_time 取 datetime.now()，重建历史数据时会被写成重建时间。
+    # 改为取最后一个 pair 的时间戳，只在完全没有时间戳时回退到当前时间。
+    if not metadata.end_time:
+        metadata.end_time = last_timestamp or datetime.now().isoformat()
+    if not metadata.start_time and pairs:
+        metadata.start_time = pairs[0].timestamp or ""
 
-    # exit_status：取最后一个非 partial pair 的 stop_reason
-    # 修复竞态兜底：如果最后一个 pair 的 stop_reason 为空（record_response_async 还没完成），
-    # 向前搜索最近一个有 stop_reason 的 pair
+    if not metadata.claude_md_hash:
+        metadata.claude_md_hash = _extract_claude_md_hash(system_text)
+
+    # exit_status：取最后一个有 stop_reason 的 pair
     if pairs:
         last_stop = ""
         for p in reversed(pairs):
             if p.stop_reason:
                 last_stop = p.stop_reason
                 break
-        metadata.exit_status = last_stop if last_stop else "unknown"
+        if last_stop:
+            metadata.exit_status = last_stop
+        elif n_partial_pairs:
+            # 全程没拿到 stop_reason 且存在 partial 响应 = 流被打断
+            metadata.exit_status = "interrupted"
+        elif n_error_responses:
+            metadata.exit_status = "error"
+        else:
+            metadata.exit_status = "unknown"
+
+    data_quality = {
+        "tool_actions": n_tool_actions,
+        "orphan_observations": n_orphan,
+        "orphan_rate": round(n_orphan / n_tool_actions, 4) if n_tool_actions else 0.0,
+        "partial_pairs": n_partial_pairs,
+        "error_responses": n_error_responses,
+        "duplicate_user_messages_dropped": n_dup_user_dropped,
+        "duplicate_tool_results_dropped": n_dup_result_dropped,
+        "has_system_prompt": bool(system_text),
+        "has_pricing_data": _lookup_pricing(metadata.model) is not None,
+    }
 
     return {
         "trajectory": trajectory,
@@ -363,6 +754,7 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
             },
             "exit_status": metadata.exit_status,
             "has_thinking": has_thinking,
+            "data_quality": data_quality,
         },
         "metadata": {
             "session_id": metadata.session_id,
@@ -380,6 +772,7 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
             "exit_status": metadata.exit_status,
             "tools_used": metadata.tools_used,
             "files_edited": metadata.files_edited,
+            "files_read": metadata.files_read,
             "has_thinking": has_thinking,
             "has_sub_agent": metadata.has_sub_agent,
             "working_directory": metadata.working_directory,
@@ -389,6 +782,7 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
             "user_prompts": metadata.user_prompts,
             "compactions": metadata.compactions,
             "subagent_spans": metadata.subagent_spans,
+            "data_quality": data_quality,
         },
     }
 

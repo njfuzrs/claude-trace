@@ -99,20 +99,46 @@ def main():
         })
 
     # ── P1 事件 ──────────────────────────────────────────────
-    elif event_name in ("PostToolUse", "PreToolUse"):
+    elif event_name in ("PostToolUse", "PreToolUse", "PostToolUseFailure"):
         event["tool_name"] = input_data.get("tool_name")
         event["tool_input"] = input_data.get("tool_input")
         event["tool_use_id"] = input_data.get("tool_use_id")
         if event_name == "PostToolUse":
             event["tool_response"] = input_data.get("tool_response")
+        elif event_name == "PostToolUseFailure":
+            # 工具执行失败：记录错误信息，用于标注失败轨迹
+            event["error"] = input_data.get("error")
+            event["tool_response"] = input_data.get("tool_response")
 
     elif event_name in ("SubagentStart", "SubagentStop"):
         event["agent_id"] = input_data.get("agent_id")
         event["agent_type"] = input_data.get("agent_type")
+        # 新版 Claude Code 用 subagent_type / agent_name，做兜底兼容
+        for k in ("subagent_type", "agent_name", "parent_session_id", "prompt"):
+            if k in input_data:
+                event[k] = input_data[k]
 
-    elif event_name == "PostCompact":
+    elif event_name in ("PreCompact", "PostCompact"):
         event["trigger"] = input_data.get("trigger")           # manual / auto
         event["compact_summary"] = input_data.get("compact_summary")
+        # PreCompact 带压缩前的上下文规模，用于分析 compaction 影响
+        for k in ("custom_instructions", "token_count", "message_count"):
+            if k in input_data:
+                event[k] = input_data[k]
+
+    # ── 模型调用边界 ─────────────────────────────────────────
+    # Fix: BeforeModel / AfterModel 是新版 Claude Code 新增事件，
+    # 实测已出现在采集数据中但 collector 没有对应分支（落到 raw_input 兜底）。
+    # 显式处理并保留 model / turn 信息，用于把 hook 事件与 API 请求精确对齐。
+    elif event_name in ("BeforeModel", "AfterModel"):
+        event["model"] = input_data.get("model")
+        for k in ("turn_id", "request_id", "stop_reason", "usage", "message_count"):
+            if k in input_data:
+                event[k] = input_data[k]
+
+    elif event_name == "Notification":
+        event["message"] = input_data.get("message")
+        event["title"] = input_data.get("title")
 
     # ── P2 事件 ──────────────────────────────────────────────
     elif event_name == "PermissionRequest":

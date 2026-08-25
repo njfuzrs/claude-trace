@@ -24,7 +24,12 @@ from typing import Dict, List, Optional
 import aiohttp
 from aiohttp import web
 
-from builder import SessionMetadata, build_trajectory, save_trajectory
+from builder import (
+    SessionMetadata,
+    apply_hook_events_to_metadata,
+    build_trajectory,
+    save_trajectory,
+)
 from uploader import UploadManager
 
 # ─────────────────────────────────────────────
@@ -75,6 +80,15 @@ SENSITIVE_HEADERS = {"x-api-key", "authorization", "proxy-authorization"}
 
 # P0 #5: session_id 只允许字母数字和连字符，防止路径遍历
 _SAFE_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+# 标准 UUID 形式的 session_id（用于校验从 request metadata 提取的值）
+_SESSION_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+# Claude Code 的 metadata.user_id 拼接格式：..._session_<uuid>
+_SESSION_SUFFIX_RE = re.compile(
+    r"_session_([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
 
 
 def sanitize_headers_for_storage(headers: Dict[str, str]) -> Dict[str, str]:
@@ -159,6 +173,9 @@ class RequestResponsePair:
     index: int = 0              # P0 #1: 在 record_request 时分配，避免并发冲突
     response_body: Optional[Dict] = None
     new_messages: List[Dict] = field(default_factory=list)
+    # 无法定位增量边界时（真正的历史重写），new_messages 是完整历史。
+    # builder 依据此标记做内容指纹去重，避免 history 中消息重复。
+    is_full_replay: bool = False
     model: str = ""
     usage: Dict = field(default_factory=dict)
     stop_reason: str = ""
@@ -184,6 +201,8 @@ class Session:
     is_title_generation: bool = False  # 标题生成请求（haiku 单条 message，不含有价值的轨迹数据）
     # 修复 exit_status 竞态：跟踪 pending 的 record_response_async tasks
     _pending_write_tasks: List[asyncio.Task] = field(default_factory=list)
+    # 已落盘到 raw.jsonl 的 tool_result id，用于补齐增量遗漏（见 _append_raw_jsonl）
+    persisted_tool_result_ids: set = field(default_factory=set)
 
     def update_activity(self):
         self.last_activity = datetime.now().isoformat()
@@ -263,6 +282,44 @@ class SessionManager:
         return session
 
     @staticmethod
+    def _extract_session_id_from_request(request_body: Dict) -> str:
+        """从请求体的 metadata.user_id 中提取 Claude Code 的真实 session_id
+
+        Fix: Claude Code 在 request_body.metadata.user_id 里携带了真实 session_id，
+        代理此前完全没用它，只靠「Hook 注册 + model 匹配」这类启发式关联。
+        Hook 未配置 / SessionStart 未触发 / 多实例并发时启发式就失效，代理兜底
+        生成随机 uuid 作为目录名，于是 events.jsonl（按真实 session_id 命名）
+        永远对不上号 —— 实测真实轨迹里 61% 缺 events，本机 2974 个 events 文件
+        与 4885 个会话目录只有 1251 个交集。
+
+        user_id 有两种已知格式：
+          1) JSON 串：{"device_id":"...","account_uuid":"...","session_id":"<uuid>"}
+          2) 拼接串：user_<hash>_account__session_<uuid>
+        """
+        metadata = request_body.get("metadata")
+        if not isinstance(metadata, dict):
+            return ""
+        user_id = metadata.get("user_id")
+        if not isinstance(user_id, str) or not user_id:
+            return ""
+
+        # 格式 1：JSON 串
+        if user_id.lstrip().startswith("{"):
+            try:
+                parsed = json.loads(user_id)
+                sid = parsed.get("session_id")
+                if isinstance(sid, str) and _SESSION_ID_RE.match(sid):
+                    return sid
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+        # 格式 2：拼接串，取 _session_ 之后的 uuid
+        match = _SESSION_SUFFIX_RE.search(user_id)
+        if match:
+            return match.group(1)
+        return ""
+
+    @staticmethod
     def _extract_cwd_from_request(request_body: Dict) -> str:
         """从请求的 system prompt 中尝试提取工作目录信息
 
@@ -280,6 +337,42 @@ class SessionManager:
         import re as _re
         match = _re.search(r"(?:working directory|cwd)[:\s]+(/\S+)", text, _re.IGNORECASE)
         return match.group(1) if match else ""
+
+    def _attach_child_session(
+        self, parent: Session, request_body: Dict, request_model: str,
+    ) -> Session:
+        """把一个 sub-agent / 标题生成请求挂到已知父会话下
+
+        从策略 3 内联逻辑抽出，供策略 0（真实 session_id 已知但 model 不匹配）复用。
+        Claude Code 的 sub-agent 与标题生成使用不同 model（通常是 haiku），
+        且携带与主会话相同的 session_id，不应产生独立的 traj 文件。
+        """
+        messages = request_body.get("messages", []) or []
+        has_system = bool(request_body.get("system"))
+        # 识别标题生成请求：haiku model + 单条 message + 有 system prompt
+        is_title_gen = (
+            len(messages) == 1
+            and has_system
+            and "haiku" in request_model.lower()
+        )
+        child_sid = str(uuid.uuid4())
+        child = Session(
+            id=child_sid,
+            model=request_model,
+            parent_session_id=parent.id,
+            is_subagent=True,
+            is_title_generation=is_title_gen,
+        )
+        self.active_sessions[child_sid] = child
+        parent.child_sessions.append(child)
+        self._subagent_parent_map[child_sid] = parent.id
+        parent.update_activity()
+        label = "标题生成" if is_title_gen else "Sub-agent"
+        logger.info(
+            "%s 会话: %s → parent %s (model=%s)",
+            label, child_sid[:8], parent.id[:8], request_model,
+        )
+        return child
 
     def _find_parent_session(self) -> Optional[Session]:
         """查找当前活跃的主会话（用于 sub-agent 请求关联）
@@ -309,12 +402,55 @@ class SessionManager:
         """双通道会话匹配
 
         策略优先级：
+        0. 请求体 metadata.user_id 中的真实 session_id（确定性，最可靠）
         1. Hooks 注册的 pending 队列（model 匹配 → 确定性关联）
         2. 已有活跃会话的对话内容连续性匹配（同 model 优先）
         3. Sub-agent 路由：model 不匹配时，关联到唯一的活跃主会话作为子会话
         4. 兜底：创建新会话
         """
         request_model = request_body.get("model", "")
+
+        # 策略 0：从请求体直接读取 Claude Code 的真实 session_id。
+        # 这是唯一确定性的关联信号，优先于所有启发式匹配 ——
+        # 实测 250 个抽样里有 122 个（76%）目录名与请求携带的真实 session_id
+        # 不一致，正是 events.jsonl 对不上号的根因。
+        #
+        # 注意：sub-agent / 标题生成请求携带的是同一个主会话 session_id
+        # （已验证：同一会话里 haiku 的 subagent 请求 session_id 与主会话相同），
+        # 所以这里只做「主会话归属」判定，不同 model 的请求仍走 sub-agent 路由，
+        # 由下方策略 3 挂到父会话下面。
+        real_sid = self._extract_session_id_from_request(request_body)
+        if real_sid:
+            existing = self.active_sessions.get(real_sid)
+            if existing is not None and not existing.is_subagent:
+                if _models_match(existing.model, request_model):
+                    existing.update_activity()
+                    return existing
+                # model 不同 → sub-agent / 标题生成，挂到这个已知父会话下
+                existing.update_activity()
+                return self._attach_child_session(existing, request_body, request_model)
+
+            # pending 中已有该 id（Hook 注册过）→ 用 Hook 带来的 metadata 创建
+            if real_sid in self._pending_sessions:
+                parent = self._create_session_from_pending(
+                    real_sid, self._pending_sessions[real_sid], "请求 session_id + Hook metadata",
+                )
+                if _models_match(parent.model, request_model) or not parent.model:
+                    if not parent.model:
+                        parent.model = request_model
+                    return parent
+                return self._attach_child_session(parent, request_body, request_model)
+
+            # Hook 未注册（未配置 hooks 或 SessionStart 未触发）：
+            # 直接用真实 id 建会话，events 后续仍能按同名文件关联上。
+            session = Session(
+                id=real_sid,
+                model=request_model,
+                cwd=self._extract_cwd_from_request(request_body),
+            )
+            self.active_sessions[real_sid] = session
+            logger.info("会话关联（请求 session_id）: %s model=%s", real_sid[:8], request_model)
+            return session
 
         # 策略 1：Hooks 注册的 pending 队列（model 匹配关联）
         if self._pending_sessions:
@@ -402,31 +538,7 @@ class SessionManager:
                 )
                 return parent
 
-            # 识别标题生成请求：haiku model + 单条 message + 有 system prompt
-            # 标题生成的 system prompt 通常很短（<500 字符），且 messages 只有 1 条
-            is_title_gen = (
-                len(messages) == 1
-                and has_system
-                and "haiku" in request_model.lower()
-            )
-            child_sid = str(uuid.uuid4())
-            child = Session(
-                id=child_sid,
-                model=request_model,
-                parent_session_id=parent.id,
-                is_subagent=True,
-                is_title_generation=is_title_gen,
-            )
-            self.active_sessions[child_sid] = child
-            parent.child_sessions.append(child)
-            self._subagent_parent_map[child_sid] = parent.id
-            parent.update_activity()
-            label = "标题生成" if is_title_gen else "Sub-agent"
-            logger.info(
-                "%s 会话: %s → parent %s (model=%s)",
-                label, child_sid[:8], parent.id[:8], request_model,
-            )
-            return child
+            return self._attach_child_session(parent, request_body, request_model)
 
         # 策略 4：创建新会话（自动生成 session_id）
         # 识别标题生成请求：haiku + 单条 message，即使没有 parent 也不应产生独立 traj
@@ -687,7 +799,7 @@ class DataCollector:
     ) -> RequestResponsePair:
         """记录请求，提取增量 messages"""
         curr_messages = request_body.get("messages", [])
-        new_messages = self._extract_incremental_messages(
+        new_messages, is_full_replay = self._extract_incremental_messages(
             session.prev_msg_hashes, session.prev_msg_count, curr_messages,
         )
 
@@ -709,6 +821,7 @@ class DataCollector:
             request_headers=sanitize_headers_for_storage(raw_headers),
             index=idx,
             new_messages=new_messages,
+            is_full_replay=is_full_replay,
             model=request_body.get("model", ""),
         )
         session.pairs.append(pair)
@@ -801,22 +914,7 @@ class DataCollector:
                                 hook_events.append(json.loads(line))
                             except json.JSONDecodeError:
                                 pass
-                    metadata.user_prompts = [
-                        e["prompt"] for e in hook_events
-                        if e.get("event") == "UserPromptSubmit" and "prompt" in e
-                    ]
-                    metadata.compactions = [
-                        e for e in hook_events if e.get("event") == "PostCompact"
-                    ]
-                    metadata.subagent_spans = [
-                        e for e in hook_events
-                        if e.get("event") in ("SubagentStart", "SubagentStop")
-                    ]
-                    metadata.has_sub_agent = len(metadata.subagent_spans) > 0
-                    session_end = next(
-                        (e for e in hook_events if e.get("event") == "SessionEnd"), {}
-                    )
-                    metadata.end_source = session_end.get("source", "")
+                    apply_hook_events_to_metadata(metadata, hook_events)
                 except Exception as e:
                     logger.debug("读取 hook events 失败: %s", e)
 
@@ -963,12 +1061,19 @@ class DataCollector:
                 task.add_done_callback(_log_task_exception)
 
     def _copy_events_to_session(self, session_id: str):
-        """将 hook events 复制到会话目录"""
+        """将 hook events 复制到会话目录
+
+        session_id 现在优先来自请求体 metadata（见 _extract_session_id_from_request），
+        与 hooks 写出的 events 文件名一致，因此正常路径直接命中。
+        """
         import shutil
         src = self.events_dir / f"{session_id}.jsonl"
-        if src.exists():
-            dst = self._session_dir(session_id) / "events.jsonl"
-            shutil.copy2(src, dst)
+        if not src.exists():
+            logger.debug("hook events 不存在，跳过复制: %s", session_id[:8])
+            return
+        dst = self._session_dir(session_id) / "events.jsonl"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
 
     def _write_pair_files(self, session: Session, pair: RequestResponsePair,
                           pairs_snapshot: List[RequestResponsePair],
@@ -995,6 +1100,8 @@ class DataCollector:
                 "headers": pair.request_headers,  # 已脱敏
                 "body": pair.request_body,
                 "new_messages": pair.new_messages,
+                # 与 raw.jsonl 通道保持一致，供 merger 重建时去重
+                "is_full_replay": pair.is_full_replay,
             }
             resp_data = {
                 "timestamp": datetime.now().isoformat(),
@@ -1009,7 +1116,7 @@ class DataCollector:
 
         # 追加写入 raw JSONL（始终执行，不受 save_raw 控制）
         jsonl_path = self._session_dir(session.id) / "raw.jsonl"
-        self._append_raw_jsonl(jsonl_path, pair)
+        self._append_raw_jsonl(jsonl_path, pair, session.persisted_tool_result_ids)
 
         # 增量重建 .traj 文件 — 子会话跳过（它们在父会话导出时合并）
         if not session.is_subagent:
@@ -1018,7 +1125,50 @@ class DataCollector:
                 save_trajectory(traj_path, traj)
 
     @staticmethod
-    def _append_raw_jsonl(jsonl_path: Path, pair: RequestResponsePair):
+    def _collect_missing_tool_results(
+        pair: RequestResponsePair, persisted_ids: set,
+    ) -> List[Dict]:
+        """找出本轮请求里尚未落盘过的 tool_result 块
+
+        Fix: raw.jsonl 只在 index==1 落完整 messages，之后全靠 new_messages 增量。
+        一旦增量边界算错（compaction、消息被插入历史中部等），落在边界外的
+        tool_result 就永久丢失 —— 重建时表现为 orphan observation，而在线路径
+        因为读的是内存里的完整 request_body 反而看不出问题，属于静默数据丢失。
+        这里做一层完整性兜底：扫描完整 messages，把没落盘过的 tool_result 补上。
+        """
+        missing: List[Dict] = []
+        for msg in (pair.request_body or {}).get("messages", []) or []:
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tid = block.get("tool_use_id")
+                if tid and tid not in persisted_ids:
+                    persisted_ids.add(tid)
+                    missing.append(block)
+        return missing
+
+    @staticmethod
+    def _register_persisted_tool_results(messages, persisted_ids: set) -> None:
+        """把一批 messages 中的 tool_result id 登记为已落盘"""
+        for msg in messages or []:
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    tid = block.get("tool_use_id")
+                    if tid:
+                        persisted_ids.add(tid)
+
+    def _append_raw_jsonl(self, jsonl_path: Path, pair: RequestResponsePair,
+                          persisted_tool_result_ids: Optional[set] = None):
         """追加写入原始 JSONL
 
         P0 fix: 只保存 new_messages 而非完整 request_body，避免 O(n^2) 存储膨胀。
@@ -1026,9 +1176,14 @@ class DataCollector:
         会导致存储量随对话轮数平方增长。首次请求（index=1）保存完整 request_body
         作为基线，后续只保存增量 new_messages。
         """
+        ids = persisted_tool_result_ids if persisted_tool_result_ids is not None else set()
+
         if pair.index == 1:
             # 首次请求：保存完整 request_body（含 system prompt 等）
             request_data = pair.request_body
+            self._register_persisted_tool_results(
+                (pair.request_body or {}).get("messages"), ids,
+            )
         else:
             # 后续请求：只保存增量 messages + 非 messages 的请求参数
             request_data = {
@@ -1037,6 +1192,16 @@ class DataCollector:
             }
             request_data["new_messages"] = pair.new_messages
             request_data["_messages_count"] = len(pair.request_body.get("messages", []))
+            self._register_persisted_tool_results(pair.new_messages, ids)
+
+            # 完整性兜底：补上增量漏掉的 tool_result，避免重建时变成 orphan
+            recovered = self._collect_missing_tool_results(pair, ids)
+            if recovered:
+                request_data["_recovered_tool_results"] = recovered
+                logger.debug(
+                    "补齐增量遗漏的 tool_result: %d 个 (index=%d)",
+                    len(recovered), pair.index,
+                )
 
         record = {
             "timestamp": pair.timestamp,
@@ -1047,6 +1212,8 @@ class DataCollector:
             "usage": pair.usage,
             "stop_reason": pair.stop_reason,
             "is_partial": pair.is_partial,
+            # 落盘重放标记，重建轨迹（merger / rebuild_trajs）时同样需要去重
+            "is_full_replay": pair.is_full_replay,
         }
         with open(jsonl_path, "a") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -1054,48 +1221,57 @@ class DataCollector:
     @staticmethod
     def _extract_incremental_messages(
         prev_hashes: List[str], prev_count: int, curr_messages: List,
-    ) -> List[Dict]:
+    ) -> tuple:
         """提取增量 messages — Claude Code 每次请求都重发完整历史
 
-        P0 #2: 使用 hash 列表而非完整 messages 引用进行比较。
-        正确处理 context compaction 场景。
+        返回 (new_messages, is_full_replay)。
+        is_full_replay=True 表示无法定位增量边界，new_messages 是完整历史，
+        下游（builder）需要按内容指纹去重，否则同一条消息会反复进 history。
+
+        Fix 1: 原实现的尾部校验分支索引算错了 ——
+            curr[len(curr) - prev_count + prev_count - tail_check + i]
+          化简就是 curr[len(curr) - tail_check + i]，即拿 curr 的「最后几条」
+          去比 prev 的「最后几条」。但 curr 尾部恰恰是本轮新追加的消息，
+          所以该分支几乎永远不成立，每次前缀不匹配都退化成返回完整历史。
+          实测后果：一个会话里同一个 tool_result 在 history 中出现几十次
+          （最坏 0 个 tool_use 对应 570 个 tool_result 块）。
+          现在改为「以上次最后一条消息为锚点反向定位」，这是正确的对齐方式。
+
+        Fix 2: 原实现返回完整历史时不给任何标记，下游无法区分
+          「真的有这么多新消息」和「定位失败的重放」。现在显式返回标记。
         """
         if not prev_hashes:
-            return curr_messages
+            return curr_messages, False
 
-        # compaction 或重置：当前 messages 数量 <= 上次
-        if len(curr_messages) <= prev_count:
-            return curr_messages
+        curr_hashes = [_msg_hash(m) for m in curr_messages]
 
-        # P1 #7: 前缀指纹校验，检查前 5 条降低 compaction 误判概率
-        check_count = min(5, prev_count)
-        prefix_match = all(
-            _msg_hash(curr_messages[i]) == prev_hashes[i]
-            for i in range(check_count)
-        )
+        # 1) 快路径：前缀完全一致且有新增 → 直接取尾部新增
+        if len(curr_messages) > prev_count:
+            check_count = min(5, prev_count)
+            if all(curr_hashes[i] == prev_hashes[i] for i in range(check_count)):
+                return curr_messages[prev_count:], False
 
-        if prefix_match:
-            return curr_messages[prev_count:]
+        # 2) 锚点定位：从后往前找上次最后一条消息在本次历史中的位置。
+        #    覆盖「消息被插到历史前部导致前缀变化」的场景（system reminder 注入等）。
+        anchor = prev_hashes[-1]
+        for i in range(len(curr_hashes) - 1, -1, -1):
+            if curr_hashes[i] == anchor:
+                return curr_messages[i + 1:], False
 
-        # Fix 5: 前缀不匹配时，再检查尾部是否包含上次的最后几条。
-        # 新 turn 开始时 Claude Code 可能在 messages 前面插入 system reminder 等内容，
-        # 导致前缀变化，但尾部仍然包含上次的历史。这不是 compaction。
-        tail_check = min(3, prev_count)
-        if tail_check > 0 and len(curr_messages) > prev_count:
-            try:
-                tail_match = all(
-                    _msg_hash(curr_messages[len(curr_messages) - prev_count + prev_count - tail_check + i])
-                    == prev_hashes[prev_count - tail_check + i]
-                    for i in range(tail_check)
-                )
-                if tail_match:
-                    # 尾部匹配，说明前面插入了新内容，取尾部新增部分
-                    return curr_messages[prev_count:]
-            except (IndexError, KeyError):
-                pass
+        # 3) 退一步：找上次历史里任意一条最靠后的消息作为锚点。
+        #    compaction 会截断前部历史，但尾部通常仍被保留。
+        prev_pos = {h: idx for idx, h in enumerate(prev_hashes)}
+        best_curr_idx = -1
+        best_prev_idx = -1
+        for i, h in enumerate(curr_hashes):
+            p = prev_pos.get(h)
+            if p is not None and p >= best_prev_idx:
+                best_prev_idx, best_curr_idx = p, i
+        if best_curr_idx >= 0:
+            return curr_messages[best_curr_idx + 1:], False
 
-        # 真正的 compaction 或历史重写，记录完整历史
-        return curr_messages
+        # 4) 完全无法对齐（真正的历史重写）：返回完整历史并打上重放标记
+        return curr_messages, True
 
 
 # ─────────────────────────────────────────────
@@ -1188,8 +1364,21 @@ async def handle_streaming(
 
 
 def _is_messages_request(method: str, path: str, request_body: Dict) -> bool:
-    """判断是否为需要采集的 messages API 请求"""
-    return method == "POST" and "/v1/messages" in path and "messages" in request_body
+    """判断是否为需要采集的 messages API 请求
+
+    Fix: 原实现用 `"/v1/messages" in path`，对 `/v1/messages/count_tokens`
+    同样成立。Claude Code 会频繁发 count_tokens 预估 token 用量，每一个都被
+    当成新会话注册、建目录、写空 traj——实测污染了 1020 个会话目录（21%），
+    这些目录 trajectory 为空、token 全 0、response 是上游的
+    "Invalid URL (POST /v1/messages/count_tokens)" 错误。
+
+    现在要求路径以 /v1/messages 结尾（允许尾部斜杠），
+    子路径端点（count_tokens、batches 等）全部走透传不采集。
+    """
+    if method != "POST" or "messages" not in request_body:
+        return False
+    normalized = path.rstrip("/")
+    return normalized.endswith("/v1/messages")
 
 
 async def _passthrough_upstream(

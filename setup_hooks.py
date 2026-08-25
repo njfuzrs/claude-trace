@@ -15,22 +15,36 @@ import shutil
 from pathlib import Path
 
 # 需要订阅的 Hook 事件（按优先级）
+#
+# Fix: Claude Code 升级后新增了若干 hook 事件（BeforeModel / AfterModel /
+# PreCompact / PostToolUseFailure / Notification / SessionResume 等）。
+# 实测已上传的 events.jsonl 里已经出现 BeforeModel / AfterModel /
+# InstructionsLoaded / PostToolUseFailure / StopFailure / SubagentStart，
+# 而这里的订阅列表和 collector.py 的分支都不认识它们。
+# 现在补全全量事件，缺失的事件在旧版 Claude Code 上会被忽略，不影响兼容。
 HOOK_EVENTS = [
-    # P0：核心事件
+    # P0：核心事件 — 会话生命周期与用户输入
     "SessionStart",
     "SessionEnd",
     "UserPromptSubmit",
     "Stop",
-    # P1：重要事件
+    # P1：重要事件 — 工具调用与子代理
+    "PreToolUse",
     "PostToolUse",
+    "PostToolUseFailure",
     "SubagentStart",
     "SubagentStop",
+    # P1：上下文压缩（PreCompact 带压缩前状态，PostCompact 带摘要）
+    "PreCompact",
     "PostCompact",
-    # P2：可选事件
-    "PreToolUse",
+    # P2：模型调用边界 — 用于精确对齐 API 请求与会话 turn
+    "BeforeModel",
+    "AfterModel",
+    # P2：其他
     "PermissionRequest",
     "InstructionsLoaded",
     "StopFailure",
+    "Notification",
 ]
 
 COLLECTOR_PATH = Path.home() / ".claude" / "hooks" / "collector.py"
