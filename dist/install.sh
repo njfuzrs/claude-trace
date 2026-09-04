@@ -19,7 +19,7 @@ set -euo pipefail
 
 INSTALL_DIR="$HOME/.claude-trace"
 VERSION_URL=""  # 将在发布时填入
-RELEASE_BASE="${RELEASE_BASE:-http://127.0.0.1/releases/0.1.1}"
+RELEASE_BASE="${RELEASE_BASE:-http://127.0.0.1/releases/0.2.0}"
 PORT="${PORT:-4000}"
 LABEL="com.claude-trace.proxy"
 PLIST_PATH="$HOME/Library/LaunchAgents/${LABEL}.plist"
@@ -267,6 +267,7 @@ WRAPPER
 
     # 复制其他文件
     cp "$REPO_DIR/collector.py"          "$INSTALL_DIR/collector.py"
+    cp "$REPO_DIR/git_state.py"          "$INSTALL_DIR/git_state.py"
     cp "$REPO_DIR/channels.json.example" "$INSTALL_DIR/channels.json.example"
     cp "$REPO_DIR/dist/claude-trace"     "$INSTALL_DIR/claude-trace"
     cp "$REPO_DIR/dist/proxy-daemon.sh"  "$INSTALL_DIR/proxy-daemon.sh"
@@ -382,6 +383,16 @@ mkdir -p "$(dirname "$COLLECTOR_DEST")"
 cp "$INSTALL_DIR/collector.py" "$COLLECTOR_DEST"
 chmod 755 "$COLLECTOR_DEST"
 ok "collector.py → $COLLECTOR_DEST"
+
+# git_state.py 是 collector.py 的同目录依赖（采集 git HEAD / 工作区脏状态）。
+# hook 以 `python3 <hooks>/collector.py` 运行，sys.path[0] 即 hooks 目录；
+# 缺这个文件 collector 会静默降级为不采集 git 状态。
+if [ -f "$INSTALL_DIR/git_state.py" ]; then
+    cp "$INSTALL_DIR/git_state.py" "$(dirname "$COLLECTOR_DEST")/git_state.py"
+    ok "git_state.py → $(dirname "$COLLECTOR_DEST")/git_state.py"
+else
+    warn "git_state.py 缺失，git 状态采集将不可用"
+fi
 
 # ─── 配置 settings.json ───
 

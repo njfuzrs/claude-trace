@@ -49,6 +49,9 @@ HOOK_EVENTS = [
 
 COLLECTOR_PATH = Path.home() / ".claude" / "hooks" / "collector.py"
 
+# collector.py 在 hooks 目录下运行时需要的同目录依赖
+HOOK_DEPS = ["git_state.py"]
+
 
 def build_hooks_config(collector_path: Path) -> dict:
     """构建 hooks 配置字典"""
@@ -86,12 +89,23 @@ def save_settings(settings_path: Path, data: dict):
 
 
 def deploy_collector(src: Path):
-    """将 collector.py 部署到 ~/.claude/hooks/"""
+    """将 collector.py 及其依赖部署到 ~/.claude/hooks/"""
     dest = COLLECTOR_PATH
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
     dest.chmod(0o755)
     print(f"✅ collector.py 已部署到: {dest}")
+
+    # git_state.py 是 collector.py 的依赖（采集 git HEAD / 脏状态）。
+    # 必须同目录部署：hook 以 `python3 ~/.claude/hooks/collector.py` 方式运行，
+    # sys.path[0] 即 hooks 目录，漏掉这个文件会让 collector 静默降级为不采 git 状态。
+    for dep in HOOK_DEPS:
+        src_dep = src.parent / dep
+        if src_dep.exists():
+            shutil.copy2(src_dep, dest.parent / dep)
+            print(f"✅ {dep} 已部署到: {dest.parent / dep}")
+        else:
+            print(f"⚠️  依赖 {dep} 不存在于 {src_dep}，git 状态采集将不可用")
 
 
 def main():

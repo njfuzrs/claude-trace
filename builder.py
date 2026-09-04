@@ -17,6 +17,7 @@ Anthropic API → TAO 映射：
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -54,6 +55,15 @@ class SessionMetadata:
     user_prompts: List[str] = field(default_factory=list)
     compactions: List[Dict] = field(default_factory=list)
     subagent_spans: List[Dict] = field(default_factory=list)
+    # git 状态快照（P0：base_commit 锚定的唯一可靠来源）
+    # 会话开始时的 HEAD 与工作区脏状态是采集时点独有的信息，事后无法重建：
+    # 未合并分支 + squash 合并 + 多 worktree 会让「按时间反查 commit」落到
+    # 主线上不存在的中间状态；脏工作区更意味着 HEAD 根本不代表真实起点。
+    git_head: str = ""              # 会话开始时的 HEAD commit sha
+    git_branch: str = ""            # 会话开始时的分支名
+    git_dirty: Optional[bool] = None  # 工作区是否有未提交改动（None = 未采集到）
+    git_state: Dict = field(default_factory=dict)      # 会话开始时的完整快照
+    git_state_end: Dict = field(default_factory=dict)  # 会话结束时的完整快照
 
 
 # ─────────────────────────────────────────────
@@ -266,6 +276,143 @@ def _strip_tool_results(msg: Dict) -> Optional[Dict]:
 # Hook 事件 → metadata
 # ─────────────────────────────────────────────
 
+# git_state 模块提供规范化能力。软导入：builder 被 merger / rebuild_trajs 等
+# 多处 import，缺失该模块时应降级而非整体 import 失败。
+try:
+    from git_state import coerce_git_state as _coerce_git_state_impl
+except Exception:  # pragma: no cover
+    _coerce_git_state_impl = None
+
+
+def _coerce_git_state(payload: Dict) -> Dict:
+    """从 hook 事件中提取 git 状态快照，兼容规范结构与扁平结构
+
+    hook 事件里的形态有两种：
+      - 新版 collector：event["git_state"] 为规范结构（键为 head/branch/dirty）
+      - 旧版 collector：git_* 扁平字段直接铺在 event 顶层
+    """
+    if not isinstance(payload, dict):
+        return {}
+    candidate = payload.get("git_state")
+    if not isinstance(candidate, dict) or not candidate:
+        # 退回顶层扁平字段
+        candidate = {
+            k: v for k, v in payload.items()
+            if k.startswith("git_") and k != "git_state"
+        }
+    if not candidate:
+        return {}
+    if _coerce_git_state_impl is not None:
+        return _coerce_git_state_impl(candidate)
+    # 无 git_state 模块时的极简兜底：只保留能直接用的字段
+    head = candidate.get("head") or candidate.get("git_head") or ""
+    if not head:
+        return {}
+    return {
+        "head": head,
+        "head_short": head[:12],
+        "branch": candidate.get("branch") or candidate.get("git_branch") or "",
+        "dirty": candidate.get("dirty", candidate.get("git_dirty")),
+    }
+
+
+# ─────────────────────────────────────────────
+# 工具退出码推导（P0）
+# ─────────────────────────────────────────────
+
+# Bash 失败时，Claude Code 会在 tool_result 文本首行写 "Exit code N"。
+# 实测（4528 个 Bash tool_result）：成功 = 无前缀 + is_error=False（4445 例）；
+# 失败 = 有前缀 + is_error=True（72 例）；另有 11 例 is_error 但无前缀
+# （用户拒绝执行 / 超时 / 被中断）。"Exit code 0" 从不出现。
+_EXIT_CODE_RE = re.compile(r"^\s*Exit code[:\s]+(\d+)", re.IGNORECASE)
+
+# 权限拒绝 / 中断 / 超时的判定文本。这些不是命令的退出码，
+# 而是命令根本没跑完，必须与「真的跑了并返回非零」区分开。
+_REJECTED_MARKERS = (
+    "the user doesn't want to proceed",
+    "the user doesn't want to take this action",
+    "tool use was rejected",
+    "operation was aborted",
+    "request was aborted",
+)
+_INTERRUPT_MARKERS = (
+    "interrupted by user",
+    "user interrupted",
+    "canceled by user",
+    "cancelled by user",
+)
+_TIMEOUT_MARKERS = (
+    "timed out after",
+    "command timed out",
+)
+# InputValidationError 等：工具调用本身不合法，命令未执行
+_INVALID_MARKERS = ("<tool_use_error>",)
+
+# 会真正产生 shell 退出码的工具
+_SHELL_TOOLS = {"bash", "bashoutput"}
+
+
+def derive_tool_outcome(tool_name: str, result_text: str, is_error: bool) -> Dict:
+    """从 tool_result 推导结构化执行结果
+
+    为什么必须在这里做推导，而不是从 hook 里读一个字段：
+    Claude Code **没有**在任何位置暴露数值退出码 —— PostToolUse 的
+    tool_response 只有 stdout/stderr/interrupted/isImage/noOutputExpected，
+    transcript 的 toolUseResult 同样没有 returnCode 字段（已核实）。唯一可靠
+    信号是 API 侧 tool_result 文本首行的 "Exit code N" 前缀 + is_error 标记。
+
+    Returns:
+        {
+          "exit_code": int | None,   # 数值退出码；无法确定为 None
+          "status": str,             # success / failure / rejected / interrupted
+                                     # / timeout / invalid_input
+          "exit_code_source": str,   # 该结论的依据，便于下游评估可信度
+        }
+    """
+    text = result_text or ""
+    head = text[:400]          # 判定标记都在开头，避免扫描超长输出
+    lower = head.lower()
+    lname = (tool_name or "").lower()
+
+    # 1) 显式退出码前缀 —— 最强信号
+    m = _EXIT_CODE_RE.match(head)
+    if m:
+        code = int(m.group(1))
+        return {
+            "exit_code": code,
+            "status": "success" if code == 0 else "failure",
+            "exit_code_source": "exit_code_prefix",
+        }
+
+    # 2) <tool_use_error> 是 Claude Code 包裹的工具层错误标记，
+    #    不会出现在正常命令输出里，可独立判定。
+    if any(k in lower for k in _INVALID_MARKERS):
+        return {"exit_code": None, "status": "invalid_input", "exit_code_source": "tool_use_error"}
+
+    # 3) 命令未真正执行的几类情形（拒绝 / 超时 / 中断）。
+    #    关键：这些文本标记只在 is_error=True 时才作数。
+    #    实测发现的误判类：命令成功执行，但 stdout 里本身含有 "timed out" /
+    #    "interrupted by user" 等字样（脚本自己打印的日志、grep 到的文本），
+    #    若不加 is_error 前置条件，会把成功的命令误判成超时/中断。
+    if is_error:
+        if any(k in lower for k in _REJECTED_MARKERS):
+            return {"exit_code": None, "status": "rejected", "exit_code_source": "rejection_text"}
+        if any(k in lower for k in _TIMEOUT_MARKERS):
+            return {"exit_code": None, "status": "timeout", "exit_code_source": "timeout_text"}
+        if any(k in lower for k in _INTERRUPT_MARKERS):
+            return {"exit_code": None, "status": "interrupted", "exit_code_source": "interrupt_text"}
+        # is_error=True 但没有任何可辨识标记：确定失败，退出码未知
+        return {"exit_code": None, "status": "failure", "exit_code_source": "is_error_flag"}
+
+    # 4) shell 类工具：无 "Exit code" 前缀 + 非 error 即成功退出 0。
+    #    实测 4445/4445 成立 —— Claude Code 只在非零时写前缀。
+    if lname in _SHELL_TOOLS:
+        return {"exit_code": 0, "status": "success", "exit_code_source": "no_error_shell"}
+
+    # 5) 非 shell 工具（Read/Edit/Write 等）没有退出码概念，只报成功
+    return {"exit_code": None, "status": "success", "exit_code_source": "no_error_nonshell"}
+
+
 def hook_event_name(event: Dict) -> str:
     """读取 hook 事件名
 
@@ -320,6 +467,25 @@ def apply_hook_events_to_metadata(metadata: SessionMetadata, hook_events: List[D
                 break
     if not metadata.model and session_start.get("model"):
         metadata.model = session_start["model"]
+
+    # git 状态兜底：优先用代理侧已带入的（实时采集，最准），否则从 hook 事件补。
+    # 这条路径对「离线重建」（rebuild_trajs / merger 读 events.jsonl）是唯一来源。
+    if not metadata.git_state:
+        start_state = _coerce_git_state(session_start)
+        if start_state:
+            metadata.git_state = start_state
+    if not metadata.git_state_end:
+        end_state = _coerce_git_state(session_end)
+        if end_state:
+            metadata.git_state_end = end_state
+    # 扁平字段从起点快照回填，供直接筛选
+    if metadata.git_state:
+        if not metadata.git_head:
+            metadata.git_head = metadata.git_state.get("head", "") or ""
+        if not metadata.git_branch:
+            metadata.git_branch = metadata.git_state.get("branch", "") or ""
+        if metadata.git_dirty is None:
+            metadata.git_dirty = metadata.git_state.get("dirty")
 
 
 # ─────────────────────────────────────────────
@@ -438,6 +604,8 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
     n_dup_user_dropped = 0
     n_dup_result_dropped = 0
     n_error_responses = 0
+    n_failed_actions = 0       # 非 success 的工具执行数
+    n_exit_codes_known = 0     # 拿到确定数值退出码的工具执行数
 
     # 全局索引：一次扫描，避免 O(n*m) 且不遗漏
     tool_result_index = build_tool_result_index(pairs)
@@ -608,13 +776,24 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
 
             if tool_result is not None:
                 obs_content = _stringify_result_content(tool_result.get("content"))
+                obs_is_error = bool(tool_result.get("is_error", False))
+                # P0：结构化执行结果。「改前失败 / 改后通过」的天然证据，
+                # F2P 判定可直接从轨迹取，不必靠解析文本重新构造。
+                outcome = derive_tool_outcome(tool_name, obs_content, obs_is_error)
+                if outcome["status"] != "success":
+                    n_failed_actions += 1
+                if outcome["exit_code"] is not None:
+                    n_exit_codes_known += 1
                 trajectory.append({
                     "message_type": "observation",
                     "role": "user",
                     "content": obs_content,
                     "agent": "primary",
-                    "is_error": bool(tool_result.get("is_error", False)),
+                    "is_error": obs_is_error,
                     "tool_use_id": tool_use_id,
+                    "exit_code": outcome["exit_code"],
+                    "status": outcome["status"],
+                    "exit_code_source": outcome["exit_code_source"],
                 })
                 # history：tool_result 只记录一次（user message 侧已剔除）
                 if tool_use_id in seen_result_ids:
@@ -630,6 +809,7 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
                     })
             elif server_result is not None:
                 obs_content = _stringify_result_content(server_result.get("content"))
+                # 服务端工具（web_search 等）无 shell 退出码，只标注状态
                 trajectory.append({
                     "message_type": "observation",
                     "role": "user",
@@ -638,6 +818,9 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
                     "is_error": False,
                     "tool_use_id": tool_use_id,
                     "_server_side": True,
+                    "exit_code": None,
+                    "status": "success",
+                    "exit_code_source": "server_tool",
                 })
                 if tool_use_id in seen_result_ids:
                     n_dup_result_dropped += 1
@@ -661,6 +844,11 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
                     "is_error": False,
                     "tool_use_id": tool_use_id,
                     "_orphan": True,
+                    # 结果本身缺失：既不能说成功也不能说失败，状态为 unknown。
+                    # 下游做 F2P 判定时必须排除这类步骤，不能当成功计。
+                    "exit_code": None,
+                    "status": "unknown",
+                    "exit_code_source": "orphan",
                 })
 
         # ── final_answer（纯文本回复，无工具调用） ──────────
@@ -738,6 +926,12 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
         "duplicate_tool_results_dropped": n_dup_result_dropped,
         "has_system_prompt": bool(system_text),
         "has_pricing_data": _lookup_pricing(metadata.model) is not None,
+        # 工具执行结果统计（P0）：failed_actions 是「改前失败 / 改后通过」的
+        # 直接依据；exit_codes_known 反映有多少步骤拿到了确定的数值退出码。
+        "failed_actions": n_failed_actions,
+        "exit_codes_known": n_exit_codes_known,
+        "failure_rate": round(n_failed_actions / n_tool_actions, 4) if n_tool_actions else 0.0,
+        "has_git_state": bool(metadata.git_state),
     }
 
     return {
@@ -782,6 +976,14 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
             "user_prompts": metadata.user_prompts,
             "compactions": metadata.compactions,
             "subagent_spans": metadata.subagent_spans,
+            # git 状态（P0）：扁平字段便于直接筛选，完整快照供精细分析。
+            # git_head + git_dirty 决定 base_commit 是否可信：
+            # 脏工作区意味着 HEAD 不代表会话的真实起点。
+            "git_head": metadata.git_head,
+            "git_branch": metadata.git_branch,
+            "git_dirty": metadata.git_dirty,
+            "git_state": metadata.git_state,
+            "git_state_end": metadata.git_state_end,
             "data_quality": data_quality,
         },
     }

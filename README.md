@@ -425,13 +425,24 @@ trajectories/
 {
   "trajectory": [                    // TAO 步骤列表
     {"message_type": "action", "tool_name": "Bash", "tool_input": {...}, ...},
-    {"message_type": "observation", "content": "...", ...}
+    {"message_type": "observation", "content": "...",
+     "exit_code": 1,                 // 数值退出码；无法确定时为 null
+     "status": "failure",            // success / failure / rejected
+                                     // / interrupted / timeout / invalid_input / unknown
+     "exit_code_source": "exit_code_prefix",   // 该结论的依据
+     "is_error": true, ...}
   ],
   "history": [...],                  // 完整 LLM 对话历史（用于 SFT 训练）
   "info": {                          // 会话统计
     "model_stats": {"tokens_sent": ..., "tokens_received": ..., "api_calls": ..., "total_cost_usd": ...},
     "exit_status": "end_turn",
-    "has_thinking": true
+    "has_thinking": true,
+    "data_quality": {
+      "failed_actions": 2,           // 非 success 的工具执行数
+      "exit_codes_known": 2,         // 拿到确定数值退出码的步骤数
+      "failure_rate": 0.5,
+      "has_git_state": true
+    }
   },
   "metadata": {                      // 扩展元数据（含 Hooks 数据）
     "session_id": "...",
@@ -439,10 +450,55 @@ trajectories/
     "tools_used": ["Bash", "Read", "Write"],
     "user_prompts": ["..."],
     "subagent_spans": [...],
-    "compactions": [...]
+    "compactions": [...],
+    "git_head": "c9f5e608963d...",   // 会话起点的 HEAD（扁平字段便于筛选）
+    "git_branch": "master",
+    "git_dirty": true,               // 工作区是否有未提交改动；null = 未采到
+    "git_state": {...},              // 起点完整快照（见下）
+    "git_state_end": {...}           // 终点完整快照
   }
 }
 ```
+
+**git 状态与退出码（为 benchmark 构造服务）**
+
+这两组字段的共同点是「采集时点不记录，事后就再也拿不到」：
+
+- `git_head` + `git_dirty` 决定 `base_commit` 是否可信。靠会话时间反查 commit
+  在多分支仓库上很脆弱（未合并分支、squash 合并、多 worktree 都会让时间反查
+  落到主线上不存在的中间状态）；而工作区脏不脏事后完全无从得知 —— 脏工作区
+  意味着 HEAD 根本不代表会话的真实起点。
+- `exit_code` + `status` 提供「改前失败 / 改后通过」的直接证据。
+
+`git_state` / `git_state_end` 的完整快照字段：
+
+| 字段 | 说明 |
+|---|---|
+| `head` / `head_short` | HEAD 的完整 sha 与短 sha |
+| `branch` / `detached` | 分支名；detached HEAD 时 `branch` 为空、`detached` 为 true |
+| `dirty` | 工作区是否有未提交改动（含未跟踪文件）；`null` 表示未采到 |
+| `modified_files` / `untracked_files` / `staged_files` | 各类改动计数 |
+| `dirty_file_list` | 脏文件明细 `{status, path}`，上限 50 条 |
+| `upstream` / `ahead` / `behind` | 上游分支及领先/落后提交数，用于判断 HEAD 是否已推送 |
+| `is_linked_worktree` | 是否为 linked worktree（非主工作树） |
+| `source` | `hook`（SessionStart 时点采集，更准）或 `proxy`（代理侧兜底） |
+
+`exit_code` 的推导依据（`exit_code_source`）：
+
+| 取值 | 含义 |
+|---|---|
+| `exit_code_prefix` | tool_result 首行的 `Exit code N`，最强信号 |
+| `no_error_shell` | Bash 类工具无错误且无前缀 → 退出 0 |
+| `no_error_nonshell` | Read/Edit 等无退出码概念的工具，仅标注成功 |
+| `is_error_flag` | 确定失败，但退出码无从得知 |
+| `rejection_text` / `timeout_text` / `interrupt_text` | 命令未真正执行（被拒绝/超时/中断），`exit_code` 为 null |
+| `tool_use_error` | 工具调用本身不合法（InputValidationError 等） |
+| `orphan` | tool_result 缺失，状态 `unknown`；下游做判定时应排除 |
+
+> Claude Code 本身不暴露数值退出码 —— PostToolUse 的 `tool_response` 只有
+> `stdout`/`stderr`/`interrupted`/`isImage`/`noOutputExpected`，transcript 的
+> `toolUseResult` 同样没有退出码字段。因此退出码在 `builder.py` 侧按上表推导，
+> 并用 `exit_code_source` 标明依据，供下游按可信度筛选。
 
 **安全说明：**
 

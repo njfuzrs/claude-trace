@@ -30,6 +30,7 @@ from builder import (
     build_trajectory,
     save_trajectory,
 )
+from git_state import coerce_git_state, collect_git_state, flatten_git_state
 from uploader import UploadManager
 
 # ─────────────────────────────────────────────
@@ -203,6 +204,11 @@ class Session:
     _pending_write_tasks: List[asyncio.Task] = field(default_factory=list)
     # 已落盘到 raw.jsonl 的 tool_result id，用于补齐增量遗漏（见 _append_raw_jsonl）
     persisted_tool_result_ids: set = field(default_factory=set)
+    # git 状态快照（P0）：会话起点的 HEAD 与工作区脏状态。
+    # 事后无法重建 —— 时间反查 commit 会落到主线上不存在的中间状态，
+    # 脏工作区更无从得知，而脏工作区意味着 HEAD 不代表真实起点。
+    git_state: Dict = field(default_factory=dict)
+    git_state_end: Dict = field(default_factory=dict)
 
     def update_activity(self):
         self.last_activity = datetime.now().isoformat()
@@ -277,6 +283,11 @@ class SessionManager:
             source=metadata.get("source", ""),
             cwd=metadata.get("cwd", ""),
         )
+        # hook 在 SessionStart 时点、真实 cwd 下采到的 git 状态优先：
+        # 代理侧要等首个 API 请求才知道 cwd，时点偏晚，期间 HEAD 可能已变。
+        session.git_state = coerce_git_state(metadata.get("git_state") or metadata)
+        if not session.git_state and session.cwd:
+            session.git_state = collect_git_state(session.cwd)
         self.active_sessions[session_id] = session
         logger.info("会话关联（%s）: %s", match_type, session_id[:8])
         return session
@@ -448,6 +459,10 @@ class SessionManager:
                 model=request_model,
                 cwd=self._extract_cwd_from_request(request_body),
             )
+            # hook 未配置 / SessionStart 未触发：退回代理侧自采。
+            # cwd 来自 system prompt 正则反解，可能为空，此时拿不到 git 状态。
+            if session.cwd:
+                session.git_state = collect_git_state(session.cwd)
             self.active_sessions[real_sid] = session
             logger.info("会话关联（请求 session_id）: %s model=%s", real_sid[:8], request_model)
             return session
@@ -579,7 +594,13 @@ class SessionManager:
             return session
 
         sid = str(uuid.uuid4())
-        session = Session(id=sid, model=request_body.get("model", ""))
+        session = Session(
+            id=sid,
+            model=request_body.get("model", ""),
+            cwd=self._extract_cwd_from_request(request_body),
+        )
+        if session.cwd:
+            session.git_state = collect_git_state(session.cwd)
         self.active_sessions[sid] = session
         logger.info("新建会话（兜底）: %s model=%s", sid[:8], request_model)
         return session
@@ -901,6 +922,9 @@ class DataCollector:
                 model=session.model,
                 working_directory=session.cwd,
                 start_source=session.source,
+                git_state=session.git_state or {},
+                git_state_end=session.git_state_end or {},
+                **flatten_git_state(session.git_state),
             )
 
             # 从 hook events JSONL 读取语义事件，丰富 metadata
@@ -1580,7 +1604,22 @@ async def handle_session_event(request: web.Request) -> web.Response:
 
     elif event == "end":
         # end 事件：最终导出 + 清理 session
-        # 先原子性地从 active_sessions 中移除，防止 cleanup_expired 竞态
+        # 先记录终点 git 状态，再移除 session。
+        # 终点状态由 collector 随本次通知一起送来，不走 events.jsonl ——
+        # collector 是「先 notify、后写文件」，代理这边导出 traj 时
+        # events.jsonl 里的 SessionEnd 往往还没落盘，读不到。
+        pre_removal = session_manager.active_sessions.get(session_id)
+        if pre_removal is not None:
+            end_state = coerce_git_state(
+                data.get("git_state_end") or data.get("git_state") or {}
+            )
+            if end_state:
+                pre_removal.git_state_end = end_state
+            elif pre_removal.cwd:
+                # hook 没送来（旧版 collector 的 end 通知不带 git 状态）：
+                # 代理侧兜底自采。时点比 hook 稍晚但仍在会话结束瞬间，足够用。
+                pre_removal.git_state_end = collect_git_state(pre_removal.cwd)
+        # 原子性地从 active_sessions 中移除，防止 cleanup_expired 竞态
         session = session_manager._remove_session_and_children(session_id)
         if session and not session.is_subagent:
             try:

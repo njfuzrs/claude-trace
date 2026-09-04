@@ -40,6 +40,20 @@ def notify_proxy(endpoint: str, data: dict):
         pass  # 代理未启动或网络异常，静默忽略
 
 
+# git 状态采集来自共享模块 git_state.py。
+# 该文件由 setup_hooks.py 与 collector.py 一起部署到 ~/.claude/hooks/，
+# 因此这里的 import 在部署后同样成立（sys.path[0] 即 hooks 目录）。
+# 导入失败时降级为「不采集 git 状态」——hook 绝不能因此崩溃。
+try:
+    from git_state import collect_git_state, flatten_git_state
+except Exception:  # pragma: no cover - 部署不完整时的兜底
+    def collect_git_state(cwd: str, source: str = "hook") -> dict:  # type: ignore[misc]
+        return {}
+
+    def flatten_git_state(state: dict) -> dict:  # type: ignore[misc]
+        return {}
+
+
 def main():
     # stdin 为空时提前退出
     raw_input = sys.stdin.read()
@@ -69,21 +83,38 @@ def main():
     if event_name == "SessionStart":
         event["source"] = input_data.get("source")   # startup / resume / clear
         event["model"] = input_data.get("model")
+        # P0（bench §8.4）：会话起点的 git HEAD 与脏状态，事后无法重建。
+        # 扁平字段放 event 顶层便于直接查询，完整快照放 git_state 供精细分析。
+        git_snapshot = collect_git_state(input_data.get("cwd") or "", source="hook")
+        if git_snapshot:
+            event.update(flatten_git_state(git_snapshot))
+            event["git_state"] = git_snapshot
         # 关键：主动通知代理建立确定性 session_id 关联
         notify_proxy("session-register", {
             "session_id": session_id,
             "model": input_data.get("model"),
             "source": input_data.get("source"),
             "cwd": input_data.get("cwd"),
+            "git_state": git_snapshot,
         })
 
     elif event_name == "SessionEnd":
         event["source"] = input_data.get("source")
-        # 通知代理会话结束，触发轨迹导出
+        # 会话终点的 git 状态：与 SessionStart 的 git_head 一对比即知
+        # 「这次会话有没有产生 commit」「结束时工作区留下多少改动」
+        git_snapshot = collect_git_state(input_data.get("cwd") or "", source="hook")
+        if git_snapshot:
+            event.update(flatten_git_state(git_snapshot))
+            event["git_state"] = git_snapshot
+        # 通知代理会话结束，触发轨迹导出。
+        # 终点快照必须随这条通知一起送出，不能只靠 events.jsonl：
+        # 本函数是「先 notify、后写文件」，而 notify 会同步触发代理导出 traj，
+        # 代理那时读 events.jsonl 往往还看不到这条 SessionEnd。
         notify_proxy("session-event", {
             "session_id": session_id,
             "event": "end",
             "source": input_data.get("source"),
+            "git_state_end": git_snapshot,
         })
 
     elif event_name == "UserPromptSubmit":
