@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-test:
+    # 本项目是 macOS-only（launchd / fswatch），但纯 Python 的数据处理部分在
+    # Linux 上也能跑，所以 ubuntu 一起跑 lint + 单测，不测 launchd 链路。
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+        # 下限必须与 pyproject.toml 的 requires-python 一致：
+        # trace_agent.py 用了 PEP 604 的 `X | None`，3.9 下会直接 TypeError。
+        python-version: ['3.10', '3.12']
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff pytest
+
+      - name: ruff（correctness 档）
+        run: ruff check .
+
+      - name: 语法自检：所有入库脚本在本版本下可导入
+        # 这一步专门兜住「声明支持 3.10 但代码里有更高版本语法」这类问题：
+        # ruff 是静态检查，compileall 才会真正按当前解释器编译。
+        run: python -m compileall -q $(git ls-files '*.py')
+
+      - name: shell 语法检查
+        run: for f in $(git ls-files '*.sh'); do bash -n "$f" || exit 1; done
+
+      - name: pytest
+        run: pytest -q
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  privacy-defaults:
+    # 隐私默认值门禁：这三条是 SECURITY.md 承诺的边界，回归了必须让 CI 红。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 身份字段不得回退到真实用户名/主机名
+        run: |
+          if grep -nE 'os\.getlogin\(\)|os\.uname\(\)|platform\.node\(\)|\$\(whoami\)' \
+               uploader.py dist/install.sh; then
+            echo "::error::身份字段出现真实身份回退，见 SECURITY.md 的隐私边界"
+            exit 1
+          fi
+
+      - name: 上传端点与凭据不得有内置默认值
+        run: |
+          if grep -nE 'TRAJ_(PLATFORM_URL|UPLOAD_TOKEN)="\$\{TRAJ_[A-Z_]+:-[^}]+\}"' \
+               dist/install.sh; then
+            echo "::error::上传端点/凭据出现内置默认值，上传必须保持 opt-in"
+            exit 1
+          fi
+
+      - name: 代理不得默认绑定 0.0.0.0
+        run: |
+          if grep -nE '"0\.0\.0\.0"|'"'"'0\.0\.0\.0'"'" proxy.py; then
+            echo "::error::代理默认监听地址不得为 0.0.0.0"
+            exit 1
+          fi

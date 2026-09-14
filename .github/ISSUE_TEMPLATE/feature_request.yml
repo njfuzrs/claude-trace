@@ -1,0 +1,28 @@
+name: 功能建议
+description: 建议一个新功能或改进
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决什么问题
+      description: 先说问题，不要直接说方案
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 设想的做法
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 请先确认
+      options:
+        - label: 我知道本项目仅支持 macOS，且不接受重构为标准 Python 包的改动（见 CONTRIBUTING.md）
+          required: true
+        - label: 如果这个功能会扩大采集范围，我在上面明确写出了会多采集什么
+          required: false

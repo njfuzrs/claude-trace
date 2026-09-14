@@ -1,0 +1,50 @@
+# pyproject.toml —— 项目元数据与工具配置
+#
+# 注意：本项目是扁平脚本结构（见 CONTRIBUTING.md），不作为 Python 包安装 ——
+# collector.py 等文件需要能被单独拷到 ~/.claude/hooks/ 下执行。
+# 这里声明 [project] 是为了给出统一的元数据与依赖下限，不用于 pip install。
+
+[project]
+name = "claude-trace"
+version = "0.2.0"   # 单一事实源是根目录的 version 文件，改版本时两处同步
+description = "Claude Code / Codex 轨迹采集工具，输出 SWE-agent 兼容的 .traj 格式"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "njfuzrs" }]
+requires-python = ">=3.10"
+dependencies = ["aiohttp>=3.9.0"]
+
+[project.urls]
+Homepage = "https://github.com/njfuzrs/claude-trace"
+Issues = "https://github.com/njfuzrs/claude-trace/issues"
+
+# ─── ruff ───
+# 只开 correctness 档。这个仓库有 8000+ 行零 lint 历史，一上来开全量规则会有
+# 几百条存量违规压着不能提交 —— 门禁的价值在于「新代码不引入真问题」，
+# 不在于一次性重排所有历史代码。风格层交给 .editorconfig。
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = ["build/_venv", "build/_build", "dist/arm64", "dist/x86_64"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle 错误
+    "F",    # pyflakes：未定义名、未用导入等真问题
+    "W",    # pycodestyle 警告
+    "B",    # flake8-bugbear：易错构造
+]
+ignore = [
+    "E501",  # 行长交给 line-length 与 formatter，不做硬失败
+    "E741",  # 允许 l/I/O 之类的短变量名（存量代码有用到）
+    "B008",  # 允许在默认参数里调用函数（argparse/pathlib 惯用法）
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里允许 assert 与稍随意的命名
+"tests/*" = ["B011"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

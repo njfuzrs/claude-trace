@@ -35,6 +35,7 @@ Claude Code / Codex 轨迹采集工具。默认通过一个统一执行入口同
   - [第三步：合并](#第三步合并)
   - [双通道数据合并](#双通道数据合并)
 - [文件说明](#文件说明)
+- [项目文档](#项目文档)
 - [常见问题](#常见问题)
 - [停止与清理](#停止与清理)
 
@@ -739,6 +740,22 @@ python3 merger.py --all \
 | `channels.json` | 渠道配置文件，含 token/upstream/force_thinking（已加入 .gitignore） |
 | `channels.json.example` | 渠道配置模板，可提交到 git |
 | `viewer.py` | 轨迹数据 HTML 查看器，将 .traj 转为可视化 HTML |
+| `git_state.py` | 会话起点 git 状态快照采集（`collector.py` 的同目录依赖） |
+| `docs/upload-protocol.md` | 自建上传接收端所需的服务端协议 |
+| `tests/` | 测试骨架（请求头脱敏 / session_id 防护 / porcelain 解析） |
+
+---
+
+## 项目文档
+
+| 文件 | 内容 |
+|------|------|
+| [SECURITY.md](SECURITY.md) | 漏洞上报通道，以及**本工具的隐私边界**（采集范围 / 脱敏覆盖面 / 什么算漏洞） |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | 开发环境、测试与门禁、三条有意的项目约定、不接受的改动 |
+| [CHANGELOG.md](CHANGELOG.md) | 变更记录 |
+| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | 行为准则 |
+| [docs/upload-protocol.md](docs/upload-protocol.md) | 上传协议与最小接收端实现 |
+| [LICENSE](LICENSE) | MIT |
 
 ---
 

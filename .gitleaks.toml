@@ -1,0 +1,26 @@
+# gitleaks 配置。扩展默认规则集，只加 allowlist，不放宽任何规则。
+#
+# 为什么需要它：`gitleaks detect --no-git` 扫的是文件系统，会命中开发者本机的
+# 配置文件与采集数据 —— 这些文件从未入库（`git log --all -- channels.json` 为空）、
+# 也在 .gitignore 中，但扫描器不看 git 状态。不排除的话每个开发者本地都是常红，
+# 常红的门禁等于没有门禁。
+#
+# ⚠️ 这里只排除「按设计不会入库」的路径。任何入库文件都必须照默认规则扫。
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "本机专用、按设计不入库的文件"
+paths = [
+    # 渠道配置：含开发者自己的 API token，.gitignore:7 已排除，从未入库
+    '''^channels\.json$''',
+    # 采集到的轨迹数据：含完整对话，可能含用户粘贴的凭据。这正是
+    # SECURITY.md 提醒用户自查的对象，但它不是仓库内容
+    '''^trajectories/''',
+    '''\.traj$''',
+    # 构建产物与虚拟环境
+    '''^build/_venv/''',
+    '''^build/_build/''',
+    '''^dist/(arm64|x86_64)/''',
+]

@@ -1,0 +1,45 @@
+# EditorConfig —— 编辑器层的最低共识：缩进、换行、编码。
+# https://editorconfig.org
+#
+# 这些值不是新定的规范，是从现有代码实测出来的：Python 一律 4 空格，
+# Shell 一律 4 空格（install-daemon.sh / dist/install.sh 等全仓一致），
+# 零 tab 缩进文件。ruff 只管 correctness（见 pyproject.toml），不管排版，
+# 所以格式化这一层，这份文件是唯一的自动化兜底，别当装饰。
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+indent_style = space
+indent_size = 4
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.py]
+indent_size = 4
+max_line_length = 100
+
+[*.{sh,bash}]
+# 全仓 shell 脚本实测为 4 空格，与 Python 保持一致
+indent_size = 4
+
+[*.{json,jsonc}]
+indent_size = 2
+
+[*.{yml,yaml}]
+indent_size = 2
+
+[*.toml]
+indent_size = 2
+
+[*.md]
+# Markdown 里行尾两个空格是硬换行语法，裁掉会改变渲染结果。
+trim_trailing_whitespace = false
+
+[Makefile]
+# Makefile 的配方行必须用 tab 开头，这是 make 的语法要求，不是风格偏好。
+indent_style = tab
+
+[*.plist]
+indent_size = 4

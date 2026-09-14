@@ -658,7 +658,7 @@ def render_traj(traj: Dict) -> str:
 
             # 内部展开的每个工具步骤
             step_parts = []
-            for si, step in enumerate(loop_steps):
+            for step in loop_steps:
                 sname = step["name"]
                 sinput = step["input"]
                 input_str = json.dumps(sinput, ensure_ascii=False, indent=2)

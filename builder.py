@@ -659,7 +659,9 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
             len(user_msgs) >= 2 and any(fp in seen_user_fps for fp in fingerprints)
         )
 
-        for msg, fp in zip(user_msgs, fingerprints):
+        # strict=True：fingerprints 由 user_msgs 逐条推导，长度必然相等；
+        # 若将来改动破坏这个不变量，宁可报错也不要静默截断掉尾部消息。
+        for msg, fp in zip(user_msgs, fingerprints, strict=True):
             if is_replay and fp in seen_user_fps:
                 n_dup_user_dropped += 1
                 continue

@@ -70,6 +70,22 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 后处理: filter_trajs.py → convert_trajs.py → combine_trajs.py → training_data.jsonl
 ```
 
+## 开发工具与门禁
+
+```bash
+brew install ruff gitleaks pre-commit   # macOS 上系统 Python 受 PEP 668 保护，用 brew 装
+pre-commit install                      # 装 git hook
+
+ruff check .                            # lint（只开 correctness 档，配置在 pyproject.toml）
+pytest -q                               # 测试（tests/）
+gitleaks detect --no-git --redact       # 密钥扫描
+pre-commit run --all-files              # 一次跑全部
+```
+
+三条隐私默认值门禁同时存在于 `.pre-commit-config.yaml` 与 CI：身份字段不得回退到
+真实用户名/主机名、上传端点与凭据不得有内置默认值、代理不得默认绑 `0.0.0.0`。
+改这三处会被拦下，理由见 `SECURITY.md`。
+
 ## 编码规范
 
 - 所有代码注释必须使用中文
@@ -85,8 +101,12 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 - 会话维度存储：所有数据按 `sessions/{session_id}/` 组织，一个会话的 traj、raw、events 放在一起
 - 增量存储：JSONL 首行保存完整 request_body，后续行只保存 new_messages，避免 O(n²) 膨胀
 - 双通道采集：proxy（API 流量）+ hooks（会话事件）通过 session_id 关联
-- 自动上传：会话结束时自动上传 session.traj + raw.jsonl + events.jsonl 到云端平台
-- 安全：API Key 自动脱敏，代理默认绑定 127.0.0.1
+- 上传 opt-in：默认关闭，无内置端点与凭据。仅当 `TRAJ_PLATFORM_URL` 与 `TRAJ_UPLOAD_TOKEN`
+  同时非空才启用；启用后会话结束时上传 session.traj + raw.jsonl + events.jsonl。
+  `TRAJ_USER_ID` / `TRAJ_DEVICE_ID` 默认留空，不回退到系统用户名与主机名。
+- 安全：**只脱三个请求头**（`x-api-key` / `authorization` / `proxy-authorization`），
+  **消息体不做内容级过滤** —— 对话里的密钥会明文落盘，内容级 Scrubber 尚未实现。
+  代理默认绑定 127.0.0.1。
 - 代理使用 SSE Tee 模式，零延迟转发 + 后台记录，不影响 Claude Code 正常使用
 
 ## 渠道管理

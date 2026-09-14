@@ -1,0 +1,70 @@
+# 防复发门禁。装一次：pre-commit install
+# 全量跑：pre-commit run --all-files
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.7
+    hooks:
+      - id: ruff
+        args: [--fix]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        # Markdown 行尾两空格是硬换行语法，裁掉会改变渲染
+        exclude: \.md$
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-executables-have-shebangs
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  - repo: local
+    hooks:
+      # 用系统安装的 gitleaks（brew install gitleaks），不用官方 remote hook ——
+      # 后者需从源码 go install，构建时依赖 proxy.golang.org，网络不通即整个门禁失效。
+      - id: gitleaks
+        name: gitleaks（密钥扫描）
+        entry: gitleaks git --pre-commit --staged --redact --verbose
+        language: system
+        pass_filenames: false
+
+      # 隐私默认值门禁：与 .github/workflows/ci.yml 的 privacy-defaults job 同口径。
+      # 这三条是 SECURITY.md 对用户的承诺，回归了必须在提交时就拦住。
+      - id: no-identity-fallback
+        name: 身份字段不得回退到真实用户名/主机名
+        entry: >
+          bash -c 'grep -nE "os\.getlogin\(\)|os\.uname\(\)|platform\.node\(\)|\$\(whoami\)"
+          uploader.py dist/install.sh && { echo "见 SECURITY.md 的隐私边界"; exit 1; } || exit 0'
+        language: system
+        pass_filenames: false
+        files: '^(uploader\.py|dist/install\.sh)$'
+
+      - id: no-builtin-upload-endpoint
+        name: 上传端点与凭据不得有内置默认值
+        entry: >
+          bash -c 'grep -nE "TRAJ_(PLATFORM_URL|UPLOAD_TOKEN)=\"\$\{TRAJ_[A-Z_]+:-[^}]+\}\""
+          dist/install.sh && { echo "上传必须保持 opt-in"; exit 1; } || exit 0'
+        language: system
+        pass_filenames: false
+        files: '^dist/install\.sh$'
+
+      - id: no-wildcard-bind
+        name: 代理不得默认绑定 0.0.0.0
+        entry: >
+          bash -c 'grep -nE "\"0\.0\.0\.0\"|'"'"'0\.0\.0\.0'"'"'" proxy.py
+          && { echo "默认监听地址必须是 127.0.0.1"; exit 1; } || exit 0'
+        language: system
+        pass_filenames: false
+        files: '^proxy\.py$'
+
+      - id: shell-syntax
+        name: shell 语法检查
+        entry: bash -n
+        language: system
+        files: '\.sh$'
