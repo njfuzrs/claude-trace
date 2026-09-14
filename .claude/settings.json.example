@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && changed=\"$CLAUDE_FILE_PATH\" && case \"$changed\" in */proxy.py|*/uploader.py|*/builder.py|*/collector.py) ./install-daemon.sh restart 2>/dev/null && echo '🔄 代理已自动重启' ;; esac || true",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -8,8 +8,10 @@
 # 非交互模式环境变量：
 #   ANTHROPIC_AUTH_TOKEN  — API Token（必填）
 #   UPSTREAM_URL          — 上游 API 地址（默认 https://api.anthropic.com）
-#   TRAJ_PLATFORM_URL     — 轨迹上传服务器（默认内置团队服务器）
-#   TRAJ_UPLOAD_TOKEN     — 上传 Token（默认内置）
+#   TRAJ_PLATFORM_URL     — 轨迹上传服务器（留空则禁用上传，默认留空）
+#   TRAJ_UPLOAD_TOKEN     — 上传 Token（留空则禁用上传，默认留空）
+#   TRAJ_USER_ID          — 上传时携带的用户标识（默认留空 = 不上报）
+#   TRAJ_DEVICE_ID        — 上传时携带的设备标识（默认留空 = 不上报）
 #   FORCE_THINKING        — 强制 thinking（默认 0）
 #   RELEASE_BASE          — 下载地址前缀（覆盖默认）
 
@@ -18,8 +20,14 @@ set -euo pipefail
 # ─── 配置 ───
 
 INSTALL_DIR="$HOME/.claude-trace"
-VERSION_URL=""  # 将在发布时填入
-RELEASE_BASE="${RELEASE_BASE:-http://127.0.0.1/releases/0.2.0}"
+# 版本号单一事实源：仓库根的 version 文件；脱离仓库运行时由 release.sh 注入 VERSION
+VERSION="${VERSION:-$(cat "$(dirname "$0")/../version" 2>/dev/null || echo "")}"
+GH_REPO="${GH_REPO:-njfuzrs/claude-trace}"
+if [ -n "$VERSION" ]; then
+    RELEASE_BASE="${RELEASE_BASE:-https://github.com/${GH_REPO}/releases/download/v${VERSION}}"
+else
+    RELEASE_BASE="${RELEASE_BASE:-https://github.com/${GH_REPO}/releases/latest/download}"
+fi
 PORT="${PORT:-4000}"
 LABEL="com.claude-trace.proxy"
 PLIST_PATH="$HOME/Library/LaunchAgents/${LABEL}.plist"
@@ -311,21 +319,42 @@ if [ "$IS_UPGRADE" = false ] || [ ! -f "$INSTALL_DIR/channels.json" ]; then
     FORCE_THINKING="${FORCE_THINKING:-0}"
     prompt_input FORCE_THINKING "强制 thinking (0=关闭, 1=开启)" "$FORCE_THINKING"
 
-    # 用户标识（用于区分数据来源）
+    # ─── 上传配置（默认关闭，opt-in） ───
+    # 无内置默认端点与凭据：两者留空即禁用上传，数据只留在本机。
     echo ""
-    _default_user="${TRAJ_USER_ID:-$(whoami)}"
+    TRAJ_PLATFORM_URL="${TRAJ_PLATFORM_URL:-}"
+    TRAJ_UPLOAD_TOKEN="${TRAJ_UPLOAD_TOKEN:-}"
     TRAJ_USER_ID="${TRAJ_USER_ID:-}"
-    prompt_input TRAJ_USER_ID "你的名字（用于标识数据来源）" "$_default_user"
+    TRAJ_DEVICE_ID="${TRAJ_DEVICE_ID:-}"
 
-    # 上传配置（内置团队默认值）
-    echo ""
-    TRAJ_PLATFORM_URL="${TRAJ_PLATFORM_URL:-http://127.0.0.1/traj}"
-    TRAJ_UPLOAD_TOKEN="${TRAJ_UPLOAD_TOKEN:-<REDACTED_TOKEN>}"
-    info "轨迹上传服务器: $TRAJ_PLATFORM_URL (内置默认)"
+    if [ "$NON_INTERACTIVE" = false ]; then
+        echo "  轨迹上传（可选，默认关闭）"
+        echo "  ⚠️  开启后会把【完整对话内容】上传到你指定的服务器，"
+        echo "      其中包含你的提示词、代码、文件路径与工具调用结果。"
+        echo "      不配置则数据只保存在本机 $INSTALL_DIR/trajectories。"
+        read -rp "  是否配置轨迹上传？(y/N): " _enable_upload
+        case "$_enable_upload" in
+            [yY]|[yY][eE][sS])
+                prompt_input TRAJ_PLATFORM_URL "上传服务器地址（留空取消）"
+                if [ -n "$TRAJ_PLATFORM_URL" ]; then
+                    prompt_input TRAJ_UPLOAD_TOKEN "上传 Token（留空取消）"
+                fi
+                echo "  以下两个标识会随每条轨迹上传，可直接回车留空："
+                prompt_input TRAJ_USER_ID "用户标识（可留空）"
+                prompt_input TRAJ_DEVICE_ID "设备标识（可留空）"
+                ;;
+        esac
+    fi
+
+    if [ -n "$TRAJ_PLATFORM_URL" ] && [ -n "$TRAJ_UPLOAD_TOKEN" ]; then
+        info "轨迹上传已启用: $TRAJ_PLATFORM_URL"
+    else
+        info "轨迹上传未配置，数据仅保存在本地"
+    fi
 
     # 写入 channels.json
-    python3 - "$INSTALL_DIR/channels.json" "$ANTHROPIC_AUTH_TOKEN" "$UPSTREAM_URL" "$FORCE_THINKING" "$TRAJ_PLATFORM_URL" "$TRAJ_UPLOAD_TOKEN" "$TRAJ_USER_ID" <<'PYEOF'
-import json, sys, os
+    python3 - "$INSTALL_DIR/channels.json" "$ANTHROPIC_AUTH_TOKEN" "$UPSTREAM_URL" "$FORCE_THINKING" "$TRAJ_PLATFORM_URL" "$TRAJ_UPLOAD_TOKEN" "$TRAJ_USER_ID" "$TRAJ_DEVICE_ID" <<'PYEOF'
+import json, sys
 
 path = sys.argv[1]
 token = sys.argv[2]
@@ -333,7 +362,9 @@ upstream = sys.argv[3]
 force_thinking = int(sys.argv[4]) if sys.argv[4] else 0
 platform_url = sys.argv[5] if len(sys.argv) > 5 else ""
 upload_token = sys.argv[6] if len(sys.argv) > 6 else ""
-user_id = sys.argv[7] if len(sys.argv) > 7 else os.getlogin()
+# 身份字段默认留空：不回退到系统用户名/主机名（常含真实姓名与资产编号）
+user_id = sys.argv[7] if len(sys.argv) > 7 else ""
+device_id = sys.argv[8] if len(sys.argv) > 8 else ""
 
 config = {
     "active_channel": "default",
@@ -349,7 +380,7 @@ config = {
         "platform_url": platform_url,
         "upload_token": upload_token,
         "user_id": user_id,
-        "device_id": os.uname().nodename,
+        "device_id": device_id,
         "cleanup_after_upload": True,
     }
 }

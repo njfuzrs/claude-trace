@@ -12,3 +12,23 @@ dist/arm64/
 dist/x86_64/
 dist/*.tar.gz
 *.spec.bak
+
+# 本机开发配置（含绝对路径，仅供参考模板 .claude/settings.json.example）
+.claude/settings.json
+.claude/settings.local.json
+
+# 系统与编辑器
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+.venv/
+venv/
+build/_venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# 日志
+*.log

@@ -95,8 +95,8 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 
 ```bash
 ./switch-channel.sh list       # 列出所有渠道
-./switch-channel.sh company    # 切换到公司渠道
-./switch-channel.sh monthly    # 切换到个人月卡
+./switch-channel.sh default    # 切换到名为 default 的渠道
+./switch-channel.sh backup     # 切换到名为 backup 的渠道
 ./switch-channel.sh status     # 查看当前渠道
 ```
 

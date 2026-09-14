@@ -9,8 +9,8 @@
     }
   },
   "upload": {
-    "platform_url": "http://127.0.0.1/traj",
-    "upload_token": "<REDACTED_TOKEN>",
+    "platform_url": "",
+    "upload_token": "",
     "user_id": "",
     "device_id": "",
     "cleanup_after_upload": true

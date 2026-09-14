@@ -1,10 +1,20 @@
 # claude-trace
 
+![platform](https://img.shields.io/badge/platform-macOS%20only-lightgrey)
+![python](https://img.shields.io/badge/python-3.10%2B-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
+
+> **仅支持 macOS。** 服务管理依赖 macOS 专有的 launchd，文件监听依赖 `fswatch`，
+> 构建产物针对 `arm64` / `x86_64` 的 Darwin。Linux 与 Windows **尚未支持**，
+> 也没有兼容层 —— 在这两个平台上安装脚本会直接失败，这是当前状态的如实描述。
+
 Claude Code / Codex 轨迹采集工具。默认通过一个统一执行入口同时采集两类数据：Claude Code 走 HTTP 统一采集器 + Hooks，Codex 走本机 `~/.codex` rollout watcher + app-server 线程读取，统一输出 SWE-agent 兼容的 `.traj` 格式。
 
 ## 目录
 
 - [快速开始](#快速开始)
+- [这个工具会采集什么](#这个工具会采集什么)
+- [数据会离开你的机器吗](#数据会离开你的机器吗)
 - [工作原理](#工作原理)
 - [安装](#安装)
 - [使用方式](#使用方式)
@@ -33,20 +43,96 @@ Claude Code / Codex 轨迹采集工具。默认通过一个统一执行入口同
 ## 快速开始
 
 ```bash
-# 1. 运行安装器（开机自启 + 崩溃重启 + 默认开启统一采集，只需执行一次）
+# 1. 取源码
+git clone https://github.com/njfuzrs/claude-trace.git
+cd claude-trace
+
+# 2. 装依赖（唯一外部依赖是 aiohttp）
+pip3 install -r requirements.txt
+
+# 3. 运行安装器（开机自启 + 崩溃重启 + 默认开启统一采集，只需执行一次）
+#    上传默认关闭，安装过程会显式询问，不填即不上传
 bash dist/install.sh
 
-# 2. 安装完成后，如需再次拉起统一采集，只需一个命令
+# 4. 安装完成后，如需再次拉起统一采集，只需一个命令
 claude-trace start
 
-# 3. 查看状态 / 日志
+# 5. 查看状态 / 日志
 claude-trace status
 claude-trace logs
+```
+
+也可以不装服务、直接从仓库跑守护进程：
+
+```bash
+./install-daemon.sh install   # 注册 launchd 服务（推荐）
+# 或
+./proxy-daemon.sh             # 前台跑，Ctrl-C 停
 ```
 
 安装器会自动部署 Hooks、写入 `~/.claude/settings.json`，并立即拉起统一采集服务。配置完成后，以后每次正常启动 `claude` 即可，Claude 请求会自动经过本地统一采集器；同时统一守护进程也会默认持续监听本机 `~/.codex`，增量采集 Codex 会话到 `./trajectories/` 目录，无需额外配置。
 
 > **核心原则：统一采集进程永不中断。** Claude Code 请求必须经过本地统一采集器（`localhost:4000`）转发到上游 API；Codex 会话则由同一守护进程默认持续监听 `~/.codex/sessions/**/rollout-*.jsonl`。统一进程通过 macOS launchd 服务管理，开机自启 + 崩溃自动重启，确保采集不丢数据。
+
+---
+
+## 这个工具会采集什么
+
+**它采集完整对话，不是摘要。** 这是采集类工具的知情同意底线，所以说清楚：
+
+| 采集内容 | 说明 |
+| --- | --- |
+| 完整请求体 | 你的每一条提示词、system prompt、全部历史消息 |
+| 完整响应体 | 模型回复，含 thinking 内容与 token 用量 |
+| 工具调用与结果 | `Read` / `Edit` / `Bash` 的**入参与输出** —— 也就是你的**源码内容、文件路径、命令与命令输出** |
+| 文件路径 | 绝对路径，含你的用户名目录（如 `/Users/<你>/...`） |
+| git 状态 | 会话起点的 HEAD、分支名、工作区是否有未提交改动（`git_state.py`，只读命令） |
+| 会话事件 | SessionStart / Stop / PostToolUse 等 hook 事件时间线 |
+
+**不采集**：你的 API Key 值（三个请求头会被截断脱敏，见[安全说明](#安全说明请如实理解脱敏范围)）。
+
+⚠️ 反过来说：**除了那三个请求头，消息体不做内容级过滤**。你在对话里粘贴过什么，
+轨迹里就有什么。在私有代码库上使用前请先明确这一点。
+
+想知道究竟落了什么盘，直接看：
+
+```bash
+ls ./trajectories/sessions/                       # 按会话列目录
+python3 viewer.py ./trajectories/sessions/<id>/session.traj   # 可视化查看单条轨迹
+```
+
+---
+
+## 数据会离开你的机器吗
+
+**默认不会。** 所有轨迹只写在本机 `./trajectories/`（或 `$OUTPUT`）目录下，
+本项目不含任何内置上传端点或内置凭据。
+
+上传是 **opt-in** 的，需要你**同时**配置两个值才会启用：
+
+| 变量 | 作用 |
+| --- | --- |
+| `TRAJ_PLATFORM_URL` | 你自己的接收服务器地址 |
+| `TRAJ_UPLOAD_TOKEN` | 该服务器的上传凭据 |
+
+任一为空即禁用上传（判据见 `proxy.py` 的 `DataCollector.__init__`），
+未启用时日志会打印「上传未配置，数据仅保存在本地」。
+
+另有两个身份字段，**默认留空即不上报**，不会回退到你的系统用户名或主机名：
+
+| 变量 | 默认 |
+| --- | --- |
+| `TRAJ_USER_ID` | 空 |
+| `TRAJ_DEVICE_ID` | 空 |
+
+自检当前是否处于「只存本地」状态：
+
+```bash
+./install-daemon.sh status
+grep -E '上传未配置|可靠上传已启用' /tmp/claude-trace-proxy.log | tail -3
+```
+
+服务端协议（自建接收端所需）见 `docs/upload-protocol.md`。
 
 ---
 
@@ -92,10 +178,12 @@ Codex CLI
 ## 安装
 
 ```bash
-git clone <repo-url> claude-trace
+git clone https://github.com/njfuzrs/claude-trace.git
 cd claude-trace
-pip install -r requirements.txt   # 只需要 aiohttp
+pip3 install -r requirements.txt   # 只需要 aiohttp
 ```
+
+要求：macOS + Python 3.10 或更高。
 
 ---
 
@@ -343,12 +431,12 @@ UPSTREAM=https://your-proxy.com ./start.sh
 
 ## 渠道管理
 
-如果你需要在多个 API 渠道（公司账号、个人月卡等）之间切换，使用 `switch-channel.sh` 一键完成：
+如果你需要在多个 API 渠道（不同服务商、不同额度的账号等）之间切换，使用 `switch-channel.sh` 一键完成：
 
 ```bash
 ./switch-channel.sh list       # 列出所有可用渠道
-./switch-channel.sh company    # 切换到公司渠道
-./switch-channel.sh monthly    # 切换到个人月卡
+./switch-channel.sh default    # 切换到名为 default 的渠道
+./switch-channel.sh backup     # 切换到名为 backup 的渠道
 ./switch-channel.sh status     # 查看当前渠道
 ```
 
@@ -359,14 +447,14 @@ UPSTREAM=https://your-proxy.com ./start.sh
 ```json
 {
   "channels": {
-    "company": {
-      "name": "公司渠道",
+    "default": {
+      "name": "默认渠道",
       "token": "sk-xxx",
-      "upstream": "https://your-company-api.example.com",
+      "upstream": "https://api.anthropic.com",
       "force_thinking": 0
     },
-    "monthly": {
-      "name": "个人月卡",
+    "backup": {
+      "name": "备用渠道",
       "token": "sk-xxx",
       "upstream": "https://api.anthropic.com",
       "force_thinking": 1
@@ -500,10 +588,25 @@ trajectories/
 > `toolUseResult` 同样没有退出码字段。因此退出码在 `builder.py` 侧按上表推导，
 > 并用 `exit_code_source` 标明依据，供下游按可信度筛选。
 
-**安全说明：**
+**安全说明（请如实理解脱敏范围）：**
 
-- 所有 raw 文件中的 API Key 已自动脱敏（`Authorization: Bearer sk-***`）
-- 统一采集器默认绑定 `127.0.0.1`，不暴露到局域网
+- **已脱敏**：请求头中的 `x-api-key`、`authorization`、`proxy-authorization`
+  三个字段，落盘时截断为前 10 字符 + `***`（实现见 `proxy.py` 的
+  `SENSITIVE_HEADERS` / `sanitize_headers_for_storage`）。
+- 🔴 **未脱敏**：**消息体不做任何内容级过滤**。轨迹会原样记录完整对话，
+  因此如果你在对话里粘贴过 token、私钥、`.env` 内容或数据库连接串，
+  它们会**明文落盘**在 `raw.jsonl` / `session.traj` 里。
+- 分享或上传轨迹前请自查：
+
+  ```bash
+  # 在轨迹目录里粗筛常见凭据形态
+  grep -rlnE 'sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{12,}|AKIA[A-Z0-9]{12,}|BEGIN [A-Z ]*PRIVATE KEY' \
+    ./trajectories/sessions/ 2>/dev/null
+  ```
+
+- 内容级脱敏器（Scrubber）在路线图上，尚未实现。在它落地之前，
+  **请把轨迹目录当作与源码同等敏感的数据来对待。**
+- 统一采集器默认绑定 `127.0.0.1`，不暴露到局域网。
 
 ---
 

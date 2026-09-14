@@ -2,14 +2,15 @@
 # build/release.sh — 构建并打包发布
 #
 # 用法：
-#   ./build/release.sh                    # 构建当前架构并打包
-#   ./build/release.sh --upload           # 构建并上传到 GitLab Release
+#   ./build/release.sh                    # 构建当前架构并打包（不上传）
+#   ./build/release.sh --upload           # 构建并发布到 GitHub Releases
 #   ./build/release.sh --cross            # 尝试交叉编译双架构（需要 Rosetta）
 #
 # 环境变量：
-#   GITLAB_TOKEN    — GitLab API Token（--upload 时需要）
-#   GITLAB_URL      — GitLab 地址（默认 https://gitlab.example.com）
-#   GITLAB_PROJECT  — 项目路径（默认 zhourusheng/claude-trace）
+#   GH_REPO  — 目标仓库（默认 njfuzrs/claude-trace，fork 时覆盖此值）
+#
+# 鉴权：--upload 使用 gh CLI 自带鉴权，脚本内不持有任何 token。
+#   首次使用先执行：gh auth login
 
 set -euo pipefail
 
@@ -19,9 +20,7 @@ VERSION="$(cat "$ROOT/version")"
 ARCH="$(uname -m)"
 DIST_DIR="$ROOT/dist"
 
-GITLAB_URL="${GITLAB_URL:-https://gitlab.example.com}"
-GITLAB_PROJECT="${GITLAB_PROJECT:-zhourusheng/claude-trace}"
-GITLAB_TOKEN="${GITLAB_TOKEN:-}"
+GH_REPO="${GH_REPO:-njfuzrs/claude-trace}"
 
 DO_UPLOAD=false
 DO_CROSS=false
@@ -87,20 +86,19 @@ fi
 echo ""
 echo ">>> 生成发布版 install.sh ..."
 
-# 复制 install.sh 并填入 RELEASE_BASE
-INSTALL_RELEASE="$DIST_DIR/install.sh"
-cp "$ROOT/dist/install.sh" "$INSTALL_RELEASE"
+# 发布版 install.sh 脱离仓库运行（curl | bash），读不到仓库里的 version 文件，
+# 所以在这里把版本号固化进去，其 RELEASE_BASE 会指向对应 tag 的 assets。
+INSTALL_RELEASE="$DIST_DIR/install.sh.release"
+sed "s|^VERSION=\"\${VERSION:-.*\$|VERSION=\"\${VERSION:-${VERSION}}\"|" \
+    "$ROOT/dist/install.sh" > "$INSTALL_RELEASE"
 
-# 如果有 GitLab 配置，填入下载地址
-if [ -n "$GITLAB_URL" ] && [ -n "$GITLAB_PROJECT" ]; then
-    ENCODED_PROJECT=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$GITLAB_PROJECT', safe=''))")
-    RELEASE_URL="${GITLAB_URL}/api/v4/projects/${ENCODED_PROJECT}/packages/generic/claude-trace/${VERSION}"
-
-    # 替换 RELEASE_BASE 默认值
-    sed -i '' "s|^RELEASE_BASE=\"\${RELEASE_BASE:-}\"|RELEASE_BASE=\"\${RELEASE_BASE:-${RELEASE_URL}}\"|" "$INSTALL_RELEASE"
-    echo "  下载地址: $RELEASE_URL"
+if ! grep -q "^VERSION=\"\${VERSION:-${VERSION}}\"\$" "$INSTALL_RELEASE"; then
+    echo "错误：install.sh 的 VERSION 注入失败（上游格式已变？）"
+    exit 1
 fi
 
+RELEASE_URL="https://github.com/${GH_REPO}/releases/download/v${VERSION}"
+echo "  下载地址: $RELEASE_URL"
 echo "  install.sh: $INSTALL_RELEASE"
 
 # ─── 汇总 ───
@@ -113,67 +111,49 @@ for f in "${TARBALLS[@]}"; do
 done
 echo "  $INSTALL_RELEASE"
 
-# ─── 上传到 GitLab（可选） ───
+# ─── 发布到 GitHub Releases（可选） ───
 
 if [ "$DO_UPLOAD" = true ]; then
     echo ""
-    echo ">>> 上传到 GitLab ..."
+    echo ">>> 发布到 GitHub Releases ..."
 
-    if [ -z "$GITLAB_TOKEN" ]; then
-        echo "错误：需要设置 GITLAB_TOKEN 环境变量"
+    if ! command -v gh >/dev/null 2>&1; then
+        echo "错误：未找到 gh CLI，请先安装：brew install gh"
+        exit 1
+    fi
+    if ! gh auth status >/dev/null 2>&1; then
+        echo "错误：gh 未登录，请先执行：gh auth login"
         exit 1
     fi
 
-    ENCODED_PROJECT=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$GITLAB_PROJECT', safe=''))")
-    PACKAGE_URL="${GITLAB_URL}/api/v4/projects/${ENCODED_PROJECT}/packages/generic/claude-trace/${VERSION}"
+    # asset 名固定为 install.sh（gh 的 path#label 语法），保证 curl | bash 地址稳定
+    ASSETS=("${TARBALLS[@]}" "${INSTALL_RELEASE}#install.sh")
 
-    # 上传 tarballs
-    for tarball in "${TARBALLS[@]}"; do
-        FILENAME="$(basename "$tarball")"
-        echo "  上传 $FILENAME ..."
-        curl --fail --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-            --upload-file "$tarball" \
-            "${PACKAGE_URL}/${FILENAME}"
-        echo "  ✅ $FILENAME"
-    done
+    NOTES="claude-trace v${VERSION}
 
-    # 上传 install.sh
-    echo "  上传 install.sh ..."
-    curl --fail --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-        --upload-file "$INSTALL_RELEASE" \
-        "${PACKAGE_URL}/install.sh"
-    echo "  ✅ install.sh"
+安装：
+\`\`\`bash
+curl -fsSL ${RELEASE_URL}/install.sh | bash
+\`\`\`"
+
+    if gh release view "v${VERSION}" --repo "$GH_REPO" >/dev/null 2>&1; then
+        echo "  Release v${VERSION} 已存在，上传/覆盖 assets ..."
+        gh release upload "v${VERSION}" "${ASSETS[@]}" --repo "$GH_REPO" --clobber
+    else
+        echo "  创建 Release v${VERSION} ..."
+        gh release create "v${VERSION}" "${ASSETS[@]}" \
+            --repo "$GH_REPO" \
+            --title "v${VERSION}" \
+            --notes "$NOTES"
+    fi
 
     echo ""
-    echo "=== 上传完成 ==="
+    echo "=== 发布完成 ==="
     echo ""
     echo "安装命令："
-    echo "  curl -fsSL ${PACKAGE_URL}/install.sh | bash"
-
-    # 创建 GitLab Release（可选）
-    echo ""
-    echo "创建 Release tag v${VERSION} ..."
-    curl --fail --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-        --header "Content-Type: application/json" \
-        --data "{
-            \"name\": \"v${VERSION}\",
-            \"tag_name\": \"v${VERSION}\",
-            \"description\": \"claude-trace v${VERSION}\n\n安装：\n\`\`\`bash\ncurl -fsSL ${PACKAGE_URL}/install.sh | bash\n\`\`\`\",
-            \"assets\": {
-                \"links\": [
-                    {\"name\": \"install.sh\", \"url\": \"${PACKAGE_URL}/install.sh\"},
-                    $(printf '{\"name\": \"%s\", \"url\": \"%s/%s\"}' "$(basename "${TARBALLS[0]}")" "$PACKAGE_URL" "$(basename "${TARBALLS[0]}")")
-                ]
-            }
-        }" \
-        "${GITLAB_URL}/api/v4/projects/${ENCODED_PROJECT}/releases" 2>/dev/null || {
-            echo "  ⚠️  Release 创建失败（可能已存在），请手动创建"
-        }
-
-    echo ""
-    echo "✅ 发布完成！"
+    echo "  curl -fsSL ${RELEASE_URL}/install.sh | bash"
 else
     echo ""
-    echo "提示：添加 --upload 参数可自动上传到 GitLab"
-    echo "  GITLAB_TOKEN=<token> ./build/release.sh --upload"
+    echo "提示：添加 --upload 参数可发布到 GitHub Releases（需先 gh auth login）"
+    echo "  ./build/release.sh --upload"
 fi

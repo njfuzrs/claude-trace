@@ -805,6 +805,8 @@ class DataCollector:
             logger.info("可靠上传已启用: %s", upload_url)
         else:
             self._uploader = None
+            # 上传默认关闭：TRAJ_PLATFORM_URL 与 TRAJ_UPLOAD_TOKEN 两者皆非空才启用
+            logger.info("上传未配置，数据仅保存在本地: %s", self.sessions_dir)
 
     def _session_dir(self, session_id: str) -> Path:
         """获取会话目录，按需创建"""

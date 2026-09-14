@@ -18,7 +18,6 @@ import hashlib
 import json
 import logging
 import os
-import platform
 import shutil
 import time
 from dataclasses import dataclass, field, asdict
@@ -56,22 +55,21 @@ class UploadQueueItem:
 # ─────────────────────────────────────────────
 
 def _get_user_id() -> str:
-    """获取用户标识：环境变量 > os.getlogin() > unknown"""
-    uid = os.environ.get("TRAJ_USER_ID", "").strip()
-    if uid:
-        return uid
-    try:
-        return os.getlogin()
-    except OSError:
-        return "unknown"
+    """获取用户标识：只认 TRAJ_USER_ID，未配置即留空。
+
+    刻意不回退到系统登录名：它常含真实姓名，
+    而这个值会作为 form 字段随每条轨迹上传。不配置就不上报。
+    """
+    return os.environ.get("TRAJ_USER_ID", "").strip()
 
 
 def _get_device_id() -> str:
-    """获取设备标识：环境变量 > hostname"""
-    did = os.environ.get("TRAJ_DEVICE_ID", "").strip()
-    if did:
-        return did
-    return platform.node() or "unknown"
+    """获取设备标识：只认 TRAJ_DEVICE_ID，未配置即留空。
+
+    刻意不回退到主机名：它常含真实姓名与资产编号，
+    理由同 _get_user_id()。
+    """
+    return os.environ.get("TRAJ_DEVICE_ID", "").strip()
 
 
 def compress_and_hash(filepath: Path) -> tuple:
