@@ -14,10 +14,12 @@ trace_agent.py — 统一采集入口
 
 import argparse
 import asyncio
+import functools
 import logging
 import os
 import shutil
 import signal
+import sys
 import threading
 from pathlib import Path
 
@@ -25,7 +27,13 @@ from aiohttp import web
 
 from builder import save_trajectory
 from import_codex import CodexImporter, CodexRolloutWatcher
-from proxy import DataCollector, SessionManager, _log_task_exception, create_app
+from proxy import (
+    DataCollector,
+    SessionManager,
+    _log_task_exception,
+    create_app,
+    print_upload_status,
+)
 from uploader import UploadManager
 
 logger = logging.getLogger("claude-trace")
@@ -40,7 +48,14 @@ def parse_args():
     parser.add_argument("--host", default="127.0.0.1", help="Claude 代理监听地址")
     parser.add_argument("--output", default="./trajectories", help="轨迹数据输出目录")
     parser.add_argument("--upstream", default="https://api.anthropic.com", help="Claude 上游 API 地址")
-    parser.add_argument("--session-timeout", type=int, default=300, help="Claude 会话超时时间（秒）")
+    # 默认 1800s（30 分钟），与 proxy.py 保持一致。
+    # 300s 太激进：思考/开会超过 5 分钟会话就被判过期清理，再提问时新建
+    # Session、index 从 1 重来，轨迹被短版本覆盖（实测 140 个会话因此损坏）。
+    parser.add_argument("--session-timeout", type=int, default=1800, help="Claude 会话超时时间（秒）")
+    parser.add_argument(
+        "--upload-status", action="store_true",
+        help="打印上传积压状态后退出（不启动采集器）。用于排查上传是否静默失效。",
+    )
     parser.add_argument(
         "--events-dir",
         default=str(Path.home() / ".claude" / "trajectory_events"),
@@ -134,13 +149,27 @@ async def _graceful_flush_proxy(app, runner, output_dir: Path):
         if not session.is_subagent and (session.pairs or session.child_sessions):
             pairs_snapshot = list(session.pairs)
             children_snapshot = DataCollector._snapshot_children(session)
-            traj_path, traj = collector._build_traj_data(session, pairs_snapshot, children_snapshot)
+            # 复活会话从 raw.jsonl 重建，否则落盘的是被截断的短轨迹
+            traj_path, traj = (None, None)
+            if session.revived:
+                traj_path, traj = collector._rebuild_traj_from_raw(session, children_snapshot)
+            if traj is None:
+                traj_path, traj = collector._build_traj_data(
+                    session, pairs_snapshot, children_snapshot,
+                )
             if traj_path and traj:
+                # allow_shrink=False：拒绝用更短的轨迹覆盖盘上已有版本
+                saver = functools.partial(save_trajectory, allow_shrink=False)
                 try:
-                    future = loop.run_in_executor(None, save_trajectory, traj_path, traj)
+                    future = loop.run_in_executor(None, saver, traj_path, traj)
                     pending_futures.append(future)
                 except RuntimeError:
-                    save_trajectory(traj_path, traj)
+                    saver(traj_path, traj)
+            # events 也要落到会话目录，否则补传上去的会话缺 events.jsonl
+            try:
+                collector._copy_events_to_session(session.id)
+            except Exception as e:
+                logger.debug("优雅退出复制 events 失败 %s: %s", session.id[:8], e)
             total = len(session.pairs) + sum(len(c.pairs) for c in session.child_sessions)
             logger.info("优雅退出导出: %s | 步骤=%d", session.id[:8], total)
 
@@ -160,6 +189,11 @@ async def main():
         logging.getLogger().setLevel(logging.DEBUG)
 
     output_dir = Path(args.output).expanduser()
+
+    # 纯查询：打印积压后退出，不启动采集器、也不创建目录
+    if args.upload_status:
+        sys.exit(print_upload_status(output_dir))
+
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "sessions").mkdir(parents=True, exist_ok=True)
 
@@ -205,11 +239,27 @@ async def main():
     watcher_thread = None
     codex_uploader = await _start_codex_uploader(output_dir)
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    received_signal: list[str] = []
+
+    def _on_signal(signame: str):
+        if received_signal:
+            # 第二次收到信号：用户在催，立即硬退出
+            logger.warning("再次收到 %s，立即退出（跳过收尾）", signame)
+            os._exit(1)
+        received_signal.append(signame)
+        logger.info("收到 %s，开始优雅退出…", signame)
+        stop_event.set()
+
+    # SIGHUP 也要接：关终端 / SSH 断连时它的默认处置同样是终止进程，
+    # 不注册就会跳过 finally 里的落盘。
+    for signame in ("SIGTERM", "SIGINT", "SIGHUP"):
+        sig = getattr(signal, signame, None)
+        if sig is None:  # 平台不支持（如 Windows 没有 SIGHUP）
+            continue
         try:
-            loop.add_signal_handler(sig, stop_event.set)
-        except NotImplementedError:
-            pass
+            loop.add_signal_handler(sig, functools.partial(_on_signal, signame))
+        except (NotImplementedError, RuntimeError) as e:
+            logger.debug("注册 %s 处理器失败: %s", signame, e)
 
     if args.codex_watch:
         enabled, reason = _codex_available(args)

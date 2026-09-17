@@ -10,22 +10,26 @@ claude-trace proxy.py — HTTP 代理服务器
 
 import argparse
 import asyncio
+import functools
 import hashlib
 import json
 import logging
 import os
 import re
+import signal
+import sys
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import aiohttp
 from aiohttp import web
 
 from builder import (
     SessionMetadata,
+    _traj_step_count,
     apply_hook_events_to_metadata,
     build_trajectory,
     save_trajectory,
@@ -209,6 +213,12 @@ class Session:
     # 脏工作区更无从得知，而脏工作区意味着 HEAD 不代表真实起点。
     git_state: Dict = field(default_factory=dict)
     git_state_end: Dict = field(default_factory=dict)
+    # 会话复活标记：该 session_id 的目录里已有上一轮 incarnation 落盘的 raw.jsonl。
+    # 触发场景是超时清理后用户又提问 —— 代理新建了一个 pairs 为空的 Session，
+    # 但盘上的历史仍在。prior_pair_count 让 index 接着往下排而不是从 1 重来，
+    # revived 则让最终导出走「从 raw.jsonl 重建」以拿回完整轨迹。
+    revived: bool = False
+    prior_pair_count: int = 0
 
     def update_activity(self):
         self.last_activity = datetime.now().isoformat()
@@ -796,11 +806,29 @@ class DataCollector:
         upload_url = os.environ.get("TRAJ_PLATFORM_URL", "").strip()
         upload_token = os.environ.get("TRAJ_UPLOAD_TOKEN", "").strip()
         if upload_url and upload_token:
-            cleanup_env = os.environ.get("TRAJ_CLEANUP_AFTER_UPLOAD", "true").strip().lower()
+            # 默认 "false"：不配置就保留本地数据（见下方 cleanup_after_upload）
+            cleanup_env = os.environ.get("TRAJ_CLEANUP_AFTER_UPLOAD", "false").strip().lower()
+            backfill_env = os.environ.get("TRAJ_BACKFILL_ON_START", "true").strip().lower()
+            # 默认保留本地数据。
+            #
+            # 老默认值是 "true"（上传成功即删本地），后果是「上传成功」这个
+            # 判断一旦有偏差，数据就没了第二份 —— 而 409 幂等 bug 恰恰会把
+            # 「服务端拒绝覆盖」也算成成功。实测 7247 个会话目录只剩一个
+            # .uploaded 标记，其中 1786 个是真实主会话，本地已无法重建。
+            # 删数据必须是显式选择，不能是默认行为。
+            cleanup_after_upload = cleanup_env == "true"
+            if cleanup_after_upload:
+                logger.warning(
+                    "TRAJ_CLEANUP_AFTER_UPLOAD=true：上传成功后将删除本地数据，"
+                    "云端将是唯一副本",
+                )
             self._uploader: Optional[UploadManager] = UploadManager(
                 upload_url=upload_url,
                 upload_token=upload_token,
-                cleanup_after_upload=(cleanup_env != "false"),
+                cleanup_after_upload=cleanup_after_upload,
+                # 启动补传需要知道去哪儿扫：上传链路的兜底，见 _backfill_loop
+                sessions_dir=self.sessions_dir,
+                backfill_enabled=(backfill_env != "false"),
             )
             logger.info("可靠上传已启用: %s", upload_url)
         else:
@@ -813,6 +841,22 @@ class DataCollector:
         d = self.sessions_dir / session_id
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    def _count_raw_records(self, session_id: str) -> int:
+        """数 raw.jsonl 已落盘的记录数（会话复活检测用）
+
+        只数行不解析 JSON：这是每个 Session 首个请求路径上的同步调用，
+        必须够快。raw.jsonl 每行一条记录，行数即历史轮数。
+        """
+        raw_path = self.sessions_dir / session_id / "raw.jsonl"
+        if not raw_path.exists():
+            return 0
+        try:
+            with raw_path.open("rb") as f:
+                return sum(1 for line in f if line.strip())
+        except OSError as e:
+            logger.debug("统计 raw.jsonl 行数失败 %s: %s", session_id[:8], e)
+            return 0
 
     def record_request(
         self,
@@ -832,11 +876,30 @@ class DataCollector:
             session.model = request_body["model"]
             logger.info("从 API 请求补全 model: %s (session=%s)", session.model, session.id[:8])
 
+        # 会话复活检测：仅在本 Session 的首个请求时做一次盘上探测。
+        # 超时清理会销毁 Session 对象但保留目录，用户隔一会儿再提问就会新建
+        # 一个 pairs 为空的 Session。不认这段历史的话 index 会从 1 重来，
+        # traj 被短轨迹覆盖（见 save_trajectory 的 allow_shrink）。
+        if not session.pairs and not session.is_subagent and not session.revived:
+            prior = self._count_raw_records(session.id)
+            if prior > 0:
+                session.revived = True
+                session.prior_pair_count = prior
+                # 复活后的首个请求带着完整历史，但内存里没有 prev_hashes 做基线，
+                # 所以 new_messages 就是整段历史。不打 replay 标记的话 builder 会
+                # 把复活前已记录过的 user 消息又写一遍进 history。
+                is_full_replay = True
+                logger.info(
+                    "会话复活: %s 盘上已有 %d 轮，index 从 %d 续排",
+                    session.id[:8], prior, prior + 1,
+                )
+
         # P0 #1: 在 append 之前分配序号。
         # 安全假设：record_request 是同步方法，aiohttp 单线程事件循环中
         # 两个 await 点之间不会被打断，因此无需加锁。
         # 如果未来改为 async，需要引入 asyncio.Lock 保护。
-        idx = len(session.pairs) + 1
+        # 复活会话从 prior_pair_count 之后续排，避免 raw.jsonl 里出现重复 index。
+        idx = session.prior_pair_count + len(session.pairs) + 1
 
         pair = RequestResponsePair(
             timestamp=datetime.now().isoformat(),
@@ -900,7 +963,9 @@ class DataCollector:
     def _build_traj_data(
         self,
         session: Session,
-        pairs_snapshot: List[RequestResponsePair],
+        # Sequence 而非 List：复活重建走 merger 的 _AdaptedPair，
+        # 与 RequestResponsePair 结构兼容但不同名（builder 只按属性取值）。
+        pairs_snapshot: Sequence[Any],
         children_snapshot: Optional[List[tuple]] = None,
     ) -> tuple:
         """构建 traj 数据，合并子会话数据，读取 hook events 丰富 metadata。
@@ -1013,6 +1078,36 @@ class DataCollector:
             for child in session.child_sessions
         ]
 
+    def _rebuild_traj_from_raw(
+        self, session: Session, children_snapshot: Optional[List[tuple]] = None,
+    ) -> tuple:
+        """从 raw.jsonl 重建完整轨迹（复活会话的最终导出用）
+
+        在线程池中执行：读整个 raw.jsonl + 重建可能较慢（实测最大 766MB）。
+        复用 merger 的加载器，保证与 rebuild_trajs.py 的重建口径一致。
+
+        子会话的 pair 只存在于内存、从未单独落盘到 raw.jsonl，所以重建后
+        仍要把 children_snapshot 合并进来。
+
+        失败返回 (None, None)，调用方退回内存快照。
+        """
+        raw_path = self.sessions_dir / session.id / "raw.jsonl"
+        if not raw_path.exists():
+            return None, None
+        try:
+            from merger import _adapt_raw_pair, load_raw_pairs_from_jsonl
+
+            raw_pairs = load_raw_pairs_from_jsonl(raw_path)
+            if not raw_pairs:
+                return None, None
+            adapted = [_adapt_raw_pair(p, i + 1) for i, p in enumerate(raw_pairs)]
+        except Exception as e:
+            logger.warning("重建 %s 的 raw.jsonl 失败: %s", session.id[:8], e)
+            return None, None
+
+        # 走与常规导出相同的构建路径，metadata / 子会话合并逻辑完全一致
+        return self._build_traj_data(session, adapted, children_snapshot)
+
     def export_session(self, session: Session):
         """导出会话的 .traj 文件（同步版本，用于优雅退出等非 async 上下文）
 
@@ -1061,11 +1156,33 @@ class DataCollector:
         # 在事件循环线程中创建所有快照（线程安全）
         pairs_snapshot = list(session.pairs)
         children_snapshot = self._snapshot_children(session)
-        traj_path, traj = self._build_traj_data(session, pairs_snapshot, children_snapshot)
+        loop = asyncio.get_running_loop()
+
+        # 复活会话的最终导出：内存里只有复活后那一段 pairs，直接建出来的 traj
+        # 会丢掉复活前的全部历史。raw.jsonl 是 append 写入、历史完整，
+        # 所以最终导出改为从盘上重建，拿回整条轨迹。
+        traj = None
+        traj_path = None
+        if is_final and session.revived:
+            traj_path, traj = await loop.run_in_executor(
+                None, self._rebuild_traj_from_raw, session, children_snapshot,
+            )
+            if traj is None:
+                logger.warning(
+                    "复活会话从 raw.jsonl 重建失败，退回内存快照: %s", session.id[:8],
+                )
+
+        if traj is None:
+            traj_path, traj = self._build_traj_data(session, pairs_snapshot, children_snapshot)
+
         if traj_path and traj:
             try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, save_trajectory, traj_path, traj)
+                # allow_shrink=False：拒绝用更短的轨迹覆盖盘上已有的版本，
+                # 兜住复活重建失败退回内存快照的场景。
+                await loop.run_in_executor(
+                    None, functools.partial(save_trajectory, allow_shrink=False),
+                    traj_path, traj,
+                )
             except Exception as e:
                 logger.warning("异步导出 .traj 失败: %s", e)
                 traj_path = None  # 导出失败，不触发上传
@@ -1148,7 +1265,10 @@ class DataCollector:
         if not session.is_subagent:
             traj_path, traj = self._build_traj_data(session, pairs_snapshot, children_snapshot)
             if traj_path and traj:
-                save_trajectory(traj_path, traj)
+                # allow_shrink=False：复活会话的内存快照只含复活后那一段，
+                # 每轮增量写都会试图用短轨迹覆盖盘上的完整版本。
+                # 闸门挡住之后，完整轨迹在最终导出时由 raw.jsonl 重建。
+                save_trajectory(traj_path, traj, allow_shrink=not session.revived)
 
     @staticmethod
     def _collect_missing_tool_results(
@@ -1640,16 +1760,45 @@ async def handle_session_event(request: web.Request) -> web.Response:
 
 
 async def handle_health(request: web.Request) -> web.Response:
-    """健康检查端点，供 start.sh 等外部脚本探测代理是否就绪"""
+    """健康检查端点，供 start.sh 等外部脚本探测代理是否就绪
+
+    同时暴露上传积压 —— 上传静默失效时，这里是唯一能看出来的地方。
+    """
     session_manager: SessionManager = request.app["session_manager"]
+    collector: DataCollector = request.app["collector"]
+
+    payload = {
+        "status": "ok",
+        "active_sessions": len(session_manager.active_sessions),
+        "pending_sessions": len(session_manager._pending_sessions),
+    }
+
+    uploader = collector._uploader
+    if uploader is None:
+        payload["upload"] = {"enabled": False}
+    else:
+        loop = asyncio.get_running_loop()
+        try:
+            pending = await loop.run_in_executor(None, uploader.scan_pending_sessions)
+            pending_count = len(pending)
+        except Exception as e:
+            logger.debug("健康检查扫描积压失败: %s", e)
+            pending_count = -1
+        queue = uploader.queue_stats()
+        payload["upload"] = {
+            "enabled": True,
+            "server_healthy": uploader.server_healthy,
+            # 说后果不说现象：这个数字的含义是「这么多会话的轨迹还没上云」
+            "sessions_not_uploaded": pending_count,
+            "queue": queue,
+        }
+        if pending_count > 20 or queue.get("oversize") or queue.get("failed"):
+            payload["status"] = "degraded"
+
     return web.Response(
         status=200,
         content_type="application/json",
-        text=json.dumps({
-            "status": "ok",
-            "active_sessions": len(session_manager.active_sessions),
-            "pending_sessions": len(session_manager._pending_sessions),
-        }),
+        text=json.dumps(payload),
     )
 
 
@@ -1722,7 +1871,18 @@ def parse_args():
         default="https://api.anthropic.com",
         help="上游 API 地址",
     )
-    parser.add_argument("--session-timeout", type=int, default=300, help="会话超时时间（秒）")
+    # 默认 1800s（30 分钟），不是 300s。
+    #
+    # 300s 太激进：用户开个会、看会儿文档、思考五分钟，会话就被判过期清理掉，
+    # 再提问时新建 Session、index 从 1 重来，于是轨迹被截断（实测 140 个会话
+    # 因此损坏，最严重的一个在 7 小时里被切成 28 段）。复活逻辑现在能兜住，
+    # 但把窗口放宽到 30 分钟能从根上少踩这条路径。
+    # 代价只是内存里多留会话对象一会儿，可忽略。
+    parser.add_argument("--session-timeout", type=int, default=1800, help="会话超时时间（秒）")
+    parser.add_argument(
+        "--upload-status", action="store_true",
+        help="打印上传积压状态后退出（不启动代理）。用于排查上传是否静默失效。",
+    )
     parser.add_argument(
         "--events-dir",
         default=str(Path.home() / ".claude" / "trajectory_events"),
@@ -1740,6 +1900,58 @@ def parse_args():
     return parser.parse_args()
 
 
+def print_upload_status(output_dir: Path) -> int:
+    """打印上传积压状态（--upload-status），返回进程退出码
+
+    存在的理由：上传静默失效时，唯一能看出来的地方就是「多少会话还没上云」。
+    sid-code 的 52 个会话一次都没传上去而无人发现，正是因为没有任何地方
+    能一眼看到这个数字。
+    """
+    sessions_dir = output_dir / "sessions"
+    if not sessions_dir.is_dir():
+        print(f"sessions 目录不存在: {sessions_dir}")
+        return 1
+
+    url = os.environ.get("TRAJ_PLATFORM_URL", "").strip()
+    token = os.environ.get("TRAJ_UPLOAD_TOKEN", "").strip()
+    print(f"数据目录: {sessions_dir}")
+    if not url or not token:
+        print("上传: 未配置（TRAJ_PLATFORM_URL / TRAJ_UPLOAD_TOKEN 为空）")
+        print("      数据仅保存在本地。")
+        return 0
+
+    mgr = UploadManager(
+        upload_url=url, upload_token=token,
+        cleanup_after_upload=False,
+        sessions_dir=sessions_dir, backfill_enabled=False,
+    )
+    pending = mgr.scan_pending_sessions()
+    queue = mgr.queue_stats()
+
+    total = sum(1 for d in sessions_dir.iterdir() if d.is_dir())
+    uploaded = sum(1 for d in sessions_dir.iterdir() if (d / ".uploaded").exists())
+
+    print(f"上传目标: {url}")
+    print()
+    print(f"会话目录总数        : {total}")
+    print(f"已确认上云          : {uploaded}")
+    print(f"轨迹仍未上云        : {len(pending)}")
+    print()
+    print(f"重试队列            : 共 {queue['total']} 项 "
+          f"(待重试 {queue['pending']} / 重试到死 {queue['failed']} / 过大 {queue['oversize']})")
+
+    if pending:
+        print("\n未上云的会话（最近 15 个）:")
+        for d in pending[:15]:
+            steps = _traj_step_count(d / "session.traj")
+            print(f"  {d.name[:8]}  {steps:>5} 步")
+    if queue["failed"] or queue["oversize"]:
+        print("\n⚠️  队列里有终态项，本地数据仍在，可用 recover_truncated.py 排查")
+    if not pending and not queue["total"]:
+        print("\n✅ 没有积压")
+    return 0
+
+
 async def main():
     args = parse_args()
 
@@ -1747,6 +1959,10 @@ async def main():
         logging.getLogger().setLevel(logging.DEBUG)
 
     output_dir = Path(args.output)
+
+    if args.upload_status:
+        sys.exit(print_upload_status(output_dir))
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     app = await create_app(
@@ -1787,27 +2003,71 @@ async def main():
     cleanup_task = asyncio.create_task(cleanup_loop())
     cleanup_task.add_done_callback(_log_task_exception)
 
+    # 信号处理：SIGTERM / SIGHUP / SIGINT 都要走完 finally 里的优雅退出。
+    #
+    # 修复前只 catch KeyboardInterrupt —— 而 SIGTERM 的默认处置是直接终止进程，
+    # finally 一行都不执行：活跃会话的最终导出、上传队列持久化全部跳过。
+    # 偏偏 install-daemon.sh 的 restart 用的是 `launchctl kickstart -k`，
+    # 那正是 SIGTERM，也就是文档推荐的恢复动作本身在丢数据。
+    # SIGHUP 同样要接（关终端 / SSH 断连），它的默认处置也是终止。
+    stop_event = asyncio.Event()
+    received_signal: List[str] = []
+
+    def _on_signal(signame: str):
+        if received_signal:
+            # 第二次收到信号：用户在催，立即硬退出
+            logger.warning("再次收到 %s，立即退出（跳过收尾）", signame)
+            os._exit(1)
+        received_signal.append(signame)
+        logger.info("收到 %s，开始优雅退出…", signame)
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for signame in ("SIGTERM", "SIGINT", "SIGHUP"):
+        sig = getattr(signal, signame, None)
+        if sig is None:  # 平台不支持（如 Windows 没有 SIGHUP）
+            continue
+        try:
+            loop.add_signal_handler(sig, functools.partial(_on_signal, signame))
+        except (NotImplementedError, RuntimeError) as e:
+            logger.debug("注册 %s 处理器失败: %s", signame, e)
+
     try:
-        # 等待直到 Ctrl+C
-        await asyncio.Event().wait()
+        await stop_event.wait()
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
         cleanup_task.cancel()
-        # 优雅退出：同步构建所有 traj 数据，然后等待写入完成
+        # 优雅退出：只做「快」的事 —— 把内存里的会话落盘。
+        #
+        # 刻意不在这里等上传（sid-code 的教训：上传挂在退出关键路径上，
+        # 进程一退 fetch 就被杀在半路，于是一次都没成功过）。落盘实测约 30ms，
+        # 上传要秒级；未上传的会话交给下次启动的补传扫描兜底。
         pending_futures = []
-        loop = asyncio.get_running_loop()
         for _sid, session in list(session_manager.active_sessions.items()):
             if not session.is_subagent and (session.pairs or session.child_sessions):
                 pairs_snapshot = list(session.pairs)
                 children_snapshot = DataCollector._snapshot_children(session)
-                traj_path, traj = collector._build_traj_data(session, pairs_snapshot, children_snapshot)
+                # 复活会话从 raw.jsonl 重建，避免落盘一份被截断的短轨迹
+                traj_path, traj = (None, None)
+                if session.revived:
+                    traj_path, traj = collector._rebuild_traj_from_raw(session, children_snapshot)
+                if traj is None:
+                    traj_path, traj = collector._build_traj_data(
+                        session, pairs_snapshot, children_snapshot,
+                    )
                 if traj_path and traj:
+                    saver = functools.partial(save_trajectory, allow_shrink=False)
                     try:
-                        future = loop.run_in_executor(None, save_trajectory, traj_path, traj)
+                        future = loop.run_in_executor(None, saver, traj_path, traj)
                         pending_futures.append(future)
                     except RuntimeError:
-                        save_trajectory(traj_path, traj)
+                        saver(traj_path, traj)
+                # events 也要落到会话目录，否则补传上去的会话缺 events.jsonl
+                try:
+                    collector._copy_events_to_session(session.id)
+                except Exception as e:
+                    logger.debug("优雅退出复制 events 失败 %s: %s", session.id[:8], e)
                 total = len(session.pairs) + sum(len(c.pairs) for c in session.child_sessions)
                 logger.info("优雅退出导出: %s | 步骤=%d", session.id[:8], total)
         # 等待所有写入完成后再 cleanup
