@@ -37,6 +37,9 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 ├── collector.py        # Hooks 采集脚本，部署到 ~/.claude/hooks/
 ├── setup_hooks.py      # 自动配置 settings.json 的 hooks
 ├── merger.py           # 双通道数据合并器（代理 + Hooks）
+├── uploader.py         # 可靠上传管理器（gzip + SHA256 + 重试队列 + 启动补传）
+├── rebuild_trajs.py    # 用当前 builder 重建历史 .traj
+├── recover_truncated.py # 历史数据修复（复活截断重建 / 超大 traj 无损去重 / 重传）
 ├── filter_trajs.py     # 轨迹过滤器
 ├── convert_trajs.py    # 格式转换（.traj → SFT .jsonl）
 ├── combine_trajs.py    # 合并 + shuffle SFT 数据
@@ -179,6 +182,28 @@ python3 viewer.py trajectories/traj/   # 目录索引模式
 | `UPSTREAM` | `https://api.anthropic.com` | 上游 API 地址 |
 | `OUTPUT` | `./trajectories` | 轨迹数据输出目录 |
 | `FORCE_THINKING` | 0 | 非 0 时强制 thinking effort=max |
+| `TRAJ_PLATFORM_URL` | 空 | 上传目标；与 token 两者皆非空才启用上传 |
+| `TRAJ_UPLOAD_TOKEN` | 空 | 上传凭据 |
+| `TRAJ_USER_ID` / `TRAJ_DEVICE_ID` | 空 | 身份字段，留空即不上报（不回退到系统用户名/主机名） |
+| `TRAJ_CLEANUP_AFTER_UPLOAD` | `false` | 上传成功后是否删本地。**默认保留**，只有显式 `true` 才删 |
+| `TRAJ_BACKFILL_ON_START` | `true` | 启动时补传盘上未上云的会话（上传链路的兜底） |
+
+## 上传链路的三条铁律
+
+这三条都是踩过坑换来的，改动上传相关代码前先读：
+
+1. **上传不能挂在退出关键路径上。** 退出时只做落盘（约 30ms），上传交给
+   启动补传兜底。sid-code 的教训：上传挂在 SessionEnd、退出预算 1.2s 而
+   上传要 10s，结果 52 个会话一次都没传上去，且无人发现。
+2. **不能只有一个触发点。** 触发器（hook 通知 / 超时清理 / 优雅退出）都可能
+   不灵，所以必须有启动补传按磁盘现状兜底：目录在、traj 非空、`.uploaded` 缺
+   → 补传。判据不依赖内存状态，也不依赖重试队列（队列文件本身可能丢）。
+3. **告警要说后果，不说现象。** 说「N 个会话的轨迹仍未上云」，不说
+   「N 个会话未正常收尾」。后者是正确的现象描述，但省掉了后果，
+   于是唯一的线索被当成背景噪音 —— sid-code 就是这么错过的。
+
+自检：`python3 trace_agent.py --output <dir> --upload-status`（proxy.py 亦可），
+或 `curl -s localhost:4000/_internal/health | python3 -m json.tool`。
 
 ## 数据目录
 

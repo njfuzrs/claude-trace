@@ -126,12 +126,36 @@ python3 viewer.py ./trajectories/sessions/<id>/session.traj   # 可视化查看�
 | `TRAJ_USER_ID` | 空 |
 | `TRAJ_DEVICE_ID` | 空 |
 
+行为开关：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `TRAJ_CLEANUP_AFTER_UPLOAD` | `false` | 上传成功后是否删除本地数据。**默认保留** —— 只有显式设为 `true` 才删。曾经默认 `true`，结果「上传成功」的判断一旦有偏差，数据就没了第二份 |
+| `TRAJ_BACKFILL_ON_START` | `true` | 启动时扫描并补传盘上未上云的会话。这是上传链路的兜底，不建议关 |
+
 自检当前是否处于「只存本地」状态：
 
 ```bash
 ./install-daemon.sh status
 grep -E '上传未配置|可靠上传已启用' /tmp/claude-trace-proxy.log | tail -3
 ```
+
+排查上传是否静默失效（关键：看「轨迹仍未上云」这个数字）：
+
+```bash
+# 打印积压状态后退出，不启动采集器（两个入口都支持，输出一致）
+python3 trace_agent.py --output ~/.claude-trace/trajectories --upload-status
+
+# 打包部署的场景用二进制查
+~/.claude-trace/bin/claude-trace-proxy \
+    --output ~/.claude-trace/trajectories --upload-status
+
+# 采集器在跑时也可以直接查
+curl -s http://127.0.0.1:4000/_internal/health | python3 -m json.tool
+```
+
+积压不为 0 且长期不降，说明上传链路有问题 —— 数据还在本地，用
+`recover_truncated.py` 排查修复（见下文「历史数据修复」）。
 
 服务端协议（自建接收端所需）见 `docs/upload-protocol.md`。
 
@@ -370,7 +394,8 @@ trajectories/sessions/{thread_id}/
 | `--host` | 127.0.0.1 | 监听地址（默认只监听本地，防止局域网访问） |
 | `--output` | ./trajectories | 轨迹数据输出目录 |
 | `--upstream` | https://api.anthropic.com | 上游 API 地址 |
-| `--session-timeout` | 300 | 会话超时时间（秒），超时后自动导出 .traj |
+| `--session-timeout` | 1800 | 会话超时时间（秒），超时后自动导出 .traj。默认 30 分钟：设太短（曾是 300s）会让「思考几分钟再提问」被判为过期，新建会话时 index 从 1 重来，轨迹被截断 |
+| `--upload-status` | - | 打印上传积压状态后退出，不启动采集器。用于排查上传是否静默失效 |
 | `--save-raw` | true | 保存原始请求/响应 JSON 文件 |
 | `--no-save-raw` | - | 只保留 JSONL + .traj，不保存单独的 JSON 文件 |
 | `--events-dir` | ~/.claude/trajectory_events | Hooks 事件数据目录 |
@@ -637,6 +662,38 @@ python3 rebuild_trajs.py --dir trajectories/sessions --quarantine-garbage
 含 sub-agent 子会话的会话会被自动跳过：子会话的 pair 只在导出时合并进
 `session.traj`，从未单独落盘到 `raw.jsonl`，重建会丢数据。新采集的会话不受影响。
 
+### 历史数据修复：会话复活截断 + 超大 traj
+
+`recover_truncated.py` 修的是两类历史损坏，都可重复运行、可先 `--dry-run`：
+
+**一、会话复活截断。** 早期 `--session-timeout` 默认 300s，用户思考/开会超过
+5 分钟，会话就被判过期清理；再提问时代理新建一个空 Session，`index` 从 1 重来，
+而 `save_trajectory` 是覆盖写 —— 几小时的完整轨迹被只含最后几步的短轨迹冲掉，
+且那份残缺版本还先上传过一次，被服务端 409 幂等锁死在云端。
+`raw.jsonl` 是 append 写入、历史完好，所以全部可重建。
+
+**二、超大 traj 传不上云。** 老版 builder 把 user message 里的 `tool_result`
+原样留在 history，而 Claude Code 每轮重发完整历史 —— 同一个 `tool_result`
+被写进 history 几百次。实测一个会话 42105 条 history 只有 2362 条唯一，
+traj 涨到 210MB，超过网关上限（约 64MB）永远传不上去。
+`dedup` 只删逐字节完全相同的重复条目，并校验 `tool_use_id` 集合与
+trajectory 步数不变，是无损的。
+
+```bash
+S=~/.claude-trace/trajectories/sessions
+
+python3 recover_truncated.py --dir $S scan      # 只报告：哪些坏了、能恢复多少
+python3 recover_truncated.py --dir $S rebuild   # 用 raw.jsonl 重建（备份为 .traj.bak）
+python3 recover_truncated.py --dir $S dedup     # 无损去重超大 traj（备份为 .traj.predup）
+python3 recover_truncated.py --dir $S reupload  # 带 force=true 覆盖云端残缺版本
+python3 recover_truncated.py --dir $S purge     # 清理残留 .gz 和已上云的死队列项
+
+python3 recover_truncated.py --dir $S all       # 一条龙（建议先跑 scan）
+```
+
+`scan` 报告的「有复活截断指纹」是历史事实，修完也还在（指纹就在 `raw.jsonl` 里）；
+判断修没修看的是「已重建 / 待重建」两行。
+
 ### 第一步：过滤
 
 ```bash
@@ -725,6 +782,8 @@ python3 merger.py --all \
 | `setup_hooks.py` | 自动配置 settings.json 的 hooks |
 | `merger.py` | 双通道数据合并器 |
 | `rebuild_trajs.py` | 用当前 builder 重建历史 .traj，并识别/隔离垃圾会话目录 |
+| `uploader.py` | 可靠上传管理器：gzip + SHA256 校验、指数退避重试、持久化队列、启动补传 |
+| `recover_truncated.py` | 历史数据修复：会话复活截断重建 + 超大 traj 无损去重 + 重新上云 |
 | `filter_trajs.py` | 轨迹过滤器 |
 | `convert_trajs.py` | 格式转换（.traj → SFT .jsonl） |
 | `combine_trajs.py` | 合并 + shuffle SFT 数据 |
