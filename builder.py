@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 logger = logging.getLogger("builder")
 
@@ -492,7 +492,7 @@ def apply_hook_events_to_metadata(metadata: SessionMetadata, hook_events: List[D
 # tool_result 索引
 # ─────────────────────────────────────────────
 
-def build_tool_result_index(pairs: List) -> Dict[str, Dict]:
+def build_tool_result_index(pairs: Sequence[Any]) -> Dict[str, Dict]:
     """预建 tool_use_id → tool_result 的全局索引
 
     Fix: 原实现 find_tool_result 用 max_lookahead=3 的滑动窗口向后查找。
@@ -541,7 +541,7 @@ def build_tool_result_index(pairs: List) -> Dict[str, Dict]:
     return index
 
 
-def build_server_result_index(pairs: List) -> Dict[str, Dict]:
+def build_server_result_index(pairs: Sequence[Any]) -> Dict[str, Dict]:
     """预建服务端工具结果索引（web_search_tool_result 等）
 
     服务端工具（server_tool_use）的结果在同一次响应的 content 数组里就返回了，
@@ -577,7 +577,7 @@ def find_tool_result(pairs: List, tool_use_id: str, max_lookahead: Optional[int]
 # 轨迹构建
 # ─────────────────────────────────────────────
 
-def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -> Dict:
+def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMetadata) -> Dict:
     """构建 SWE-agent 兼容的 .traj 格式
 
     输出结构：
@@ -995,7 +995,65 @@ def build_trajectory(_session_id: str, pairs: List, metadata: SessionMetadata) -
 # 增量保存
 # ─────────────────────────────────────────────
 
-def save_trajectory(traj_path: Path, traj: Dict):
-    """覆盖写入 .traj 文件（每次记录后调用，保持最新状态）"""
+def _traj_step_count(traj_path: Path) -> int:
+    """读取已落盘 traj 的步骤数，读不出来返回 -1（表示未知）。
+
+    大文件不做完整 json.loads：trajectory 是首个 key，读头部即可判断空数组，
+    否则才退回完整解析。
+    """
+    try:
+        size = traj_path.stat().st_size
+    except OSError:
+        return -1
+    try:
+        if size > 400 * 1024:
+            with traj_path.open(errors="replace") as f:
+                head = f.read(4096)
+            if '"trajectory"' in head:
+                tail = head.split('"trajectory"', 1)[1].lstrip()
+                if tail.startswith(":"):
+                    tail = tail[1:].lstrip()
+                if tail.startswith("[]"):
+                    return 0
+        data = json.loads(traj_path.read_text(errors="replace"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return -1
+    if not isinstance(data, dict):
+        return -1
+    return len(data.get("trajectory") or [])
+
+
+def save_trajectory(traj_path: Path, traj: Dict, allow_shrink: bool = True):
+    """原子写入 .traj 文件（每次记录后调用，保持最新状态）
+
+    allow_shrink=False 时拒绝用「步骤更少」的轨迹覆盖已落盘的版本。
+
+    这道闸门防的是会话复活截断：代理按 --session-timeout（默认 300s）清理不活跃
+    会话，用户隔了 5 分钟再提问时会新建一个 pairs 为空的 Session，index 从 1 重来，
+    而本函数每轮都被调用 —— 老实现直接 write_text 覆盖，于是几小时的完整轨迹被
+    只含最后几步的短轨迹冲掉（实测 136 个会话、13313 次 API 调用因此从 traj 消失）。
+    raw.jsonl 是 append 写入所以原始数据完好，坏的只有 traj。
+
+    写入走「先写 .tmp 再 os.replace」，避免大 traj 写一半时进程被 SIGTERM 打断
+    留下截断的半个 JSON。
+    """
     traj_path.parent.mkdir(parents=True, exist_ok=True)
-    traj_path.write_text(json.dumps(traj, ensure_ascii=False, indent=2))
+
+    if not allow_shrink and traj_path.exists():
+        old_steps = _traj_step_count(traj_path)
+        new_steps = len(traj.get("trajectory") or [])
+        # old_steps < 0 表示旧文件读不出来（损坏），此时放行覆盖
+        if old_steps > new_steps:
+            logger.warning(
+                "拒绝收缩 traj: %s 已有 %d 步，本次仅 %d 步（会话复活截断已被拦下）",
+                traj_path.parent.name[:8], old_steps, new_steps,
+            )
+            return
+
+    tmp_path = traj_path.with_suffix(traj_path.suffix + ".tmp")
+    try:
+        tmp_path.write_text(json.dumps(traj, ensure_ascii=False, indent=2))
+        tmp_path.replace(traj_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise

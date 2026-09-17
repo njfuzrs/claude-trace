@@ -48,3 +48,6 @@ ignore = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# 上传/采集链路的回归测试需要跑 async 用例（proxy 是 aiohttp 事件循环）。
+# auto 模式免得每个 async 测试都手写 @pytest.mark.asyncio。
+asyncio_mode = "auto"
