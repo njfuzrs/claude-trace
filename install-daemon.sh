@@ -28,7 +28,13 @@ TRAJ_PLATFORM_URL="${TRAJ_PLATFORM_URL:-}"
 TRAJ_UPLOAD_TOKEN="${TRAJ_UPLOAD_TOKEN:-}"
 TRAJ_USER_ID="${TRAJ_USER_ID:-}"
 TRAJ_DEVICE_ID="${TRAJ_DEVICE_ID:-}"
-TRAJ_CLEANUP_AFTER_UPLOAD="${TRAJ_CLEANUP_AFTER_UPLOAD:-true}"
+# 默认 false：不删本地数据。
+# 老默认值是 true（上传成功即删本地），后果是「上传成功」的判断一旦有偏差
+# 数据就没了第二份 —— 而 409 幂等 bug 恰恰把「服务端拒绝覆盖」也算成了成功。
+# 实测 7247 个会话目录只剩一个 .uploaded 标记，本地已无法重建。
+TRAJ_CLEANUP_AFTER_UPLOAD="${TRAJ_CLEANUP_AFTER_UPLOAD:-false}"
+# 启动补传：扫描盘上未上传的会话并补齐，上传链路的兜底
+TRAJ_BACKFILL_ON_START="${TRAJ_BACKFILL_ON_START:-true}"
 
 usage() {
     echo "用法: $0 {install|uninstall|status|restart}"
@@ -151,6 +157,8 @@ do_install() {
         <string>${TRAJ_DEVICE_ID}</string>
         <key>TRAJ_CLEANUP_AFTER_UPLOAD</key>
         <string>${TRAJ_CLEANUP_AFTER_UPLOAD}</string>
+        <key>TRAJ_BACKFILL_ON_START</key>
+        <string>${TRAJ_BACKFILL_ON_START}</string>
         <key>PATH</key>
         <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
@@ -158,6 +166,8 @@ do_install() {
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>ExitTimeOut</key>
+    <integer>25</integer>
     <key>StandardOutPath</key>
     <string>${LOG_FILE}</string>
     <key>StandardErrorPath</key>

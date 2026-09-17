@@ -21,10 +21,26 @@ mkdir -p "$OUTPUT"
 echo $$ > "$PID_FILE"
 
 cleanup() {
-    echo "$(date '+%H:%M:%S') [DAEMON] 守护进程退出" >> "$LOG_FILE"
+    echo "$(date '+%H:%M:%S') [DAEMON] 守护进程退出，等待代理收尾…" >> "$LOG_FILE"
     rm -f "$PID_FILE"
-    # 杀掉子进程
-    kill $CHILD_PID 2>/dev/null
+    # 转发 SIGTERM 并等它走完优雅退出（导出 traj + 持久化上传队列）。
+    #
+    # 老实现 kill 完立刻 exit 0，守护进程一死 launchd 就会连带清掉整个进程组，
+    # 代理的收尾逻辑被砍在半路 —— 白瞎了 proxy.py 里的 signal handler。
+    # 最多等 15 秒，超时才强杀，避免卡住 launchd 的停止流程。
+    if [ -n "${CHILD_PID:-}" ]; then
+        kill -TERM "$CHILD_PID" 2>/dev/null
+        for _ in $(seq 1 150); do
+            kill -0 "$CHILD_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        if kill -0 "$CHILD_PID" 2>/dev/null; then
+            echo "$(date '+%H:%M:%S') [DAEMON] 代理 15 秒未退出，强制终止" >> "$LOG_FILE"
+            kill -KILL "$CHILD_PID" 2>/dev/null
+        else
+            echo "$(date '+%H:%M:%S') [DAEMON] 代理已优雅退出" >> "$LOG_FILE"
+        fi
+    fi
     exit 0
 }
 trap cleanup SIGTERM SIGINT

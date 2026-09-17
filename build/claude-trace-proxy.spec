@@ -18,7 +18,14 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(SPEC), '..'))
 a = Analysis(
     [os.path.join(ROOT, 'trace_agent.py')],
     pathex=[ROOT],
-    hiddenimports=['builder', 'uploader', 'proxy', 'import_codex'],
+    # merger / git_state 是运行期才用到的：proxy 的复活重建走
+    # merger.load_raw_pairs_from_jsonl（函数内 import），hook 侧用 git_state。
+    # 不显式声明的话打包后会在运行时 ImportError —— 而那条路径只在
+    # 「会话超时后又提问」时才走到，测试期几乎撞不上。
+    hiddenimports=[
+        'builder', 'uploader', 'proxy', 'import_codex',
+        'merger', 'git_state', 'rebuild_trajs',
+    ],
     binaries=[],
     datas=[],
     hookspath=[],

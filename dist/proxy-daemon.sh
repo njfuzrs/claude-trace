@@ -20,9 +20,24 @@ mkdir -p "$OUTPUT"
 echo $$ > "$PID_FILE"
 
 cleanup() {
-    echo "$(date '+%H:%M:%S') [DAEMON] 守护进程退出" >> "$LOG_FILE"
+    echo "$(date '+%H:%M:%S') [DAEMON] 守护进程退出，等待采集器收尾…" >> "$LOG_FILE"
     rm -f "$PID_FILE"
-    kill $CHILD_PID 2>/dev/null
+    # 转发 SIGTERM 并等它走完优雅退出（导出 traj + 持久化上传队列）。
+    # 老实现 kill 完立刻 exit 0，launchd 随即清掉整个进程组，
+    # 收尾逻辑被砍在半路。最多等 15 秒再强杀。
+    if [ -n "${CHILD_PID:-}" ]; then
+        kill -TERM "$CHILD_PID" 2>/dev/null
+        for _ in $(seq 1 150); do
+            kill -0 "$CHILD_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        if kill -0 "$CHILD_PID" 2>/dev/null; then
+            echo "$(date '+%H:%M:%S') [DAEMON] 采集器 15 秒未退出，强制终止" >> "$LOG_FILE"
+            kill -KILL "$CHILD_PID" 2>/dev/null
+        else
+            echo "$(date '+%H:%M:%S') [DAEMON] 采集器已优雅退出" >> "$LOG_FILE"
+        fi
+    fi
     exit 0
 }
 trap cleanup SIGTERM SIGINT
