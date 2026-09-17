@@ -165,9 +165,20 @@ class UploadManager:
     BACKOFF_MAX = 32
     IMMEDIATE_RETRIES = 5       # 首次上传时的立即重试次数
 
+    # 单文件上传体积上限（压缩后）。
+    # 实测网关：50MB → 200，100MB → 413，上限落在两者之间，取 64MB 保守值。
+    # 超过此值本地直接判死（status=oversize），不做 50 次注定 413 的无效重试 ——
+    # 那会把 1.1GB 的 .gz 永久留在盘上，且每次扫描都重压一遍。
+    MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+
     # 后台任务间隔
     QUEUE_SCAN_INTERVAL = 300   # 5 分钟
     HEALTH_CHECK_INTERVAL = 60  # 60 秒
+
+    # 启动补传节流：代理启动 30s 后开始，每个会话之间隔 2s，
+    # 避免历史积压很多时补传把上行带宽占满、影响正常采集。
+    BACKFILL_START_DELAY = 30
+    BACKFILL_INTERVAL = 2
 
     def __init__(
         self,
@@ -175,6 +186,8 @@ class UploadManager:
         upload_token: str,
         queue_dir: Optional[Path] = None,
         cleanup_after_upload: bool = True,
+        sessions_dir: Optional[Path] = None,
+        backfill_enabled: bool = True,
     ):
         base = upload_url.rstrip("/")
         self._upload_endpoint = f"{base}/api/v1/upload/session-file"
@@ -196,6 +209,11 @@ class UploadManager:
         self._health_task: Optional[asyncio.Task] = None
         self._scan_task: Optional[asyncio.Task] = None
 
+        # 启动补传：sessions 目录用于扫描未上传的历史会话
+        self._sessions_dir = sessions_dir
+        self._backfill_enabled = backfill_enabled and sessions_dir is not None
+        self._backfill_task: Optional[asyncio.Task] = None
+
     # ─────────────────────────────────────────
     # 生命周期
     # ─────────────────────────────────────────
@@ -215,12 +233,25 @@ class UploadManager:
             self._user_id, self._device_id, len(self._queue),
         )
 
+        # 启动补传：扫描盘上所有「有轨迹但没 .uploaded 标记」的会话。
+        #
+        # 这是整个上传链路的兜底，也是最重要的一环 —— 有了它，上传就不再依赖
+        # 任何单一触发点成功。sid-code 的教训正是「只挂 SessionEnd」：触发器一
+        # 不灵，52 个会话一次都没传上去，而且没人发现。判据只看磁盘现状
+        # （目录在、traj 非空、.uploaded 缺），刻意不依赖重试队列 ——
+        # 队列文件本身可能丢失或损坏。
+        if self._backfill_enabled:
+            self._backfill_task = asyncio.create_task(self._backfill_loop())
+            self._backfill_task.add_done_callback(self._log_task_error)
+
     async def stop(self):
         """停止上传管理器：持久化队列、取消后台任务、关闭 HTTP 会话"""
         if self._health_task:
             self._health_task.cancel()
         if self._scan_task:
             self._scan_task.cancel()
+        if self._backfill_task:
+            self._backfill_task.cancel()
         self._save_queue()
         if self._http_session:
             await self._http_session.close()
@@ -288,8 +319,12 @@ class UploadManager:
             logger.info("空轨迹会话，跳过上传: %s", session_id[:8])
             return
 
+        # results 记录传成功的，oversize 记录因过大放弃的。
+        # 「哪些还没传成」由末尾按盘上文件重新推导（retriable），
+        # 不再用一个 all_confirmed 布尔量 —— 它分不清「可重试的失败」
+        # 和「重试也没用的过大」，而这两者的处置完全不同。
         results = {}  # file_type → {"sha256": ..., "gz_size": ...}
-        all_confirmed = True
+        oversize = {}  # file_type → 原因（超过服务端上限，本地保留）
         resolved_tool_source = tool_source or infer_tool_source(session_dir)
 
         for file_type, filename in self.UPLOAD_FILES:
@@ -299,6 +334,18 @@ class UploadManager:
 
             gz_path = None
             try:
+                # 压缩前先按原始体积粗筛：gzip 对 JSONL 通常压到 1/3 左右，
+                # 原始超过上限 4 倍的基本不可能压进去。省掉几百 MB 的无效压缩
+                # （实测有 766MB 的 raw.jsonl，压一次要几十秒还是 413）。
+                raw_size = filepath.stat().st_size
+                if raw_size > self.MAX_UPLOAD_BYTES * 4:
+                    oversize[file_type] = f"{raw_size / 1e6:.0f}MB(原始)"
+                    logger.warning(
+                        "文件过大跳过压缩: %s/%s (%.0fMB) — 本地保留",
+                        session_id[:8], filename, raw_size / 1e6,
+                    )
+                    continue
+
                 # 在线程池中压缩 + 计算 hash（避免阻塞事件循环）
                 loop = asyncio.get_running_loop()
                 gz_path, sha256 = await loop.run_in_executor(
@@ -318,7 +365,6 @@ class UploadManager:
                 if not self._server_healthy:
                     logger.info("服务端不可达，入队: %s/%s", session_id[:8], filename)
                     await self._enqueue(item)
-                    all_confirmed = False
                     continue
 
                 # 尝试上传（带立即重试）
@@ -331,25 +377,60 @@ class UploadManager:
                     # 上传成功，清理临时压缩文件
                     gz_path.unlink(missing_ok=True)
                     logger.info("上传成功: %s/%s", session_id[:8], filename)
+                elif item.status == "oversize":
+                    # 压缩后仍超上限：本地判死，不入队（入队只会每 5 分钟重压一次）
+                    oversize[file_type] = item.error or "过大"
+                    gz_path.unlink(missing_ok=True)
                 else:
                     # 立即重试失败，入队等待后台扫描
                     await self._enqueue(item)
-                    all_confirmed = False
                     logger.warning("上传失败，已入队: %s/%s (retries=%d)", session_id[:8], filename, item.retry_count)
 
             except Exception as e:
-                all_confirmed = False
                 logger.warning("上传处理异常: %s/%s — %s", session_id[:8], filename, e)
                 # 清理可能残留的压缩文件
                 if gz_path and gz_path.exists():
                     gz_path.unlink(missing_ok=True)
 
-        # 所有文件都确认后才标记和清理
-        if all_confirmed and results:
-            self._write_uploaded_marker(session_dir, results)
-            if self._cleanup_after_upload:
-                self._cleanup_session_files(session_dir)
-                logger.info("本地文件已清理: %s", session_id[:8])
+        # ── 是否写 .uploaded 标记 ──
+        #
+        # 两条硬性条件：
+        #   1) traj 必须真的上云。traj 是训练用的那份，它没上去这个会话就不算落地，
+        #      哪怕 events.jsonl 传成功了也不能标记（否则积压数字会假性归零）。
+        #   2) 没有「可重试」的缺口。oversize 是终态、重试永远不会成功，
+        #      所以它不阻止标记 —— 否则每次启动补传都要重压几百 MB 再吃一个 413，
+        #      积压永远降不下去。可重试的失败则必须留着，等下次补传。
+        traj_exists = (session_dir / "session.traj").exists()
+        traj_done = ("traj" in results) or (not traj_exists)
+        retriable = [
+            ft for ft, fname in self.UPLOAD_FILES
+            if (session_dir / fname).exists()
+            and ft not in results
+            and ft not in oversize
+        ]
+
+        if not results or not traj_done or retriable:
+            if oversize and not traj_done and not retriable:
+                # traj 自身过大：这个会话传不上去，本地是唯一副本。
+                # 说后果不说现象 —— 这条日志要能直接读出「它没上云」。
+                logger.warning(
+                    "会话轨迹因过大无法上云，本地保留为唯一副本: %s (%s)",
+                    session_id[:8], oversize.get("traj", "traj 过大"),
+                )
+                # 落盘判据：否则每次启动补传都要重压一遍几百 MB 再吃一个 413
+                self._record_oversize(session_dir, oversize)
+            return
+
+        self._write_uploaded_marker(session_dir, results, oversize=oversize or None)
+        if oversize:
+            logger.warning(
+                "会话已标记上传，但 %s 因过大未上云（本地保留）: %s",
+                ",".join(oversize), session_id[:8],
+            )
+        # 有文件因过大没上传时绝不删本地 —— 那是它唯一的副本
+        elif self._cleanup_after_upload:
+            self._cleanup_session_files(session_dir)
+            logger.info("本地文件已清理: %s", session_id[:8])
 
     # ─────────────────────────────────────────
     # 单文件上传
@@ -369,41 +450,75 @@ class UploadManager:
             item.error = "HTTP 会话未初始化"
             return False
 
-        data = aiohttp.FormData()
-        data.add_field(
-            "file",
-            open(gz_path, "rb"),
-            filename=gz_path.name,
-            content_type="application/gzip",
-        )
-        data.add_field("session_id", item.session_id)
-        data.add_field("file_type", item.file_type)
-        data.add_field("tool_source", item.tool_source)
-        data.add_field("compressed", "true")
-        data.add_field("user_id", self._user_id)
-        data.add_field("device_id", self._device_id)
+        gz_size = gz_path.stat().st_size
+        # 体积预检：超过服务端上限的文件本地直接判死，不做 50 次无效重试。
+        # 实测网关上限在 50MB(200) 与 100MB(413) 之间，取 64MB 作为保守阈值。
+        if gz_size > self.MAX_UPLOAD_BYTES:
+            item.error = (
+                f"压缩后 {gz_size / 1e6:.1f}MB 超过上限 "
+                f"{self.MAX_UPLOAD_BYTES / 1e6:.0f}MB，跳过（本地数据保留）"
+            )
+            item.status = "oversize"
+            logger.warning(
+                "文件过大跳过上传: %s/%s (%.1fMB) — 本地数据保留，不再重试",
+                item.session_id[:8], item.file_type, gz_size / 1e6,
+            )
+            return False
 
         headers = {
             "X-Upload-Token": self._upload_token,
             "X-Content-SHA256": item.sha256,
         }
 
-        async with self._http_session.post(
-            self._upload_endpoint, data=data, headers=headers,
-        ) as resp:
-            if resp.status == 200:
-                body = await resp.json()
-                # 二次校验：服务端返回的 hash 必须一致
-                server_sha = body.get("sha256", "")
-                if server_sha and server_sha != item.sha256:
-                    item.error = f"SHA256 不匹配: local={item.sha256[:16]} server={server_sha[:16]}"
-                    logger.warning("SHA256 不匹配: %s/%s", item.session_id[:8], item.file_type)
+        # force=true：允许覆盖服务端已有文件。
+        # 不加这个参数时服务端对 traj 返回 409，而老实现把 409 当幂等成功 ——
+        # 于是「超时上传了残缺 traj → 会话继续 → 最终上传完整 traj」这条路径上，
+        # 云端永远停留在第一次那份残缺版本（实测 126 个会话被这样锁死）。
+        params = {"force": "true"}
+
+        # FormData 每次尝试都要重建：body 是一次性的流，重试时不能复用。
+        # 同时用 with 管住文件句柄 —— 老实现的裸 open() 在异常路径上会泄漏 fd。
+        with open(gz_path, "rb") as fh:
+            data = aiohttp.FormData()
+            data.add_field(
+                "file", fh, filename=gz_path.name, content_type="application/gzip",
+            )
+            data.add_field("session_id", item.session_id)
+            data.add_field("file_type", item.file_type)
+            data.add_field("tool_source", item.tool_source)
+            data.add_field("compressed", "true")
+            data.add_field("user_id", self._user_id)
+            data.add_field("device_id", self._device_id)
+
+            async with self._http_session.post(
+                self._upload_endpoint, data=data, headers=headers, params=params,
+            ) as resp:
+                if resp.status == 200:
+                    body = await resp.json()
+                    # 二次校验：服务端返回的 hash 必须一致
+                    server_sha = body.get("sha256", "")
+                    if server_sha and server_sha != item.sha256:
+                        item.error = f"SHA256 不匹配: local={item.sha256[:16]} server={server_sha[:16]}"
+                        logger.warning("SHA256 不匹配: %s/%s", item.session_id[:8], item.file_type)
+                        return False
+                    return True
+                if resp.status == 409:
+                    # 带了 force=true 仍返回 409：服务端不支持覆盖（老版本）。
+                    # 视为成功以免无限重试，但明确告警 —— 云端可能是旧版本数据。
+                    logger.warning(
+                        "服务端拒绝覆盖 (409)：%s/%s 云端可能仍是旧版本",
+                        item.session_id[:8], item.file_type,
+                    )
+                    return True
+                if resp.status == 413:
+                    # 服务端明确说太大：本地判死，不再重试
+                    item.error = f"HTTP 413: 服务端拒绝（{gz_size / 1e6:.1f}MB 过大）"
+                    item.status = "oversize"
+                    logger.warning(
+                        "服务端返回 413: %s/%s (%.1fMB) — 停止重试，本地数据保留",
+                        item.session_id[:8], item.file_type, gz_size / 1e6,
+                    )
                     return False
-                return True
-            elif resp.status == 409:
-                # 已存在，视为成功（幂等）
-                return True
-            else:
                 text = await resp.text()
                 item.error = f"HTTP {resp.status}: {text[:200]}"
                 return False
@@ -433,6 +548,9 @@ class UploadManager:
             try:
                 if await self._upload_single_file(item):
                     return True
+                # oversize 是终态：重试多少次都还是过大，立即放弃剩余尝试
+                if item.status == "oversize":
+                    return False
             except Exception as e:
                 item.error = str(e)
                 logger.debug(
@@ -442,6 +560,28 @@ class UploadManager:
                 )
 
         return False
+
+    # ─────────────────────────────────────────
+    # 可观测性
+    # ─────────────────────────────────────────
+
+    @property
+    def server_healthy(self) -> bool:
+        """服务端当前是否可达（由后台健康检查维护）"""
+        return self._server_healthy
+
+    def queue_stats(self) -> dict:
+        """重试队列的分状态计数
+
+        老实现的 _process_queue 返回 void，队列里攒了多少 failed 项
+        外部完全看不见 —— 静默丢数据。这里把计数暴露出去，
+        供 /health 和 --upload-status 使用。
+        """
+        stats = {"total": len(self._queue), "pending": 0, "failed": 0, "oversize": 0}
+        for item in self._queue:
+            key = item.status if item.status in ("failed", "oversize") else "pending"
+            stats[key] = stats.get(key, 0) + 1
+        return stats
 
     # ─────────────────────────────────────────
     # 队列管理
@@ -459,6 +599,138 @@ class UploadManager:
             await asyncio.sleep(self.QUEUE_SCAN_INTERVAL)
             await self._process_queue()
 
+    # ─────────────────────────────────────────
+    # 启动补传（上传链路的兜底）
+    # ─────────────────────────────────────────
+
+    OVERSIZE_MARKER = ".upload_oversize"
+
+    def _record_oversize(self, session_dir: Path, reasons: dict) -> None:
+        """落盘「过大放弃」的判据，避免每次启动都重压一遍几百 MB
+
+        记录 traj 当时的体积：文件变小（比如用新 builder 重建后）就说明
+        判据过期，应重新尝试上传。
+        """
+        traj = session_dir / "session.traj"
+        try:
+            payload = {
+                "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "limit_bytes": self.MAX_UPLOAD_BYTES,
+                "traj_bytes": traj.stat().st_size if traj.exists() else 0,
+                "reasons": reasons,
+            }
+            (session_dir / self.OVERSIZE_MARKER).write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+            )
+        except OSError as e:
+            logger.debug("写 oversize 标记失败 %s: %s", session_dir.name[:8], e)
+
+    def _is_recorded_oversize(self, session_dir: Path, traj: Path) -> bool:
+        """该会话是否已被判定过大且判据仍然成立
+
+        判据过期（traj 变小了，或上限提高了）时返回 False 并删掉标记，
+        让它重新进入补传队列 —— 否则一旦误判就永远没机会再传。
+        """
+        marker = session_dir / self.OVERSIZE_MARKER
+        if not marker.exists():
+            return False
+        try:
+            data = json.loads(marker.read_text())
+            recorded_bytes = int(data.get("traj_bytes") or 0)
+            recorded_limit = int(data.get("limit_bytes") or 0)
+            current_bytes = traj.stat().st_size
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return False
+        if current_bytes < recorded_bytes or self.MAX_UPLOAD_BYTES > recorded_limit:
+            marker.unlink(missing_ok=True)
+            logger.info(
+                "oversize 判据已过期，重新纳入补传: %s", session_dir.name[:8],
+            )
+            return False
+        return True
+
+    def scan_pending_sessions(self) -> List[Path]:
+        """扫描盘上所有待上传的会话目录
+
+        判据只看磁盘现状，不依赖任何内存状态或队列文件：
+          1. 是目录
+          2. 没有 .uploaded 标记
+          3. session.traj 存在且含 TAO 步骤（空轨迹没有训练价值）
+
+        返回按修改时间倒序排列的目录列表（新的先传）。
+        """
+        if not self._sessions_dir or not self._sessions_dir.exists():
+            return []
+        pending = []
+        try:
+            entries = list(self._sessions_dir.iterdir())
+        except OSError as e:
+            logger.warning("扫描 sessions 目录失败: %s", e)
+            return []
+        for d in entries:
+            try:
+                if not d.is_dir() or (d / ".uploaded").exists():
+                    continue
+                # 必须有非空 session.traj 才补传。
+                # 注意 is_empty_trajectory 在 traj 缺失时返回 False（保守放行），
+                # 这里要显式排除「根本没建出 traj」的目录 —— 那多半是 subagent
+                # 或标题生成的子目录（实测 9355 个），补传它们既没价值也很吵。
+                traj = d / "session.traj"
+                if not traj.exists() or traj.stat().st_size == 0:
+                    continue
+                # 已判定过大的会话不再反复尝试：压一次 200~350MB 要好几秒，
+                # 而结果注定是 413。判据落盘（.upload_oversize），
+                # 文件变小或上限提高后删掉该标记即可重新纳入补传。
+                if self._is_recorded_oversize(d, traj):
+                    continue
+                if is_empty_trajectory(d):
+                    continue
+                pending.append(d)
+            except OSError:
+                continue
+        pending.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+        return pending
+
+    async def _backfill_loop(self):
+        """启动补传：把盘上未上传的会话逐个补传上去
+
+        串行执行 + 每个之间小睡：补传是后台兜底，不能和正常采集抢带宽。
+        单个会话失败不影响其余（upload_session 内部已捕获异常并入队）。
+        """
+        # 等一会儿再开始：让健康检查先跑一轮，同时避开代理刚启动时的请求高峰
+        await asyncio.sleep(self.BACKFILL_START_DELAY)
+
+        pending = await asyncio.get_running_loop().run_in_executor(
+            None, self.scan_pending_sessions,
+        )
+        if not pending:
+            logger.info("启动补传：没有待上传的会话")
+            return
+
+        # 说后果而不是说现象：sid-code 的告警写「51 个会话未正常收尾」，
+        # 描述正确却省掉了「所以它们没上云」，唯一的线索就这么被当成噪音了。
+        logger.warning("启动补传：%d 个会话的轨迹仍未上云，开始补传", len(pending))
+
+        ok = failed = 0
+        for session_dir in pending:
+            if not self._server_healthy:
+                logger.info("服务端不可达，暂停补传（剩余 %d 个，下次启动继续）",
+                            len(pending) - ok - failed)
+                break
+            try:
+                await self.upload_session(session_dir, session_dir.name)
+                if (session_dir / ".uploaded").exists():
+                    ok += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                failed += 1
+                logger.warning("补传异常 %s: %s", session_dir.name[:8], e)
+            await asyncio.sleep(self.BACKFILL_INTERVAL)
+
+        logger.info("启动补传完成：成功 %d，未完成 %d（未完成的已入队或留待下次启动）",
+                    ok, failed)
+
     async def _process_queue(self):
         """处理队列中的 pending 项"""
         if not self._server_healthy:
@@ -470,8 +742,24 @@ class UploadManager:
 
             remaining = []
             for item in self._queue:
-                if item.status == "failed":
-                    remaining.append(item)  # 保留 failed 项供排查
+                if item.status in ("failed", "oversize"):
+                    # 终态项：保留条目供排查，但把 .gz 释放掉。
+                    # 老实现把重试到死的 .gz 永久留在会话目录里（实测 1.1GB），
+                    # 源文件仍在，真要重传随时能重新压缩。
+                    if item.gz_path:
+                        gz = Path(item.gz_path)
+                        if gz.exists():
+                            try:
+                                freed = gz.stat().st_size
+                                gz.unlink()
+                                item.gz_path = ""
+                                logger.info(
+                                    "释放终态项压缩文件: %s/%s (%.1fMB)",
+                                    item.session_id[:8], item.file_type, freed / 1e6,
+                                )
+                            except OSError as e:
+                                logger.debug("释放 .gz 失败 %s: %s", gz, e)
+                    remaining.append(item)
                     continue
 
                 # 确保压缩文件存在
@@ -544,13 +832,23 @@ class UploadManager:
     # ─────────────────────────────────────────
 
     @staticmethod
-    def _write_uploaded_marker(session_dir: Path, results: dict):
-        """写入 .uploaded 标记文件，记录上传确认信息"""
+    def _write_uploaded_marker(
+        session_dir: Path, results: dict, oversize: Optional[dict] = None,
+    ):
+        """写入 .uploaded 标记文件，记录上传确认信息
+
+        oversize 记录「因超过服务端上限而没上云」的文件。写进标记里是为了
+        日后能查清云端为什么缺这个文件 —— 否则只能看到 files 里少一项，
+        分不清是过大跳过还是上传漏了。
+        """
         marker = session_dir / ".uploaded"
-        marker.write_text(json.dumps({
+        payload = {
             "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "files": results,
-        }, ensure_ascii=False, indent=2))
+        }
+        if oversize:
+            payload["oversize_skipped"] = oversize
+        marker.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
     @staticmethod
     def _cleanup_session_files(session_dir: Path):
