@@ -63,10 +63,12 @@ pre-commit install          # 装 git hook，提交前自动跑
 
 ```bash
 ruff check .                       # lint（只开 correctness 档，见 pyproject.toml）
-pytest -q                          # 测试
+pytest -q                          # 测试（async 用例需要 pytest-asyncio）
 gitleaks detect --no-git --redact  # 密钥扫描
 pre-commit run --all-files         # 一次跑全部门禁
 ```
+
+`pyproject.toml` 开了 `asyncio_mode = auto`，本地跑 async 测试需要 `pytest-asyncio`（CI 会装）。macOS 上系统 Python 受 PEP 668 保护时：`brew install ruff` 之后用自己的 venv 装 `pytest pytest-asyncio`。
 
 三者都必须绿才提 PR。CI 会在 macOS + Ubuntu × Python 3.10/3.12 上重跑。
 

@@ -33,7 +33,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install ruff pytest
+          # pytest-asyncio：pyproject.toml 开了 asyncio_mode=auto，没装插件
+          # 时 Unknown config option + async 测试全部 Failed。
+          pip install ruff pytest pytest-asyncio
 
       - name: ruff（correctness 档）
         run: ruff check .

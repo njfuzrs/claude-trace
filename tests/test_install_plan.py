@@ -11,7 +11,10 @@
 
 import os
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 INSTALLER = ROOT / "dist" / "install.sh"
@@ -179,6 +182,7 @@ def test_channels_example默认不删本地():
     assert '"backfill_on_start": true' in text
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="install.sh 仅支持 macOS，Linux 会在平台检查处直接退出")
 def test_远程失败不覆盖已有安装(tmp_path):
     """远程 404 / 解析失败时，INSTALL_DIR 里已有的二进制和 version 文件必须原样留下。"""
     install_dir = tmp_path / "install"
