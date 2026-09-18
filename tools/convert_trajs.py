@@ -8,7 +8,7 @@ convert_trajs.py — 轨迹格式转换（.traj → SFT .jsonl）
   messages — 通用 messages 格式
 
 用法：
-    python convert_trajs.py --input filtered/ --output sft/ --style xml
+    python3 tools/convert_trajs.py --input filtered/ --output sft/ --style xml
 """
 
 import argparse

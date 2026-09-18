@@ -1085,7 +1085,7 @@ class DataCollector:
         """从 raw.jsonl 重建完整轨迹（复活会话的最终导出用）
 
         在线程池中执行：读整个 raw.jsonl + 重建可能较慢（实测最大 766MB）。
-        复用 merger 的加载器，保证与 rebuild_trajs.py 的重建口径一致。
+        复用 merger 的加载器，保证与 tools/rebuild_trajs.py 的重建口径一致。
 
         子会话的 pair 只存在于内存、从未单独落盘到 raw.jsonl，所以重建后
         仍要把 children_snapshot 合并进来。
@@ -1359,7 +1359,7 @@ class DataCollector:
             "usage": pair.usage,
             "stop_reason": pair.stop_reason,
             "is_partial": pair.is_partial,
-            # 落盘重放标记，重建轨迹（merger / rebuild_trajs）时同样需要去重
+            # 落盘重放标记，重建轨迹（merger / tools/rebuild_trajs）时同样需要去重
             "is_full_replay": pair.is_full_replay,
         }
         with open(jsonl_path, "a") as f:
@@ -1956,7 +1956,7 @@ def print_upload_status(output_dir: Path) -> int:
             steps = _traj_step_count(d / "session.traj")
             print(f"  {d.name[:8]}  {steps:>5} 步")
     if queue["failed"] or queue["oversize"]:
-        print("\n⚠️  队列里有终态项，本地数据仍在，可用 recover_truncated.py 排查")
+        print("\n⚠️  队列里有终态项，本地数据仍在，可用 tools/recover_truncated.py 排查")
     if not pending and not queue["total"]:
         print("\n✅ 没有积压")
     return 0

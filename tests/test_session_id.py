@@ -5,12 +5,9 @@ session_id 来自外部（HTTP 请求头 / hook 事件），并被直接用于�
 所以这层防护值得用测试锁死。
 """
 
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from proxy import _sanitize_session_id  # noqa: E402
+from proxy import _sanitize_session_id
 
 # 合法 id 原样通过：字母、数字、下划线、连字符
 VALID = [

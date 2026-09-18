@@ -3,7 +3,7 @@
 combine_trajs.py — 合并 + shuffle SFT 数据
 
 用法：
-    python combine_trajs.py --input sft/ --output training_data.jsonl --shuffle --seed 42
+    python3 tools/combine_trajs.py --input sft/ --output training_data.jsonl --shuffle --seed 42
 """
 
 import argparse

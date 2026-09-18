@@ -11,16 +11,16 @@ migrate_storage.py — 本地存储迁移脚本
   ~/.claude/trajectory_events/{sid}.jsonl → sessions/{sid}/events.jsonl (copy)
 
 用法：
-    python migrate_storage.py                    # dry-run 预览
-    python migrate_storage.py --execute          # 执行迁移
-    python migrate_storage.py --execute --cleanup  # 执行迁移并清理空目录
+    python3 tools/migrate_storage.py                    # dry-run 预览
+    python3 tools/migrate_storage.py --execute          # 执行迁移
+    python3 tools/migrate_storage.py --execute --cleanup  # 执行迁移并清理空目录
 """
 
 import argparse
 import shutil
 from pathlib import Path
 
-TRAJ_ROOT = Path(__file__).parent / "trajectories"
+TRAJ_ROOT = Path(__file__).resolve().parent.parent / "trajectories"
 RAW_DIR = TRAJ_ROOT / "raw"
 TRAJ_DIR = TRAJ_ROOT / "traj"
 SESSIONS_DIR = TRAJ_ROOT / "sessions"

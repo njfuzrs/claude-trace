@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SYNC = ROOT / "sync.py"
+SYNC = ROOT / "tools" / "sync.py"
 
 
 def _run(env_updates: dict, *args: str) -> subprocess.CompletedProcess:

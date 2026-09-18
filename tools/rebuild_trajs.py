@@ -12,16 +12,16 @@ tool_result 重复膨胀、新模型成本为 0 等，全部可以通过重跑 b
 
 用法：
     # 先看一遍会做什么（不写任何文件）
-    python rebuild_trajs.py --dir trajectories/sessions --dry-run
+    python3 tools/rebuild_trajs.py --dir trajectories/sessions --dry-run
 
     # 重建所有会话的 session.traj（原文件备份为 session.traj.bak）
-    python rebuild_trajs.py --dir trajectories/sessions
+    python3 tools/rebuild_trajs.py --dir trajectories/sessions
 
     # 重建 + 把 count_tokens 垃圾目录移到 _trash/
-    python rebuild_trajs.py --dir trajectories/sessions --quarantine-garbage
+    python3 tools/rebuild_trajs.py --dir trajectories/sessions --quarantine-garbage
 
     # 只统计垃圾目录，不重建
-    python rebuild_trajs.py --dir trajectories/sessions --scan-only
+    python3 tools/rebuild_trajs.py --dir trajectories/sessions --scan-only
 """
 
 import argparse
@@ -32,7 +32,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-sys.path.insert(0, str(Path(__file__).parent))
+# 本文件在 tools/，builder / merger 在仓库根
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from builder import (  # noqa: E402
     SessionMetadata,

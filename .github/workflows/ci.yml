@@ -33,7 +33,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install ruff pytest
+          # pytest-asyncio：pyproject.toml 开了 asyncio_mode=auto，没装插件
+          # 时 Unknown config option + async 测试全部 Failed。
+          pip install ruff pytest pytest-asyncio
 
       - name: ruff（correctness 档）
         run: ruff check .
@@ -69,7 +71,7 @@ jobs:
       - name: 身份字段不得回退到真实用户名/主机名
         run: |
           if grep -nE 'os\.getlogin\(\)|os\.uname\(\)|platform\.node\(\)|\$\(whoami\)' \
-               uploader.py sync.py dist/install.sh; then
+               uploader.py tools/sync.py dist/install.sh; then
             echo "::error::身份字段出现真实身份回退，见 SECURITY.md 的隐私边界"
             exit 1
           fi

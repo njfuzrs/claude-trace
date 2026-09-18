@@ -17,13 +17,13 @@ raw.jsonl 是 append 写入的，历史完好，所以全部可以重建。
   purge    清理重试到死的残留 .gz（源文件仍在，可随时重压）
 
 用法：
-    python recover_truncated.py --dir ~/.claude-trace/trajectories/sessions scan
-    python recover_truncated.py --dir ~/.claude-trace/trajectories/sessions rebuild
-    python recover_truncated.py --dir ~/.claude-trace/trajectories/sessions reupload
-    python recover_truncated.py --dir ~/.claude-trace/trajectories/sessions purge
+    python3 tools/recover_truncated.py --dir ~/.claude-trace/trajectories/sessions scan
+    python3 tools/recover_truncated.py --dir ~/.claude-trace/trajectories/sessions rebuild
+    python3 tools/recover_truncated.py --dir ~/.claude-trace/trajectories/sessions reupload
+    python3 tools/recover_truncated.py --dir ~/.claude-trace/trajectories/sessions purge
 
     # 一条龙（推荐先跑 scan 看一眼）
-    python recover_truncated.py --dir ... all
+    python3 tools/recover_truncated.py --dir ... all
 """
 
 import argparse
@@ -36,7 +36,10 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-sys.path.insert(0, str(Path(__file__).parent))
+# 本文件在 tools/：同目录有 rebuild_trajs，仓库根有 uploader
+_TOOLS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_TOOLS_DIR.parent))
+sys.path.insert(0, str(_TOOLS_DIR))
 
 from rebuild_trajs import rebuild_one  # noqa: E402
 from uploader import UploadManager  # noqa: E402

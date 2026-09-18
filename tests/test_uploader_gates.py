@@ -9,12 +9,8 @@
 """
 
 import json
-import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from uploader import UploadManager  # noqa: E402
+from uploader import UploadManager
 
 
 def _mgr(tmp_path, **kw):

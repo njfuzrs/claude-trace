@@ -7,15 +7,12 @@ cleanup_expired 就把会话清掉；再提问时代理新建一个 pairs 为空
 """
 
 import json
-import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-import proxy as P  # noqa: E402
+import proxy as P
 
 
 def _req(n_msgs: int, model: str = "claude-opus-4-6") -> dict:

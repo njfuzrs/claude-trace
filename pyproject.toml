@@ -1,7 +1,8 @@
 # pyproject.toml —— 项目元数据与工具配置
 #
-# 注意：本项目是扁平脚本结构（见 CONTRIBUTING.md），不作为 Python 包安装 ——
-# collector.py 等文件需要能被单独拷到 ~/.claude/hooks/ 下执行。
+# 注意：本项目不是可安装的 Python 包（见 CONTRIBUTING.md）。
+# 运行时模块平铺在仓库根（collector.py / git_state.py 要能被单独拷到
+# ~/.claude/hooks/ 下执行）；离线 CLI 在 tools/。
 # 这里声明 [project] 是为了给出统一的元数据与依赖下限，不用于 pip install。
 
 [project]
@@ -47,6 +48,7 @@ ignore = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 addopts = "-q"
 # 上传/采集链路的回归测试需要跑 async 用例（proxy 是 aiohttp 事件循环）。
 # auto 模式免得每个 async 测试都手写 @pytest.mark.asyncio。
