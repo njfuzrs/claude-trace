@@ -136,6 +136,17 @@ python3 viewer.py ./trajectories/sessions/<id>/session.traj
 任一为空即禁用上传（判据见 `proxy.py` 的 `DataCollector.__init__`），
 未启用时日志会打印「上传未配置，数据仅保存在本地」。
 
+采集进程内的自动上传由 `uploader.py` 负责。`uploader` 没跑时（历史积压、
+其它机器上的目录）用根目录 `sync.py` 手动批量，**同一对变量必填**，同样
+无内置端点。身份字段规则也相同：空则不上报。
+
+```bash
+export TRAJ_PLATFORM_URL=...     # 必填
+export TRAJ_UPLOAD_TOKEN=...     # 必填
+python3 sync.py                  # 增量
+python3 sync.py --all            # 全量
+```
+
 另有两个身份字段，**默认留空即不上报**，不会回退到你的系统用户名或主机名：
 
 | 变量 | 默认 |
@@ -863,6 +874,7 @@ python3 merger.py --all \
 | `merger.py` | 双通道数据合并器 |
 | `rebuild_trajs.py` | 用当前 builder 重建历史 .traj，并识别/隔离垃圾会话目录 |
 | `uploader.py` | 可靠上传管理器：gzip + SHA256 校验、指数退避重试、持久化队列、启动补传 |
+| `sync.py` | 手动批量补传（uploader 没跑时）。同一对 URL/token 必填，身份不回退系统用户名 |
 | `recover_truncated.py` | 历史数据修复：会话复活截断重建 + 超大 traj 无损去重 + 重新上云 |
 | `filter_trajs.py` | 轨迹过滤器 |
 | `convert_trajs.py` | 格式转换（.traj → SFT .jsonl） |

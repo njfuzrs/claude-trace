@@ -40,10 +40,10 @@ repos:
         name: 身份字段不得回退到真实用户名/主机名
         entry: >
           bash -c 'grep -nE "os\.getlogin\(\)|os\.uname\(\)|platform\.node\(\)|\$\(whoami\)"
-          uploader.py dist/install.sh && { echo "见 SECURITY.md 的隐私边界"; exit 1; } || exit 0'
+          uploader.py sync.py dist/install.sh && { echo "见 SECURITY.md 的隐私边界"; exit 1; } || exit 0'
         language: system
         pass_filenames: false
-        files: '^(uploader\.py|dist/install\.sh)$'
+        files: '^(uploader\.py|sync\.py|dist/install\.sh)$'
 
       - id: no-builtin-upload-endpoint
         name: 上传端点与凭据不得有内置默认值
