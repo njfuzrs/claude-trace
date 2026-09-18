@@ -17,6 +17,9 @@ Claude Code / Codex 轨迹采集工具。默认通过一个统一执行入口同
 - [数据会离开你的机器吗](#数据会离开你的机器吗)
 - [工作原理](#工作原理)
 - [安装](#安装)
+  - [从 GitHub Release 安装（推荐）](#从-github-release-安装推荐)
+  - [从源码安装（开发用）](#从源码安装开发用)
+  - [升级](#升级)
 - [使用方式](#使用方式)
   - [方式一：一键启动](#方式一一键启动)
   - [方式二：守护进程模式（推荐日常使用）](#方式二守护进程模式推荐日常使用)
@@ -30,6 +33,8 @@ Claude Code / Codex 轨迹采集工具。默认通过一个统一执行入口同
 - [渠道管理](#渠道管理)
 - [数据目录结构](#数据目录结构)
 - [数据处理管道](#数据处理管道)
+  - [第零步（可选）：重建历史轨迹](#第零步可选重建历史轨迹)
+  - [历史数据修复：会话复活截断 + 超大 traj](#历史数据修复会话复活截断--超大-traj)
   - [第一步：过滤](#第一步过滤)
   - [第二步：格式转换](#第二步格式转换)
   - [第三步：合并](#第三步合并)
@@ -49,7 +54,7 @@ Claude Code / Codex 轨迹采集工具。默认通过一个统一执行入口同
 curl -fsSL https://github.com/njfuzrs/claude-trace/releases/latest/download/install.sh | bash
 ```
 
-安装器会询问 API Token，部署 Hooks，写入 `~/.claude/settings.json`，并拉起 launchd 服务。上传默认关闭，不填即不上传。之后：
+安装器会询问 API Token，部署 Hooks，写入 `~/.claude/settings.json`，并拉起 launchd 服务。数据落到 `~/.claude-trace/trajectories/sessions/`。上传默认关闭，不填即不上传。之后：
 
 ```bash
 claude-trace status
@@ -105,8 +110,13 @@ bash dist/install.sh             # 本地安装模式
 想知道究竟落了什么盘，直接看：
 
 ```bash
-ls ./trajectories/sessions/                       # 按会话列目录
-python3 viewer.py ./trajectories/sessions/<id>/session.traj   # 可视化查看单条轨迹
+# 打包安装（路径 A）
+ls ~/.claude-trace/trajectories/sessions/
+python3 viewer.py ~/.claude-trace/trajectories/sessions/<id>/session.traj
+
+# 源码 / 开发守护进程（路径 B，默认 ./trajectories）
+ls ./trajectories/sessions/
+python3 viewer.py ./trajectories/sessions/<id>/session.traj
 ```
 
 ---
@@ -223,7 +233,8 @@ curl -fsSL https://github.com/njfuzrs/claude-trace/releases/download/v0.3.0/inst
 非交互：
 
 ```bash
-curl -fsSL https://github.com/njfuzrs/claude-trace/releases/latest/download/install.sh \
+ANTHROPIC_AUTH_TOKEN=sk-... \
+  curl -fsSL https://github.com/njfuzrs/claude-trace/releases/latest/download/install.sh \
   | bash -s -- --non-interactive
 # 必填：ANTHROPIC_AUTH_TOKEN
 # 可选：UPSTREAM_URL / TRAJ_PLATFORM_URL / TRAJ_UPLOAD_TOKEN / PORT
@@ -243,6 +254,19 @@ bash dist/install.sh
 
 仓库内且未设置 `RELEASE_BASE` 时，安装器走本地拷贝，不会去 GitHub 下载。
 显式设置 `RELEASE_BASE` 则强制走远程（用于模拟 Release 安装）。
+
+### 升级
+
+同一条 `curl | bash` 就是升级。安装器先把新包落到临时目录并校验，成功后再停旧服务、再替换 `~/.claude-trace/`，远程 404 时不停正在跑的采集。`channels.json` 和 `trajectories/` 会保留。
+
+```bash
+curl -fsSL https://github.com/njfuzrs/claude-trace/releases/latest/download/install.sh | bash
+claude-trace version    # 对一下 version 文件、二进制 --version、sha256
+```
+
+版本号相同时仍可能换了二进制（曾经同一个 `0.2.0` 对应过行为差 13 天的两份包）。以 `claude-trace version` 打出来的 sha256 / 自报为准，不要只看数字。
+
+开发机不要对正在跑的生产二进制装 `install-daemon.sh install --watch`：文件监听会重启 `~/.claude-trace` 里的旧包，还会把活会话按超时切碎。
 
 ---
 
@@ -300,7 +324,8 @@ bash dist/install.sh
 ```bash
 # 管理命令
 claude-trace status       # 查看状态
-claude-trace restart      # 重启服务
+claude-trace restart      # 重启服务（bootout + bootstrap，会重读 plist）
+claude-trace version      # 版本文件 + 二进制 --version + sha256
 claude-trace uninstall    # 卸载服务
 ```
 
@@ -319,9 +344,7 @@ PORT=5000 UPSTREAM_URL=https://api.anthropic.com \
 UPSTREAM=https://api.anthropic.com nohup ./proxy-daemon.sh > /dev/null 2>&1 &
 ```
 
-**配置 settings.json（两种方法都需要，只需执行一次）**
-
-编辑 `~/.claude/settings.json`，将 `ANTHROPIC_BASE_URL` 指向统一采集器：
+方法 A（`install.sh` / `claude-trace start`）会自己写 `ANTHROPIC_BASE_URL`。方法 B 和源码守护进程需要你自己改 `~/.claude/settings.json`：
 
 ```json
 {
@@ -438,8 +461,9 @@ trajectories/sessions/{thread_id}/
 | `--upstream` | https://api.anthropic.com | 上游 API 地址 |
 | `--session-timeout` | 1800 | 会话超时时间（秒），超时后自动导出 .traj。默认 30 分钟：设太短（曾是 300s）会让「思考几分钟再提问」被判为过期，新建会话时 index 从 1 重来，轨迹被截断 |
 | `--upload-status` | - | 打印上传积压状态后退出，不启动采集器。用于排查上传是否静默失效 |
-| `--save-raw` | true | 保存原始请求/响应 JSON 文件 |
-| `--no-save-raw` | - | 只保留 JSONL + .traj，不保存单独的 JSON 文件 |
+| `--save-raw` | false | 额外把每轮请求/响应写成 `raw/NNN_request.json`。默认关：`raw.jsonl` 已有全部数据 |
+| `--no-save-raw` | - | 显式关闭上面这项（默认行为） |
+| `--version` | - | 打印版本号与构建指纹后退出。打包后的二进制读的是打进包内的 `version` 文件 |
 | `--events-dir` | ~/.claude/trajectory_events | Hooks 事件数据目录 |
 | `--force-thinking` | 0 | 非 0 时将 adaptive thinking 的 effort 改写为 max，提高 thinking blocks 产生概率（仅 Opus 4.6） |
 | `--verbose` | false | 详细日志输出 |
@@ -499,13 +523,23 @@ UPSTREAM=https://your-proxy.com ./start.sh
 
 ## 渠道管理
 
-如果你需要在多个 API 渠道（不同服务商、不同额度的账号等）之间切换，使用 `switch-channel.sh` 一键完成：
+如果你需要在多个 API 渠道（不同服务商、不同额度的账号等）之间切换：
+
+- 源码开发：`./switch-channel.sh`
+- 打包安装：`claude-trace switch`（读的是 `~/.claude-trace/channels.json`）
+
+两条路径都会改 plist 并 `bootout + bootstrap` 重启采集器，让新的 `UPSTREAM` 生效。不要用 `launchctl kickstart`。
 
 ```bash
+# 源码
 ./switch-channel.sh list       # 列出所有可用渠道
 ./switch-channel.sh default    # 切换到名为 default 的渠道
-./switch-channel.sh backup     # 切换到名为 backup 的渠道
 ./switch-channel.sh status     # 查看当前渠道
+
+# 安装版
+claude-trace switch list
+claude-trace switch default
+claude-trace switch status
 ```
 
 切换时会同时更新：`ANTHROPIC_AUTH_TOKEN`（token）、统一采集器上游地址（`UPSTREAM`）、`FORCE_THINKING` 参数，并自动重启统一采集器。
@@ -539,23 +573,20 @@ UPSTREAM=https://your-proxy.com ./start.sh
 
 ## 数据目录结构
 
-Claude 在线采集输出：
+当前布局按会话目录组织（一个 session 的 traj / raw / events 放一起）。打包安装写在 `~/.claude-trace/trajectories/`，源码守护进程默认写在仓库的 `./trajectories/`。
 
 ```
 trajectories/
-├── raw/                                    # 原始数据
-│   ├── {session_id}.jsonl                  # 增量日志（每行一个请求/响应对）
-│   └── {session_id}/
-│       ├── 001_request.json                # 第 1 个请求（含完整 body + 脱敏 headers）
-│       ├── 001_response.json               # 第 1 个响应（SSE 重组后）
-│       ├── 002_request.json
-│       ├── 002_response.json
-│       └── ...
-├── traj/                                   # SWE-agent 兼容格式
-│   └── {session_id}.traj                   # 轨迹文件（trajectory + history + info + metadata）
-~/.claude/trajectory_events/                # Hooks 事件数据（通道 B）
-    └── {session_id}.jsonl                  # 按 session 分文件的事件流
+└── sessions/
+    └── {session_id}/
+        ├── session.traj     # 构建好的轨迹
+        ├── raw.jsonl        # 增量请求/响应（始终写）
+        ├── events.jsonl     # Hook 事件（有的话）
+        └── raw/             # 仅 --save-raw 时才有：每轮 NNN_request.json / NNN_response.json
+~/.claude/trajectory_events/{session_id}.jsonl   # Hooks 原始事件（通道 B，合并前）
 ```
+
+旧布局 `trajectories/raw/` + `trajectories/traj/` 仍能被 `viewer.py` / `filter_trajs.py` 读到，新采集不再往那里写。
 
 Codex 离线导出输出：
 
@@ -740,7 +771,7 @@ python3 recover_truncated.py --dir $S all       # 一条龙（建议先跑 scan�
 
 ```bash
 python3 filter_trajs.py \
-    --input trajectories/traj/ \
+    --input trajectories/sessions/ \
     --output filtered/ \
     --min-steps 3 \
     --max-steps 100 \
@@ -802,11 +833,11 @@ python3 merger.py --session-id <session_id>
 # 合并所有会话
 python3 merger.py --all
 
-# 自定义目录
+# 自定义目录（新布局：raw / events / traj 都在 sessions/{id}/ 下）
 python3 merger.py --all \
-    --raw-dir ./trajectories/raw \
-    --events-dir ~/.claude/trajectory_events \
-    --output ./trajectories/traj
+    --raw-dir ./trajectories/sessions \
+    --events-dir ./trajectories/sessions \
+    --output ./trajectories/sessions
 ```
 
 合并后的 `.traj` 会包含 Hooks 提供的额外信息：用户原始 prompt、sub-agent 生命周期、compaction 摘要等。
@@ -817,8 +848,9 @@ python3 merger.py --all \
 
 | 文件 | 作用 |
 |------|------|
-| `proxy.py` | HTTP 统一采集器服务器，SSE Tee 模式采集 API 请求/响应 |
+| `proxy.py` | HTTP 统一采集器服务器。日常入口是 `trace_agent.py`；本文件的 `main` 留给单测和 `--upload-status` |
 | `trace_agent.py` | Claude + Codex 统一采集入口，默认同时启动 HTTP 统一采集器与 Codex watcher |
+| `version_info.py` | 版本号解析：仓库 `version` 文件 → 打包后的 `sys._MEIPASS` |
 | `builder.py` | 轨迹构建器，将请求/响应对转换为 .traj 格式 |
 | `collector.py` | Hooks 采集脚本，部署到 `~/.claude/hooks/` |
 | `setup_hooks.py` | 自动配置 settings.json 的 hooks |
@@ -846,7 +878,7 @@ python3 merger.py --all \
 | `viewer.py` | 轨迹数据 HTML 查看器，将 .traj 转为可视化 HTML |
 | `git_state.py` | 会话起点 git 状态快照采集（`collector.py` 的同目录依赖） |
 | `docs/upload-protocol.md` | 自建上传接收端所需的服务端协议 |
-| `tests/` | 测试骨架（请求头脱敏 / session_id 防护 / porcelain 解析） |
+| `tests/` | 测试骨架（请求头脱敏 / session_id 防护 / porcelain 解析 / 安装器分流 / 版本事实源） |
 
 ---
 
@@ -934,7 +966,7 @@ ls ~/.claude/trajectory_events/
 .traj 在以下时机生成：
 - 每次记录请求/响应后增量更新
 - SessionEnd hook 触发时导出
-- 会话超时（默认 5 分钟无活动）时导出
+- 会话超时（默认 30 分钟无活动）时导出
 - 统一采集器 Ctrl+C 退出时导出所有活跃会话
 
 如果 .traj 缺失，检查统一采集器日志中是否有 `构建 .traj 失败` 的错误。
@@ -943,20 +975,20 @@ ls ~/.claude/trajectory_events/
 
 ```bash
 # 可视化查看 .traj（推荐，生成 HTML 在浏览器中查看）
-python3 viewer.py trajectories/traj/<session_id>.traj
-python3 viewer.py trajectories/traj/              # 目录索引模式
-python3 viewer.py trajectories/traj/xxx.traj -o out.html  # 指定输出文件
+python3 viewer.py trajectories/sessions/<session_id>/session.traj
+python3 viewer.py trajectories/sessions/              # 目录索引模式
+python3 viewer.py trajectories/sessions/<id>/session.traj -o out.html
 
-# 查看原始请求/响应
-cat trajectories/raw/<session_id>/001_request.json | python3 -m json.tool
+# 查看增量日志（始终有）
+head -1 trajectories/sessions/<session_id>/raw.jsonl | python3 -m json.tool
 
-# 查看 JSONL 增量日志
-head -1 trajectories/raw/<session_id>.jsonl | python3 -m json.tool
+# 查看每轮原始请求/响应（仅 --save-raw 时才有）
+cat trajectories/sessions/<session_id>/raw/001_request.json | python3 -m json.tool
 
 # 查看 .traj 轨迹摘要
 python3 -c "
 import json
-t = json.load(open('trajectories/traj/<session_id>.traj'))
+t = json.load(open('trajectories/sessions/<session_id>/session.traj'))
 m = t['metadata']
 print(f\"model: {m['model']}\")
 print(f\"steps: {m['total_steps']}\")
@@ -964,9 +996,6 @@ print(f\"tools: {m['tools_used']}\")
 print(f\"cost: \${m['total_cost_usd']:.4f}\")
 print(f\"exit: {m['exit_status']}\")
 "
-
-# 查看 Hooks 事件
-cat ~/.claude/trajectory_events/<session_id>.jsonl | python3 -m json.tool --json-lines
 ```
 
 ### 如何移除所有配置恢复原状
@@ -1002,7 +1031,10 @@ rm /tmp/claude-trace-proxy.pid && kill $(lsof -ti :4000)
 # 停止手动启动的统一采集器
 # 直接 Ctrl+C，会自动导出所有活跃会话的轨迹
 
-# 清理采集数据
+# 清理采集数据（新布局）
+rm -rf trajectories/sessions
+
+# 旧布局残留（如果还有）
 rm -rf trajectories/raw trajectories/traj
 
 # 清理 Hooks 事件数据

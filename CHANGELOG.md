@@ -10,7 +10,7 @@
 
 ### 修正
 
-- 发布脚本上传安装器时用磁盘上真正叫 `install.sh` 的文件。`path#label` 只改 GitHub 展示文字，不改下载路径；v0.3.0 第一次上传因此变成 `install.sh.release`，`curl | bash` 404。已在同一 tag 下把 asset 改名为 `install.sh`。
+- README：补升级步骤；`--save-raw` 默认改为 false；数据目录改成 `sessions/{id}/`；会话超时 FAQ 从 5 分钟改为 30 分钟；渠道切换区分安装版 `claude-trace switch` 与源码 `switch-channel.sh`。
 
 ## [0.3.0] - 2026-09-18
 

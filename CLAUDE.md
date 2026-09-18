@@ -167,7 +167,7 @@ pre-commit run --all-files              # 一次跑全部
 ./start.sh
 
 # 数据处理管道
-python3 filter_trajs.py --input trajectories/traj/ --output filtered/
+python3 filter_trajs.py --input trajectories/sessions/ --output filtered/
 python3 convert_trajs.py --input filtered/ --output sft/ --style xml
 python3 combine_trajs.py --input sft/ --output training_data.jsonl --shuffle
 
@@ -175,8 +175,8 @@ python3 combine_trajs.py --input sft/ --output training_data.jsonl --shuffle
 python3 merger.py --all
 
 # 可视化查看轨迹
-python3 viewer.py trajectories/traj/<session_id>.traj
-python3 viewer.py trajectories/traj/   # 目录索引模式
+python3 viewer.py trajectories/sessions/<session_id>/session.traj
+python3 viewer.py trajectories/sessions/   # 目录索引模式
 ```
 
 ## 环境变量
@@ -212,6 +212,12 @@ python3 viewer.py trajectories/traj/   # 目录索引模式
 
 ## 数据目录
 
-- 原始数据：`trajectories/raw/{session_id}.jsonl` + `trajectories/raw/{session_id}/NNN_request.json`
-- 轨迹文件：`trajectories/traj/{session_id}.traj`
-- Hooks 事件：`~/.claude/trajectory_events/{session_id}.jsonl`
+当前布局按会话组织（打包安装在 `~/.claude-trace/trajectories/`）：
+
+- `trajectories/sessions/{session_id}/session.traj`
+- `trajectories/sessions/{session_id}/raw.jsonl`（始终写）
+- `trajectories/sessions/{session_id}/events.jsonl`
+- `trajectories/sessions/{session_id}/raw/NNN_*.json`（仅 `--save-raw`）
+- Hooks 原始事件：`~/.claude/trajectory_events/{session_id}.jsonl`
+
+旧布局 `trajectories/raw/` + `trajectories/traj/` 只存在于历史数据。
