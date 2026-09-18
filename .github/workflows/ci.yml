@@ -22,7 +22,7 @@ jobs:
         python-version: ['3.10', '3.12']
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
@@ -52,7 +52,7 @@ jobs:
   secrets:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: gitleaks
@@ -64,7 +64,7 @@ jobs:
     # 隐私默认值门禁：这三条是 SECURITY.md 承诺的边界，回归了必须让 CI 红。
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: 身份字段不得回退到真实用户名/主机名
         run: |
