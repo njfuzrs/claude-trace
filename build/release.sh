@@ -204,6 +204,11 @@ if [ "$DO_CROSS" = true ]; then
 fi
 
 # ─── 生成 install.sh 的发布版本 ───
+#
+# 下载 URL 用的是 asset 的 *文件名*，不是 # 后面的展示标签。
+# v0.3.0 第一次上传写成 dist/install.sh.release#install.sh，结果
+# GitHub 上的名字是 install.sh.release，curl | bash 404。
+# 正确做法：磁盘上就放一份叫 install.sh 的文件再上传。
 
 echo ""
 echo ">>> 生成发布版 install.sh ..."
@@ -268,15 +273,36 @@ if [ "$DO_UPLOAD" = true ]; then
         exit 1
     fi
 
-    # asset 名固定为 install.sh（gh 的 path#label 语法），保证 curl | bash 地址稳定
-    ASSETS=("${TARBALLS[@]}" "${INSTALL_RELEASE}#install.sh")
-
     NOTES="claude-trace v${VERSION}
 
 安装：
 \`\`\`bash
 curl -fsSL ${RELEASE_URL}/install.sh | bash
 \`\`\`"
+
+    # 上传文件名必须就是 install.sh。gh 的 path#label 只改 Release 页展示文字，
+    # 不改下载路径 —— v0.3.0 第一次写成 install.sh.release#install.sh，
+    # 用户 curl 的是 /install.sh，实际 asset 叫 install.sh.release，404。
+    # 源文件仍叫 install.sh.release，避免和仓库里的 dist/install.sh 撞名。
+    prepare_install_asset() {
+        INSTALL_ASSET_DIR="$(mktemp -d)"
+        trap 'rm -rf "$INSTALL_ASSET_DIR"' EXIT
+        INSTALL_ASSET="$INSTALL_ASSET_DIR/install.sh"
+        cp "$INSTALL_RELEASE" "$INSTALL_ASSET"
+        chmod +x "$INSTALL_ASSET"
+        ASSETS=("${TARBALLS[@]}" "$INSTALL_ASSET")
+        # 自检：传给 gh 的路径 basename 必须是 install.sh。#label 改不了下载名。
+        local name
+        name="$(basename "$INSTALL_ASSET")"
+        if [ "$name" != "install.sh" ]; then
+            echo "错误：安装器 asset 文件名是 $name，下载 URL 会变成 /$name 而不是 /install.sh"
+            exit 1
+        fi
+        if [[ "$INSTALL_ASSET" == *#* ]]; then
+            echo "错误：不要用 path#label 伪装文件名，GitHub 下载路径看的是磁盘文件名"
+            exit 1
+        fi
+    }
 
     if gh release view "v${VERSION}" --repo "$GH_REPO" >/dev/null 2>&1; then
         # 覆盖已发布的 asset 要显式确认：覆盖之后「同一个 tag 对应两份行为完全
@@ -297,9 +323,11 @@ curl -fsSL ${RELEASE_URL}/install.sh | bash
             exit 1
         fi
         echo "  ALLOW_CLOBBER=true，覆盖上传 assets ..."
+        prepare_install_asset
         gh release upload "v${VERSION}" "${ASSETS[@]}" --repo "$GH_REPO" --clobber
     else
         echo "  创建 Release v${VERSION} ..."
+        prepare_install_asset
         gh release create "v${VERSION}" "${ASSETS[@]}" \
             --repo "$GH_REPO" \
             --title "v${VERSION}" \

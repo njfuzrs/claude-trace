@@ -214,3 +214,13 @@ def test_远程失败退出在停服务之前():
     stop_at = text.find("已停止旧服务")
     assert fail_at != -1 and stop_at != -1
     assert fail_at < stop_at, "停服务写在远程失败 exit 之前，404 会掐正在跑的采集"
+
+
+def test_发布脚本不以label伪装安装器文件名():
+    """gh 的 path#label 只改展示名。下载 URL 用的是磁盘文件名。
+    v0.3.0 第一次上传写成 install.sh.release#install.sh，curl | bash 404。"""
+    text = (ROOT / "build" / "release.sh").read_text(encoding="utf-8")
+    # 注释里会提到这个错误写法，真正传给 gh 的路径 basename 必须是 install.sh
+    assert 'ASSETS=("${TARBALLS[@]}" "${INSTALL_RELEASE}#install.sh")' not in text
+    assert 'INSTALL_ASSET="$INSTALL_ASSET_DIR/install.sh"' in text
+    assert "prepare_install_asset" in text
