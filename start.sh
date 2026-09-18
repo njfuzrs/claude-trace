@@ -90,10 +90,10 @@ export CLAUDE_PROXY_PORT="$PORT"
 
 if [ "$PROXY_ONLY" = true ]; then
     # 前台运行代理
-    exec python3 "$SCRIPT_DIR/proxy.py" --port "$PORT" --output "$OUTPUT" --upstream "$UPSTREAM" --force-thinking "$FORCE_THINKING"
+    exec python3 "$SCRIPT_DIR/trace_agent.py" --port "$PORT" --output "$OUTPUT" --upstream "$UPSTREAM" --force-thinking "$FORCE_THINKING"
 else
-    # 后台运行代理
-    python3 "$SCRIPT_DIR/proxy.py" --port "$PORT" --output "$OUTPUT" --upstream "$UPSTREAM" --force-thinking "$FORCE_THINKING" &
+    # 后台运行统一采集器
+    python3 "$SCRIPT_DIR/trace_agent.py" --port "$PORT" --output "$OUTPUT" --upstream "$UPSTREAM" --force-thinking "$FORCE_THINKING" &
     PROXY_PID=$!
     echo "代理 PID: $PROXY_PID"
 

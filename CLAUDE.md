@@ -32,7 +32,9 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 
 ```
 ├── migrate_storage.py  # 存储迁移脚本（旧 raw/+traj/ → 新 sessions/）
-├── proxy.py            # HTTP 代理服务器，SSE Tee 模式采集 API 请求/响应
+├── proxy.py            # HTTP 代理服务器（单测 / --upload-status 仍可用；生产入口是 trace_agent.py）
+├── trace_agent.py      # 统一采集入口（Claude 代理 + Codex watcher）
+├── version_info.py     # 版本号解析：仓库 version 文件 → 打包后的 sys._MEIPASS
 ├── builder.py          # 轨迹构建器，请求/响应对 → .traj 格式
 ├── collector.py        # Hooks 采集脚本，部署到 ~/.claude/hooks/
 ├── setup_hooks.py      # 自动配置 settings.json 的 hooks
@@ -45,9 +47,11 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 ├── combine_trajs.py    # 合并 + shuffle SFT 数据
 ├── viewer.py           # 轨迹数据 HTML 查看器，将 .traj 转为可视化 HTML
 ├── start.sh            # 一键启动脚本（代理 + Claude Code 生命周期绑定）
-├── proxy-daemon.sh     # 守护进程脚本（自动重启循环）
-├── install-daemon.sh   # 安装/卸载 launchd 自启动服务（macOS）
-├── watch-reload.sh     # 文件监听脚本，.py 变更后自动重启代理（需 fswatch）
+├── proxy-daemon.sh     # 守护进程脚本（开发版：python3 trace_agent.py）
+├── install-daemon.sh   # 安装/卸载 launchd 自启动服务（macOS）。--watch 才装文件监听
+├── watch-reload.sh     # 文件监听脚本，.py 变更后自动重启（需 fswatch；默认不装）
+├── build/build.sh      # PyInstaller 打包
+├── build/release.sh    # 发版：--bump 改版本，--upload 发 GitHub Releases
 ├── switch-channel.sh   # 快速切换 API 渠道（token + 上游）
 ├── channels.json       # 渠道配置文件（含 token，已加入 .gitignore）
 ├── channels.json.example  # 渠道配置模板（可提交）
@@ -64,7 +68,7 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 ## 架构流水线
 
 ```
-采集: proxy.py (通道A) + collector.py (通道B)
+采集: trace_agent.py → proxy.py (通道A) + collector.py (通道B)
   ↓
 构建: builder.py → .traj
   ↓
@@ -149,9 +153,10 @@ pre-commit run --all-files              # 一次跑全部
 
 ```bash
 # 服务管理（推荐方式）
-./install-daemon.sh install         # 安装 launchd 服务（开机自启）
+./install-daemon.sh install         # 安装 launchd 服务（开机自启；不装文件监听）
+./install-daemon.sh install --watch # 开发用：同时装文件监听
 ./install-daemon.sh status          # 查看服务状态
-./install-daemon.sh restart         # 重启服务
+./install-daemon.sh restart         # 重启服务（bootout + bootstrap，不是 kickstart）
 ./install-daemon.sh uninstall       # 卸载服务
 
 # 渠道切换

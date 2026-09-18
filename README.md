@@ -43,32 +43,39 @@ Claude Code / Codex 轨迹采集工具。默认通过一个统一执行入口同
 
 ## 快速开始
 
+**最终用户（推荐）：从 GitHub Release 安装。** 不需要 clone，不需要 Python 依赖。
+
 ```bash
-# 1. 取源码
-git clone https://github.com/njfuzrs/claude-trace.git
-cd claude-trace
-
-# 2. 装依赖（唯一外部依赖是 aiohttp）
-pip3 install -r requirements.txt
-
-# 3. 运行安装器（开机自启 + 崩溃重启 + 默认开启统一采集，只需执行一次）
-#    上传默认关闭，安装过程会显式询问，不填即不上传
-bash dist/install.sh
-
-# 4. 安装完成后，如需再次拉起统一采集，只需一个命令
-claude-trace start
-
-# 5. 查看状态 / 日志
-claude-trace status
-claude-trace logs
+curl -fsSL https://github.com/njfuzrs/claude-trace/releases/latest/download/install.sh | bash
 ```
 
-也可以不装服务、直接从仓库跑守护进程：
+安装器会询问 API Token，部署 Hooks，写入 `~/.claude/settings.json`，并拉起 launchd 服务。上传默认关闭，不填即不上传。之后：
 
 ```bash
-./install-daemon.sh install   # 注册 launchd 服务（推荐）
+claude-trace status
+claude-trace logs
+claude-trace version    # 同时打印版本号、二进制 sha256、mtime
+```
+
+目前只提供 macOS arm64 的预编译包。Intel Mac 请走下面的源码路径，或等对应架构的 Release。
+
+**开发者：从源码装。** 仓库内跑 `bash dist/install.sh` 会拷 `dist/$ARCH/` 里刚构建的二进制，**不会**去 GitHub 下载。没有预构建二进制时会退回 `python3 trace_agent.py` 包装。
+
+```bash
+git clone https://github.com/njfuzrs/claude-trace.git
+cd claude-trace
+pip3 install -r requirements.txt
+./build/build.sh                 # 产出 dist/arm64/claude-trace-proxy
+bash dist/install.sh             # 本地安装模式
+```
+
+也可以不装到 `~/.claude-trace/`，直接从仓库跑守护进程：
+
+```bash
+./install-daemon.sh install            # 注册 launchd（开发入口，走 python3 trace_agent.py）
+./install-daemon.sh install --watch    # 额外装文件监听（改 .py 自动重启；生产二进制模式不要装）
 # 或
-./proxy-daemon.sh             # 前台跑，Ctrl-C 停
+./proxy-daemon.sh                      # 前台跑，Ctrl-C 停
 ```
 
 安装器会自动部署 Hooks、写入 `~/.claude/settings.json`，并立即拉起统一采集服务。配置完成后，以后每次正常启动 `claude` 即可，Claude 请求会自动经过本地统一采集器；同时统一守护进程也会默认持续监听本机 `~/.codex`，增量采集 Codex 会话到 `./trajectories/` 目录，无需额外配置。
@@ -202,13 +209,40 @@ Codex CLI
 
 ## 安装
 
+要求：macOS。预编译包目前只打 arm64；源码路径需要 Python 3.10 或更高。
+
+### 从 GitHub Release 安装（推荐）
+
+```bash
+curl -fsSL https://github.com/njfuzrs/claude-trace/releases/latest/download/install.sh | bash
+
+# 指定版本
+curl -fsSL https://github.com/njfuzrs/claude-trace/releases/download/v0.3.0/install.sh | bash
+```
+
+非交互：
+
+```bash
+curl -fsSL https://github.com/njfuzrs/claude-trace/releases/latest/download/install.sh \
+  | bash -s -- --non-interactive
+# 必填：ANTHROPIC_AUTH_TOKEN
+# 可选：UPSTREAM_URL / TRAJ_PLATFORM_URL / TRAJ_UPLOAD_TOKEN / PORT
+```
+
+### 从源码安装（开发用）
+
+必须先构建，否则安装器会退回 Python 包装，而不是装二进制：
+
 ```bash
 git clone https://github.com/njfuzrs/claude-trace.git
 cd claude-trace
-pip3 install -r requirements.txt   # 只需要 aiohttp
+pip3 install -r requirements.txt
+./build/build.sh
+bash dist/install.sh
 ```
 
-要求：macOS + Python 3.10 或更高。
+仓库内且未设置 `RELEASE_BASE` 时，安装器走本地拷贝，不会去 GitHub 下载。
+显式设置 `RELEASE_BASE` 则强制走远程（用于模拟 Release 安装）。
 
 ---
 
@@ -246,8 +280,15 @@ Claude Code 退出后，统一采集器自动停止。
 
 **方法 A：launchd 自启动（推荐 macOS）**
 
+最终用户：
+
 ```bash
-# 一键安装并启动（开机自启 + 崩溃重启）
+curl -fsSL https://github.com/njfuzrs/claude-trace/releases/latest/download/install.sh | bash
+```
+
+开发者（仓库内，需先 `./build/build.sh`）：
+
+```bash
 bash dist/install.sh
 ```
 
@@ -266,8 +307,9 @@ claude-trace uninstall    # 卸载服务
 自定义参数通过环境变量传入：
 
 ```bash
-# 自定义上游和端口
-PORT=5000 UPSTREAM_URL=https://api.anthropic.com bash dist/install.sh --non-interactive
+# 自定义上游和端口（非交互）
+PORT=5000 UPSTREAM_URL=https://api.anthropic.com \
+  ANTHROPIC_AUTH_TOKEN=sk-... bash dist/install.sh --non-interactive
 ```
 
 **方法 B：手动 nohup 启动**
@@ -789,9 +831,12 @@ python3 merger.py --all \
 | `combine_trajs.py` | 合并 + shuffle SFT 数据 |
 | `start.sh` | 一键启动脚本 |
 | `proxy-daemon.sh` | 自动重启的守护进程脚本 |
-| `dist/install.sh` | 一键安装器，安装后默认拉起统一采集服务，并创建 `claude-trace` 命令 |
-| `dist/claude-trace` | 安装后的统一 CLI 入口，用于 `start/status/logs/uninstall` |
-| `install-daemon.sh` | 旧版 launchd 安装脚本（保留兼容） |
+| `dist/install.sh` | 一键安装器。仓库内走本地拷贝；`curl \| bash` 走 GitHub Releases |
+| `dist/claude-trace` | 安装后的统一 CLI 入口，用于 `start/status/restart/logs/uninstall/version` |
+| `install-daemon.sh` | 开发用 launchd 安装脚本（走 `python3 trace_agent.py`）。`--watch` 才装文件监听 |
+| `version` | 版本号单一事实源。改版本用 `./build/release.sh --bump x.y.z` |
+| `build/build.sh` | PyInstaller 打包，产出 `dist/{arch}/claude-trace-proxy` |
+| `build/release.sh` | 打包 + 可选上传 GitHub Releases。`--bump` 同步改 version / pyproject / CHANGELOG |
 | `import_codex.py` | Codex 手工导入 + rollout watcher 持续采集 |
 | `codex-daemon.sh` | 自动重启的 Codex watcher 守护进程脚本 |
 | `install-codex-daemon.sh` | 安装/卸载 Codex watcher 的 launchd 自启动服务（macOS） |

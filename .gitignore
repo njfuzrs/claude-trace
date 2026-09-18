@@ -11,6 +11,7 @@ build/_build/
 dist/arm64/
 dist/x86_64/
 dist/*.tar.gz
+dist/install.sh.release
 *.spec.bak
 
 # 本机开发配置（含绝对路径，仅供参考模板 .claude/settings.json.example）
@@ -32,3 +33,6 @@ build/_venv/
 
 # 日志
 *.log
+
+# Claude Code 会话导出，不入库
+*-local-command-caveat*

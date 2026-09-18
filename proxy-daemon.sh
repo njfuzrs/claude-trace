@@ -1,8 +1,13 @@
 #!/bin/bash
-# proxy-daemon.sh — 自动重启的代理守护进程
+# proxy-daemon.sh — 自动重启的统一采集守护进程（开发版）
 # 被 kill 后自动重启，直到收到 SIGTERM 两次或删除 PID 文件
 #
 # 支持 launchd 环境：所有路径使用绝对路径，不依赖 $PWD
+#
+# 入口必须是 trace_agent.py，不是 proxy.py。
+# 两套入口曾经各修各的：9 月 17 日修 proxy.py 漏了 trace_agent.py 的 hiddenimports，
+# 打包后的二进制在「会话超时后又提问」时 ImportError。开发模式和生产模式走同一入口，
+# 修一处两边都生效。proxy.py:main() 仍留给单测和 --upload-status。
 
 PORT="${PORT:-4000}"
 UPSTREAM="${UPSTREAM:-https://api.anthropic.com}"
@@ -21,7 +26,7 @@ mkdir -p "$OUTPUT"
 echo $$ > "$PID_FILE"
 
 cleanup() {
-    echo "$(date '+%H:%M:%S') [DAEMON] 守护进程退出，等待代理收尾…" >> "$LOG_FILE"
+    echo "$(date '+%H:%M:%S') [DAEMON] 守护进程退出，等待采集器收尾…" >> "$LOG_FILE"
     rm -f "$PID_FILE"
     # 转发 SIGTERM 并等它走完优雅退出（导出 traj + 持久化上传队列）。
     #
@@ -35,10 +40,10 @@ cleanup() {
             sleep 0.1
         done
         if kill -0 "$CHILD_PID" 2>/dev/null; then
-            echo "$(date '+%H:%M:%S') [DAEMON] 代理 15 秒未退出，强制终止" >> "$LOG_FILE"
+            echo "$(date '+%H:%M:%S') [DAEMON] 采集器 15 秒未退出，强制终止" >> "$LOG_FILE"
             kill -KILL "$CHILD_PID" 2>/dev/null
         else
-            echo "$(date '+%H:%M:%S') [DAEMON] 代理已优雅退出" >> "$LOG_FILE"
+            echo "$(date '+%H:%M:%S') [DAEMON] 采集器已优雅退出" >> "$LOG_FILE"
         fi
     fi
     exit 0
@@ -46,8 +51,8 @@ cleanup() {
 trap cleanup SIGTERM SIGINT
 
 while true; do
-    echo "$(date '+%H:%M:%S') [DAEMON] 启动代理..." >> "$LOG_FILE"
-    python3 "$SCRIPT_DIR/proxy.py" \
+    echo "$(date '+%H:%M:%S') [DAEMON] 启动统一采集器..." >> "$LOG_FILE"
+    python3 "$SCRIPT_DIR/trace_agent.py" \
         --port "$PORT" \
         --output "$OUTPUT" \
         --upstream "$UPSTREAM" \
@@ -65,6 +70,6 @@ while true; do
         exit 0
     fi
 
-    echo "$(date '+%H:%M:%S') [DAEMON] 代理退出 (code=$EXIT_CODE)，2 秒后重启..." >> "$LOG_FILE"
+    echo "$(date '+%H:%M:%S') [DAEMON] 统一采集器退出 (code=$EXIT_CODE)，2 秒后重启..." >> "$LOG_FILE"
     sleep 2
 done

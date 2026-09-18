@@ -3,8 +3,8 @@
 claude-trace proxy.py — HTTP 代理服务器
 通道 A：透明转发 Claude Code 的 API 请求，SSE Tee 模式采集完整轨迹数据
 
-用法：
-    python proxy.py --port 4000 --output ./trajectories
+用法（日常入口是 trace_agent.py；本文件的 main 留给单测和 --upload-status）：
+    python3 trace_agent.py --port 4000 --output ./trajectories
     ANTHROPIC_BASE_URL=http://localhost:4000 claude
 """
 
@@ -36,6 +36,7 @@ from builder import (
 )
 from git_state import coerce_git_state, collect_git_state, flatten_git_state
 from uploader import UploadManager
+from version_info import build_fingerprint, resolve_version, version_string
 
 # ─────────────────────────────────────────────
 # 日志配置
@@ -1769,6 +1770,11 @@ async def handle_health(request: web.Request) -> web.Response:
 
     payload = {
         "status": "ok",
+        # 版本与构建指纹：回答「现在这个端口上跑的到底是哪一份」。
+        # 只报版本号不够 —— 同一个 0.2.0 曾对应过行为不同的两份二进制，
+        # 于是「以为在跑今天的修复，实际在跑 13 天前的包」无法被发现。
+        "version": resolve_version(),
+        "build": build_fingerprint() or ("source" if not getattr(sys, "frozen", False) else ""),
         "active_sessions": len(session_manager.active_sessions),
         "pending_sessions": len(session_manager._pending_sessions),
     }
@@ -1862,6 +1868,10 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="claude-trace — Claude Code HTTP 代理 + 轨迹采集",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--version", action="version", version=version_string(),
+        help="打印版本与构建指纹后退出",
     )
     parser.add_argument("--port", type=int, default=4000, help="代理监听端口")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1，防止局域网访问）")
@@ -1980,7 +1990,7 @@ async def main():
     await site.start()
 
     logger.info("=" * 50)
-    logger.info("claude-trace 代理已启动")
+    logger.info("claude-trace 代理已启动 | %s", version_string())
     logger.info("监听地址: http://%s:%d", args.host, args.port)
     logger.info("上游 API:  %s", args.upstream)
     logger.info("输出目录:  %s", output_dir.resolve())
@@ -2007,8 +2017,10 @@ async def main():
     #
     # 修复前只 catch KeyboardInterrupt —— 而 SIGTERM 的默认处置是直接终止进程，
     # finally 一行都不执行：活跃会话的最终导出、上传队列持久化全部跳过。
-    # 偏偏 install-daemon.sh 的 restart 用的是 `launchctl kickstart -k`，
+    # 偏偏老的 install-daemon.sh restart 用的是 `launchctl kickstart -k`，
     # 那正是 SIGTERM，也就是文档推荐的恢复动作本身在丢数据。
+    # 现在 restart 已改成 bootout + bootstrap，但 SIGTERM 这条路径仍要接住：
+    # launchd 停服务、用户 kill、二次信号之前的第一次，全都走它。
     # SIGHUP 同样要接（关终端 / SSH 断连），它的默认处置也是终止。
     stop_event = asyncio.Event()
     received_signal: List[str] = []

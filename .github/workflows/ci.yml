@@ -88,3 +88,24 @@ jobs:
             echo "::error::代理默认监听地址不得为 0.0.0.0"
             exit 1
           fi
+
+      - name: 版本号两处必须一致
+        # version 文件是单一事实源，pyproject.toml 另写了一份。
+        # 人肉同步注定会漏；漏掉的后果不是报错，而是发出去的包与包元数据对不上。
+        run: |
+          FILE_VER=$(tr -d '[:space:]' < version)
+          if ! grep -E "^version = \"${FILE_VER}\"" pyproject.toml; then
+            echo "::error::version 文件是 ${FILE_VER}，pyproject.toml 对不上。用 ./build/release.sh --bump 一次改全。"
+            grep -n '^version' pyproject.toml || true
+            exit 1
+          fi
+
+      - name: 安装器候选名含带版本的 tarball
+        # 曾经 basename 拿到 v0.x.x，正则要求以数字开头，带版本号的候选名被跳过，
+        # 发了 Release 用户也 404。这条门禁不真装，只跑 --print-plan。
+        run: |
+          out=$(VERSION=0.3.0 ARCH=arm64 RELEASE_BASE=https://example.invalid/download/v0.3.0 \
+                bash dist/install.sh --print-plan)
+          echo "$out"
+          echo "$out" | grep -qxF "candidate=claude-trace-0.3.0-darwin-arm64.tar.gz"
+          echo "$out" | grep -qxF "install_mode=remote"

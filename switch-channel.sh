@@ -148,27 +148,26 @@ with open(path, "wb") as f:
 print("  ✅ plist 已更新")
 PYEOF
 
-        # 3. 重启代理（unload+load 让 plist 新环境变量生效）
-        #    先停掉旧服务和进程，再重新加载
-        local was_running=false
+        # 改了 plist 必须 bootout + bootstrap，不是 unload/load，也不是 kickstart。
+        # unload/load 是旧 API，对 bootstrap 装上的 job 经常是空操作，
+        # 表现为「渠道切了、上游没变」；kickstart 不重读 plist。
         if launchctl list "$LABEL" &>/dev/null; then
-            was_running=true
-            launchctl unload "$PLIST" 2>/dev/null || true
+            launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
         fi
 
-        # 确保端口释放（unload 可能不会立即杀掉 Python 子进程）
-        local proxy_pid
-        proxy_pid=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+        local proxy_pid=""
+        for _ in $(seq 1 50); do
+            proxy_pid=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+            [ -z "$proxy_pid" ] && break
+            sleep 0.2
+        done
         if [ -n "$proxy_pid" ]; then
-            kill "$proxy_pid" 2>/dev/null
-            for i in 1 2 3; do
-                lsof -ti tcp:"$PORT" -sTCP:LISTEN &>/dev/null || break
-                sleep 1
-            done
+            echo "  ⚠️  端口 $PORT 仍被占用 (PID: $proxy_pid)，终止残留进程"
+            kill "$proxy_pid" 2>/dev/null || true
+            sleep 1
         fi
 
-        # 重新加载 plist 并启动
-        launchctl load "$PLIST" 2>/dev/null
+        launchctl bootstrap "gui/$(id -u)" "$PLIST"
         if launchctl list "$LABEL" &>/dev/null; then
             echo "  ✅ 代理已重启（plist 已重新加载）"
         else

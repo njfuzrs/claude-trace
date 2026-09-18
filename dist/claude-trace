@@ -64,6 +64,17 @@ elif channels:
 else:
     ch = {}
 upload = config.get('upload', {})
+
+
+def flag(value, default):
+    '''把 JSON 里的 true/false 归一成 launchd 认的 'true'/'false' 字符串'''
+    if value is None:
+        value = default
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    return 'true' if str(value).strip().lower() in ('1', 'true', 'yes', 'on') else 'false'
+
+
 vals = [
     ch.get('upstream', 'https://api.anthropic.com'),
     str(ch.get('force_thinking', 0)),
@@ -71,7 +82,10 @@ vals = [
     upload.get('upload_token', ''),
     upload.get('user_id', ''),
     upload.get('device_id', ''),
-    str(upload.get('cleanup_after_upload', 'true')),
+    # 兜底 false：与 uploader.py / proxy.py / install-daemon.sh 一致。
+    # 兜底 'true' 会让老配置（没这个键）一执行 start 就变成「上传成功即删本地」。
+    flag(upload.get('cleanup_after_upload'), False),
+    flag(upload.get('backfill_on_start'), True),
 ]
 print('\n'.join(vals))
 " "$CONFIG")
@@ -82,6 +96,7 @@ print('\n'.join(vals))
         TRAJ_USER_ID="$(echo "$_cfg" | sed -n '5p')"
         TRAJ_DEVICE_ID="$(echo "$_cfg" | sed -n '6p')"
         TRAJ_CLEANUP_AFTER_UPLOAD="$(echo "$_cfg" | sed -n '7p')"
+        TRAJ_BACKFILL_ON_START="$(echo "$_cfg" | sed -n '8p')"
     else
         UPSTREAM="${UPSTREAM:-https://api.anthropic.com}"
         FORCE_THINKING="${FORCE_THINKING:-0}"
@@ -89,58 +104,71 @@ print('\n'.join(vals))
         TRAJ_UPLOAD_TOKEN=""
         TRAJ_USER_ID=""
         TRAJ_DEVICE_ID=""
-        TRAJ_CLEANUP_AFTER_UPLOAD="true"
+        TRAJ_CLEANUP_AFTER_UPLOAD="false"
+        TRAJ_BACKFILL_ON_START="true"
     fi
 
-    # 生成 plist
-    cat > "$PLIST_PATH" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/bash</string>
-        <string>${INSTALL_DIR}/proxy-daemon.sh</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PORT</key>
-        <string>${PORT}</string>
-        <key>UPSTREAM</key>
-        <string>${UPSTREAM}</string>
-        <key>OUTPUT</key>
-        <string>${INSTALL_DIR}/trajectories</string>
-        <key>FORCE_THINKING</key>
-        <string>${FORCE_THINKING}</string>
-        <key>TRAJ_PLATFORM_URL</key>
-        <string>${TRAJ_PLATFORM_URL}</string>
-        <key>TRAJ_UPLOAD_TOKEN</key>
-        <string>${TRAJ_UPLOAD_TOKEN}</string>
-        <key>TRAJ_USER_ID</key>
-        <string>${TRAJ_USER_ID}</string>
-        <key>TRAJ_DEVICE_ID</key>
-        <string>${TRAJ_DEVICE_ID}</string>
-        <key>TRAJ_CLEANUP_AFTER_UPLOAD</key>
-        <string>${TRAJ_CLEANUP_AFTER_UPLOAD}</string>
-        <key>PATH</key>
-        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    </dict>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>${LOG_FILE}</string>
-    <key>StandardErrorPath</key>
-    <string>${LOG_FILE}</string>
-    <key>WorkingDirectory</key>
-    <string>${INSTALL_DIR}</string>
-</dict>
-</plist>
-PLIST
+    # 写 plist：只更新已知键，保留人工加过的其他键。
+    #
+    # 老实现用 heredoc 整文件覆盖，于是「手工给 plist 补过的键」在下一次
+    # claude-trace start 后全部消失 —— 部署记录里明确写过「不要随后跑
+    # claude-trace start，它会把刚加上的 ExitTimeOut / BACKFILL 抹掉」。
+    # 一个需要用户绕开的命令不算可用命令，所以改成合并写入。
+    python3 - "$PLIST_PATH" <<PYEOF
+import plistlib
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+
+known = {
+    "Label": "${LABEL}",
+    "ProgramArguments": ["/bin/bash", "${INSTALL_DIR}/proxy-daemon.sh"],
+    "RunAtLoad": True,
+    "KeepAlive": True,
+    # 大于 daemon 等子进程收尾的 15 秒，否则 launchd 先动手，
+    # 采集器的最终导出与上传队列持久化被砍在半路。
+    "ExitTimeOut": 25,
+    "StandardOutPath": "${LOG_FILE}",
+    "StandardErrorPath": "${LOG_FILE}",
+    "WorkingDirectory": "${INSTALL_DIR}",
+}
+known_env = {
+    "PORT": "${PORT}",
+    "UPSTREAM": "${UPSTREAM}",
+    "OUTPUT": "${INSTALL_DIR}/trajectories",
+    "FORCE_THINKING": "${FORCE_THINKING}",
+    "TRAJ_PLATFORM_URL": "${TRAJ_PLATFORM_URL}",
+    "TRAJ_UPLOAD_TOKEN": "${TRAJ_UPLOAD_TOKEN}",
+    "TRAJ_USER_ID": "${TRAJ_USER_ID}",
+    "TRAJ_DEVICE_ID": "${TRAJ_DEVICE_ID}",
+    "TRAJ_CLEANUP_AFTER_UPLOAD": "${TRAJ_CLEANUP_AFTER_UPLOAD}",
+    "TRAJ_BACKFILL_ON_START": "${TRAJ_BACKFILL_ON_START}",
+    "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+}
+
+data = {}
+if path.exists():
+    try:
+        with path.open("rb") as f:
+            data = plistlib.load(f)
+    except Exception:
+        data = {}  # 损坏的 plist 直接重建，不然服务永远起不来
+
+env = data.get("EnvironmentVariables")
+if not isinstance(env, dict):
+    env = {}
+env.update(known_env)
+
+data.update(known)
+data["EnvironmentVariables"] = env
+
+path.parent.mkdir(parents=True, exist_ok=True)
+tmp = path.with_suffix(path.suffix + ".tmp")
+with tmp.open("wb") as f:
+    plistlib.dump(data, f)
+tmp.replace(path)
+PYEOF
 
     launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
 
@@ -219,11 +247,37 @@ do_status() {
 # ─── restart ───
 
 do_restart() {
-    if launchctl list "$LABEL" &>/dev/null; then
-        launchctl kickstart -k "gui/$(id -u)/$LABEL"
-        echo "✅ 服务已重启"
-    else
+    if ! launchctl list "$LABEL" &>/dev/null; then
         echo "服务未安装，执行 start..."
+        do_start
+        return
+    fi
+
+    # bootout + bootstrap，不是 kickstart。
+    #
+    # kickstart -k 只重启进程，plist 不重读、磁盘上换过的二进制也不一定被换上 ——
+    # 用户改完配置执行 restart，看到「已重启」却还在跑旧配置旧二进制。
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+
+    # 等端口真正释放再拉起，否则新实例起来就撞 EADDRINUSE，
+    # 被 KeepAlive 反复重启，表面上服务在跑，实际一直起不来。
+    local pid
+    for _ in $(seq 1 50); do
+        pid=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+        [ -z "$pid" ] && break
+        sleep 0.2
+    done
+    if [ -n "${pid:-}" ]; then
+        echo "⚠️  端口 $PORT 仍被占用 (PID: $pid)，尝试终止残留进程"
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+    fi
+
+    if [ -f "$PLIST_PATH" ]; then
+        launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+        echo "✅ 服务已重启（已重新加载 $PLIST_PATH）"
+    else
+        echo "未找到 $PLIST_PATH，执行 start 重建配置..."
         do_start
     fi
 }
@@ -347,30 +401,9 @@ with open(path, "wb") as f:
 print("  ✅ plist 已更新")
 PYEOF
 
-                # 重启服务
-                local was_running=false
-                if launchctl list "$LABEL" &>/dev/null; then
-                    was_running=true
-                    launchctl unload "$PLIST_PATH" 2>/dev/null || true
-                fi
-
-                # 确保端口释放
-                local proxy_pid
-                proxy_pid=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
-                if [ -n "$proxy_pid" ]; then
-                    kill "$proxy_pid" 2>/dev/null || true
-                    for i in 1 2 3; do
-                        lsof -ti tcp:"$PORT" -sTCP:LISTEN &>/dev/null || break
-                        sleep 1
-                    done
-                fi
-
-                launchctl load "$PLIST_PATH" 2>/dev/null
-                if launchctl list "$LABEL" &>/dev/null; then
-                    echo "  ✅ 统一采集器已重启"
-                else
-                    echo "  ❌ 统一采集器启动失败，请检查: claude-trace logs"
-                fi
+                # 改了 plist 必须 bootout + bootstrap。unload/load 是旧 API，
+                # 在已用 bootstrap 装上的 job 上经常是空操作，表现为「渠道切了、上游没变」。
+                do_restart
             else
                 echo "  ⚠️  plist 不存在，请先执行: claude-trace start"
             fi
@@ -520,6 +553,34 @@ do_version() {
         echo "claude-trace v$(cat "$INSTALL_DIR/version")"
     else
         echo "claude-trace（版本未知）"
+    fi
+
+    # 版本号不足以识别一份构建：同一个 0.2.0 曾对应过行为完全不同的两份二进制
+    # （相差 13 天、session-timeout 从 300 变 1800、多出 --upload-status）。
+    # 排查「我到底在跑哪一份」时，真正有用的是 sha256 与 mtime。
+    local bin="$INSTALL_DIR/bin/claude-trace-proxy"
+    if [ -f "$bin" ]; then
+        echo "  二进制:  $bin"
+        echo "  sha256:  $(shasum -a 256 "$bin" 2>/dev/null | cut -d' ' -f1)"
+        echo "  构建于:  $(stat -f '%Sm' -t '%Y-%m-%d %H:%M:%S' "$bin" 2>/dev/null)"
+        # 跑一次二进制自己的 --version：它读的是打进包内的 version 文件，
+        # 和上面那行安装目录里的 version 文件不是同一份。不一致就说明
+        # 装上的 CLI/version 文件和正在跑的 Mach-O 不是一次构建。
+        local bin_ver
+        bin_ver="$("$bin" --version 2>/dev/null || true)"
+        if [ -n "$bin_ver" ]; then
+            echo "  自报:    $bin_ver"
+            local file_ver
+            file_ver="$(cat "$INSTALL_DIR/version" 2>/dev/null || true)"
+            case "$bin_ver" in
+                *" $file_ver "*) ;;
+                *)
+                    echo "  ⚠️  安装目录 version 文件是 $file_ver，二进制自报不一致"
+                    ;;
+            esac
+        fi
+    else
+        echo "  二进制:  未安装（$bin 不存在）"
     fi
 }
 

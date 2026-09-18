@@ -2,10 +2,15 @@
 # install-daemon.sh — 安装/卸载 claude-trace 代理的 launchd 自启动服务
 #
 # 用法：
-#   ./install-daemon.sh install    # 安装并启动服务
-#   ./install-daemon.sh uninstall  # 停止并卸载服务
-#   ./install-daemon.sh status     # 查看服务状态
-#   ./install-daemon.sh restart    # 重启服务
+#   ./install-daemon.sh install           # 安装并启动服务（不装文件监听）
+#   ./install-daemon.sh install --watch   # 同时安装文件监听（开发用，改 .py 自动重启）
+#   ./install-daemon.sh uninstall         # 停止并卸载服务
+#   ./install-daemon.sh status            # 查看服务状态
+#   ./install-daemon.sh restart           # 重启服务
+#
+# 文件监听默认不装。曾经默认装在同一台生产采集机上，改仓库 .py 会 kickstart
+# 正在跑的二进制 —— 重启的是 ~/.claude-trace 里的旧包，还会按当时的 300s
+# 超时把活会话切碎。生产二进制模式禁止装它。
 
 set -euo pipefail
 
@@ -35,14 +40,16 @@ TRAJ_DEVICE_ID="${TRAJ_DEVICE_ID:-}"
 TRAJ_CLEANUP_AFTER_UPLOAD="${TRAJ_CLEANUP_AFTER_UPLOAD:-false}"
 # 启动补传：扫描盘上未上传的会话并补齐，上传链路的兜底
 TRAJ_BACKFILL_ON_START="${TRAJ_BACKFILL_ON_START:-true}"
+INSTALL_WATCH=false
 
 usage() {
-    echo "用法: $0 {install|uninstall|status|restart}"
+    echo "用法: $0 {install [--watch]|uninstall|status|restart}"
     echo ""
-    echo "  install    安装 launchd 服务（开机自启 + 崩溃重启）"
-    echo "  uninstall  停止并卸载服务"
-    echo "  status     查看服务运行状态"
-    echo "  restart    重启服务"
+    echo "  install            安装 launchd 服务（开机自启 + 崩溃重启）"
+    echo "  install --watch    同时安装文件监听（开发用，改 .py 自动重启）"
+    echo "  uninstall          停止并卸载服务"
+    echo "  status             查看服务运行状态"
+    echo "  restart            重启服务"
     echo ""
     echo "环境变量："
     echo "  PORT=$PORT"
@@ -189,8 +196,13 @@ PLIST
     echo ""
     echo "验证: curl -s http://127.0.0.1:$PORT/_internal/health"
 
-    # 安装文件监听服务
-    install_watch
+    # 文件监听只在显式 --watch 时安装。默认路径曾经顺手装上，
+    # 生产二进制模式就会被仓库 .py 的保存触发 kickstart，重启的是旧包。
+    if [ "$INSTALL_WATCH" = true ]; then
+        install_watch
+    else
+        echo "ℹ️  未安装文件监听（开发时加 --watch：./install-daemon.sh install --watch）"
+    fi
 }
 
 do_uninstall() {
@@ -261,17 +273,56 @@ do_status() {
 }
 
 do_restart() {
-    if launchctl list "$LABEL" &>/dev/null; then
-        launchctl kickstart -k "gui/$(id -u)/$LABEL"
-        echo "✅ 服务已重启"
-    else
+    if ! launchctl list "$LABEL" &>/dev/null; then
         echo "服务未安装，执行 install..."
+        do_install
+        return
+    fi
+
+    # bootout + bootstrap，不是 kickstart。
+    #
+    # kickstart -k 只重启进程、不重读 plist：改完 plist 里的 env（上游、上传开关）
+    # 执行 restart，会看到「已重启」但跑的还是旧配置。watch-reload.sh 也走这条路径，
+    # 所以源码改动后的自动重启同样吃不到 plist 变更。
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+
+    # 等端口释放再拉起，否则新实例撞 EADDRINUSE，被 KeepAlive 反复重启，
+    # 表面上服务在跑，实际一直起不来。
+    local pid=""
+    for _ in $(seq 1 50); do
+        pid=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+        [ -z "$pid" ] && break
+        sleep 0.2
+    done
+    if [ -n "$pid" ]; then
+        echo "⚠️  端口 $PORT 仍被占用 (PID: $pid)，终止残留进程"
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+    fi
+
+    if [ -f "$PLIST_PATH" ]; then
+        launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+        echo "✅ 服务已重启（已重新加载 $PLIST_PATH）"
+    else
+        echo "未找到 $PLIST_PATH，执行 install 重建配置..."
         do_install
     fi
 }
 
 case "${1:-}" in
-    install)   do_install ;;
+    install)
+        shift
+        for arg in "$@"; do
+            case "$arg" in
+                --watch) INSTALL_WATCH=true ;;
+                *)
+                    echo "未知参数: $arg"
+                    usage
+                    ;;
+            esac
+        done
+        do_install
+        ;;
     uninstall) do_uninstall ;;
     status)    do_status ;;
     restart)   do_restart ;;

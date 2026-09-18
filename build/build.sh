@@ -78,10 +78,16 @@ echo "✅ 构建成功"
 echo "   二进制: $BINARY"
 echo "   大小:   $BINARY_SIZE"
 
-# 快速验证：检查二进制能否启动（打印 help 后退出）
+# 快速验证：检查二进制能否启动（打印 help 后退出），
+# 以及 --version 能读到打进包内的 version 文件。漏了 datas 时这里会报 unknown。
 "$BINARY" --help >/dev/null 2>&1 || {
     echo "⚠️  警告：二进制无法执行 --help，可能存在打包问题"
 }
+BIN_VER="$("$BINARY" --version 2>/dev/null || true)"
+echo "   自报:   $BIN_VER"
+if ! echo "$BIN_VER" | grep -q "$VERSION"; then
+    echo "⚠️  警告：二进制 --version 未包含 $VERSION（version 文件可能没打进 datas）"
+fi
 
 # 打包 tarball
 if [ "${1:-}" = "--package" ] || [ "${2:-}" = "--package" ]; then

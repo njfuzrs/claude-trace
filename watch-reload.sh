@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # watch-reload.sh — 监听核心 Python 文件变更，自动重启代理
 #
-# 使用 fswatch 监听 proxy.py / uploader.py / builder.py / collector.py，
+# 使用 fswatch 监听 trace_agent.py / proxy.py / uploader.py / builder.py / collector.py，
 # 文件保存后自动执行 install-daemon.sh restart。
 # 防抖：2 秒内的多次变更只触发一次重启。
 
@@ -29,10 +29,12 @@ trap cleanup EXIT
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 WATCH_FILES=(
+    "$SCRIPT_DIR/trace_agent.py"
     "$SCRIPT_DIR/proxy.py"
     "$SCRIPT_DIR/uploader.py"
     "$SCRIPT_DIR/builder.py"
     "$SCRIPT_DIR/collector.py"
+    "$SCRIPT_DIR/version_info.py"
 )
 
 log() {

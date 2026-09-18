@@ -6,7 +6,7 @@
 
 [project]
 name = "claude-trace"
-version = "0.2.0"   # 单一事实源是根目录的 version 文件，改版本时两处同步
+version = "0.3.0"   # 由 ./build/release.sh --bump 从 version 文件回写，不要手改这一处
 description = "Claude Code / Codex 轨迹采集工具，输出 SWE-agent 兼容的 .traj 格式"
 readme = "README.md"
 license = { text = "MIT" }

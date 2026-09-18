@@ -76,6 +76,8 @@ pre-commit run --all-files         # 一次跑全部门禁
 | `tests/test_sanitize.py` | `proxy.py` 的请求头脱敏 —— 目前唯一的脱敏能力 |
 | `tests/test_session_id.py` | `session_id` 的路径遍历防护 |
 | `tests/test_git_state.py` | `git_state.py` 的 porcelain 解析（纯函数） |
+| `tests/test_version_source.py` | `version` 文件与 `pyproject.toml` 必须一致；`--version` 能自报 |
+| `tests/test_install_plan.py` | 安装器分流与 tarball 文件名拼接（不真装） |
 
 补测试的 PR 一律欢迎。**唯一硬要求**：将来若实现内容级脱敏器（Scrubber），
 没有测试的实现不会被合并 —— 脱敏器是「没测试就等于没有」的那类模块，
@@ -99,6 +101,23 @@ pre-commit run --all-files         # 一次跑全部门禁
 - 把代理默认绑定从 `127.0.0.1` 改成 `0.0.0.0`
 
 这三条都是隐私默认值，见 `SECURITY.md` 的「本工具的隐私边界」。
+
+## 发版
+
+版本号的单一事实源是仓库根的 `version` 文件。`pyproject.toml` 必须与它一致，
+改版本请走脚本，不要人肉只改一处：
+
+```bash
+./build/release.sh --bump 0.4.0     # 同步改 version / pyproject.toml / CHANGELOG
+# 检查 diff，把用户可见的变更填进 CHANGELOG 的 [0.4.0] 段
+git add version pyproject.toml CHANGELOG.md && git commit -m "chore(release): v0.4.0"
+./build/release.sh --upload --tag   # 构建、上传 GitHub Releases、打本地 tag
+```
+
+覆盖已有 Release 需要 `ALLOW_CLOBBER=true`。不要在同一个 tag 下覆盖行为不同的二进制。
+
+目前只在本机 arm64 打包装，没有 CI 自动发版（GitHub-hosted macos-latest 是 Intel）。
+Intel Mac 请走源码路径，或等对应架构的 Release。
 
 ## 上报安全问题
 

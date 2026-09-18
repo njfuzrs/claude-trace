@@ -35,6 +35,7 @@ from proxy import (
     print_upload_status,
 )
 from uploader import UploadManager
+from version_info import version_string
 
 logger = logging.getLogger("claude-trace")
 
@@ -43,6 +44,13 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="claude-trace — Claude Code + Codex 统一轨迹采集",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    # --version 让跑着的进程能自报是哪一次构建。
+    # 只有版本号不够：同一个 0.2.0 曾对应过相差 13 天、行为不同的两份二进制，
+    # 所以 version_string() 连 sha256 前缀一起打出来。
+    parser.add_argument(
+        "--version", action="version", version=version_string(),
+        help="打印版本与构建指纹后退出",
     )
     parser.add_argument("--port", type=int, default=4000, help="Claude 代理监听端口")
     parser.add_argument("--host", default="127.0.0.1", help="Claude 代理监听地址")
@@ -212,7 +220,9 @@ async def main():
     await site.start()
 
     logger.info("=" * 50)
-    logger.info("claude-trace 统一采集器已启动")
+    # 版本写进启动日志：日志是事后排查的唯一现场，
+    # 「这条轨迹是哪份构建采的」必须能从日志里读出来，而不是靠回忆当时装了什么。
+    logger.info("claude-trace 统一采集器已启动 | %s", version_string())
     logger.info("Claude 监听地址: http://%s:%d", args.host, args.port)
     logger.info("Claude 上游 API: %s", args.upstream)
     logger.info("输出目录: %s", output_dir.resolve())
