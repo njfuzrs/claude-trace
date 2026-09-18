@@ -25,6 +25,18 @@ PROXY_BASE = f"http://127.0.0.1:{PROXY_PORT}"
 # P0 #5: session_id 只允许字母数字和连字符，防止路径遍历
 _SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
+# 官方 OTel tool_decision.source。只有决策字段也在时才抄 source，避免
+# SessionStart/End 的 source（startup/resume）被当成决策来源。
+_OFFICIAL_DECISION_SOURCES = frozenset({
+    "config", "hook", "user_permanent", "user_temporary", "user_abort", "user_reject",
+})
+_DECISION_FIELD_KEYS = (
+    "decision",
+    "permission_decision",
+    "decision_source",
+    "permission_decision_source",
+)
+
 
 def notify_proxy(endpoint: str, data: dict):
     """通过 HTTP 回调通知代理（非阻塞，失败静默）"""
@@ -38,6 +50,79 @@ def notify_proxy(endpoint: str, data: dict):
         urllib.request.urlopen(req, timeout=2)
     except Exception:
         pass  # 代理未启动或网络异常，静默忽略
+
+
+def copy_decision_fields(event, input_data):
+    """把 Claude Code 可能带上的决策字段抄到事件上。
+
+    2026-09-18 存量扫描（Claude Code 2.1.276）：PostToolUse / Notification /
+    PermissionRequest 都还没有 decision / source。这里先把字段名写进采集路径，
+    官方一旦补决策后 hook，events.jsonl 就能接到真实值，不必再改 collector。
+    """
+    for key in _DECISION_FIELD_KEYS:
+        if key in input_data and input_data[key] not in (None, ""):
+            event[key] = input_data[key]
+    # 只有已经有决策时，才把裸 source 当成决策来源
+    if (
+        "decision_source" not in event
+        and "permission_decision_source" not in event
+        and (event.get("decision") or event.get("permission_decision"))
+        and input_data.get("source") in _OFFICIAL_DECISION_SOURCES
+    ):
+        event["decision_source"] = input_data["source"]
+
+
+def permission_mode_change_event(
+    prev_mode,
+    current_mode,
+    timestamp,
+    session_id,
+    cwd,
+    trigger=None,
+):
+    """相邻事件 permission_mode 边沿。trigger 拿不到就空，禁止编造官方枚举。"""
+    if not prev_mode or not current_mode or prev_mode == current_mode:
+        return None
+    changed = {
+        "timestamp": timestamp,
+        "event": "PermissionModeChanged",
+        "session_id": session_id,
+        "cwd": cwd,
+        "permission_mode": current_mode,
+        "from": prev_mode,
+        "to": current_mode,
+    }
+    if trigger:
+        changed["trigger"] = trigger
+    return changed
+
+
+def _mode_state_path(session_id):
+    return EVENTS_DIR / f".{session_id}.perm_mode"
+
+
+def read_last_permission_mode(session_id):
+    """跨 hook 进程记住上一次非空 permission_mode。
+
+    collector 每次都是新进程，不能靠内存做边沿检测。sidecar 只有一行；
+    读失败就当没有上一次，宁可漏一条变更也不能让 hook 崩。
+    """
+    path = _mode_state_path(session_id)
+    try:
+        if path.exists():
+            value = path.read_text(encoding="utf-8").strip()
+            return value or None
+    except Exception:
+        return None
+    return None
+
+
+def write_last_permission_mode(session_id, mode):
+    try:
+        EVENTS_DIR.mkdir(parents=True, exist_ok=True)
+        _mode_state_path(session_id).write_text(mode, encoding="utf-8")
+    except Exception:
+        pass
 
 
 # git 状态采集来自共享模块 git_state.py。
@@ -140,6 +225,7 @@ def main():
             # 工具执行失败：记录错误信息，用于标注失败轨迹
             event["error"] = input_data.get("error")
             event["tool_response"] = input_data.get("tool_response")
+        copy_decision_fields(event, input_data)
 
     elif event_name in ("SubagentStart", "SubagentStop"):
         event["agent_id"] = input_data.get("agent_id")
@@ -170,13 +256,17 @@ def main():
     elif event_name == "Notification":
         event["message"] = input_data.get("message")
         event["title"] = input_data.get("title")
+        copy_decision_fields(event, input_data)
 
     # ── P2 事件 ──────────────────────────────────────────────
     elif event_name == "PermissionRequest":
-        # P2 fix: PermissionRequest 是 pre-hook，在用户做决定之前触发，
-        # 不会有 decision 字段。只记录请求的工具名和参数。
+        # PermissionRequest 是 pre-hook，发生在用户点按钮之前。
+        # 2.1.276 实测没有 decision / tool_use_id；两者都抄，官方一旦补上就能接到。
         event["tool_name"] = input_data.get("tool_name")
         event["tool_input"] = input_data.get("tool_input")
+        if input_data.get("tool_use_id"):
+            event["tool_use_id"] = input_data.get("tool_use_id")
+        copy_decision_fields(event, input_data)
 
     elif event_name == "InstructionsLoaded":
         # P2 fix: 使用 Claude Code 实际传入的字段名，兜底保存完整 input_data
@@ -200,8 +290,27 @@ def main():
     # 追加写入事件文件（按 session_id 分文件）
     EVENTS_DIR.mkdir(parents=True, exist_ok=True)
     events_file = EVENTS_DIR / f"{session_id}.jsonl"
+    current_mode = event.get("permission_mode")
+    mode_changed = None
+    if current_mode:
+        mode_changed = permission_mode_change_event(
+            read_last_permission_mode(session_id),
+            current_mode,
+            timestamp,
+            session_id,
+            event.get("cwd"),
+        )
     with open(events_file, "a") as f:
+        if mode_changed:
+            f.write(json.dumps(mode_changed, ensure_ascii=False) + "\n")
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    if current_mode:
+        write_last_permission_mode(session_id, current_mode)
+    if event_name == "SessionEnd":
+        try:
+            _mode_state_path(session_id).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

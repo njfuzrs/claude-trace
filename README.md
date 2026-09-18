@@ -226,6 +226,25 @@ Codex CLI
 - **补通道（rollout.jsonl）**：补 developer/system 指令、token 用量，并兼容旧版会话缺失的工具 item
 - **异常兜底（sqlite）**：保留 `thread_spawn_edges`、失败日志、索引信息，减少遗漏
 
+### 不是什么
+
+官方 OpenTelemetry（Claude Code 监控页）是可选的旁路观测，**不是**采集通道，
+也替代不了本仓库。训练数据主源永远是 `raw.jsonl`（Claude）和 rollout /
+app-server（Codex）。不要为了「用官方监控」做下面这些事：
+
+| 不要做 | 为什么 |
+| --- | --- |
+| 把 `ANTHROPIC_BASE_URL` 改离 `http://127.0.0.1:4000` | 代理首先是路由器。没起就是 403，官方 OTel 不会转发请求 |
+| 用 `OTEL_LOG_RAW_API_BODIES` 替换 `raw.jsonl` 当 SFT 源 | 官方合同会编辑 extended thinking，训练资产被裁 |
+| 卸 hooks / 停 launchd 代理，指望 OTel 顶上 | SessionStart / SessionEnd 在给代理登记 `session_id`、触发导出和 git 快照 |
+| 默认安装 OTel collector | 多一个必依赖进程，和「代理永不中断」抢运维注意力 |
+| 把 `~/.claude/projects` transcript 当主通道 | 格式不稳定、无 exit_code、无 wire 请求、会和代理双写 |
+| 自建 OTLP receiver 把事件转 `.traj` | 重建 Thought/Action/Observation ≈ 再写一个 builder，thinking 还是没有 |
+| 用官方监控替换 `FORCE_THINKING` | OTel 不改写请求 |
+| 为了 MCP 审计去开 `OTEL_LOG_TOOL_DETAILS` 进默认采集 | PostToolUse 已有 tool_input；缺的是决策 source，由 hooks 推断补 |
+
+看板以后可以旁路接 metrics + 脱敏 events。训练数据永远不要用 OTel raw bodies。
+
 ---
 
 ## 安装
@@ -507,7 +526,7 @@ python3 setup_hooks.py --collector /path/to/collector.py  # 指定 collector 路
 | P1 | SubagentStart / SubagentStop | sub-agent 生命周期 |
 | P1 | PostCompact | context compaction 摘要 |
 | P2 | PreToolUse | 工具调用前参数 |
-| P2 | PermissionRequest | 权限交互 |
+| P2 | PermissionRequest | 权限交互（决策前；无 decision 字段时由 builder 推断） |
 | P2 | InstructionsLoaded | CLAUDE.md 加载 |
 | P2 | StopFailure | API 错误详情 |
 
@@ -659,7 +678,15 @@ trajectories/
     "git_branch": "master",
     "git_dirty": true,               // 工作区是否有未提交改动；null = 未采到
     "git_state": {...},              // 起点完整快照（见下）
-    "git_state_end": {...}           // 终点完整快照
+    "git_state_end": {...},          // 终点完整快照
+    "permission_decisions": [        // 权限决策（不进 SFT 正文）
+      {"tool_use_id": "...", "tool_name": "Bash",
+       "decision": "accept", "source": "inferred_executed",
+       "timestamp": "..."}
+    ],
+    "permission_mode_timeline": [    // 权限模式变更；trigger 拿不到就省略
+      {"timestamp": "...", "from": "default", "to": "plan"}
+    ]
   }
 }
 ```

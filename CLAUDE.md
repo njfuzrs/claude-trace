@@ -112,6 +112,10 @@ pre-commit run --all-files              # 一次跑全部
 - 会话维度存储：所有数据按 `sessions/{session_id}/` 组织，一个会话的 traj、raw、events 放在一起
 - 增量存储：JSONL 首行保存完整 request_body，后续行只保存 new_messages，避免 O(n²) 膨胀
 - 双通道采集：proxy（API 流量）+ hooks（会话事件）通过 session_id 关联
+- 官方 OpenTelemetry 是可选的旁路观测，**不是**采集通道。训练数据主源永远是
+  `raw.jsonl`（Claude）和 rollout / app-server（Codex）。禁止把
+  `ANTHROPIC_BASE_URL` 改离 `http://127.0.0.1:4000` 去「改用官方监控」——
+  代理首先是路由器，没起就是 403。
 - 上传 opt-in：默认关闭，无内置端点与凭据。仅当 `TRAJ_PLATFORM_URL` 与 `TRAJ_UPLOAD_TOKEN`
   同时非空才启用；启用后会话结束时由 `uploader.py` 上传 session.traj + raw.jsonl + events.jsonl。
   `TRAJ_USER_ID` / `TRAJ_DEVICE_ID` 默认留空，不回退到系统用户名与主机名。
