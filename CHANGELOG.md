@@ -8,6 +8,17 @@
 
 ## [Unreleased]
 
+### 新增
+
+- traj `metadata.permission_decisions`：权限决策结果。Claude Code 2.1.276 没有决策后 hook，
+  由 PermissionRequest + 是否随后执行推断 `accept`/`reject`，`source` 为
+  `inferred_executed` / `inferred_not_executed`（不冒充官方 `user_permanent` 等枚举）。
+  官方一旦在 hook 载荷里带上 `decision`，采集器会原样抄。
+- traj `metadata.permission_mode_timeline`：hooks 相邻事件的 `permission_mode` 边沿。
+  collector 另写一条合成事件 `PermissionModeChanged`；`trigger` 拿不到就省略。
+- CLAUDE.md / README 写明：官方 OpenTelemetry 不是采集通道，禁止把
+  `ANTHROPIC_BASE_URL` 改离 `:4000` 去「改用官方监控」。
+
 ### 变更
 
 - 离线 CLI（`viewer` / `sync` / `rebuild_trajs` / `recover_truncated` / `filter_trajs` / `convert_trajs` / `combine_trajs` / `migrate_storage`）从仓库根迁到 `tools/`。采集进程入口与 hooks 部署文件仍平铺在根，不改包结构。调用改为 `python3 tools/<脚本>.py`。

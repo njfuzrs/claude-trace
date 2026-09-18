@@ -64,6 +64,10 @@ class SessionMetadata:
     git_dirty: Optional[bool] = None  # 工作区是否有未提交改动（None = 未采集到）
     git_state: Dict = field(default_factory=dict)      # 会话开始时的完整快照
     git_state_end: Dict = field(default_factory=dict)  # 会话结束时的完整快照
+    # 权限决策 / 权限模式时间线（S1）：不进 Action/Observation 正文，只进 metadata。
+    # decision 的 source 若是推断，必须带 inferred_ 前缀，不得冒充官方枚举。
+    permission_decisions: List[Dict] = field(default_factory=list)
+    permission_mode_timeline: List[Dict] = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────
@@ -422,6 +426,182 @@ def hook_event_name(event: Dict) -> str:
     return event.get("event") or event.get("hook_event_name") or ""
 
 
+# 真实决策字段。不读 SessionStart/End 的 source，避免和决策来源撞名。
+_REAL_DECISION_KEYS = ("decision", "permission_decision")
+_REAL_SOURCE_KEYS = ("decision_source", "permission_decision_source")
+_EXECUTED_EVENTS = frozenset({"PostToolUse", "PostToolUseFailure"})
+# 推断「未执行」时，遇到这些事件就停止向后找同名工具的 Post —— 视为新的一轮。
+_INFER_SEARCH_STOP = frozenset({
+    "PermissionRequest", "UserPromptSubmit", "SessionEnd",
+})
+
+
+def _event_real_decision(event: Dict) -> Optional[str]:
+    """事件上是否已有真实决策字段（Claude Code 将来若补上决策后 hook）。"""
+    for key in _REAL_DECISION_KEYS:
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _event_real_source(event: Dict) -> str:
+    """只读显式的决策 source，不把 SessionStart/End 的 source 当成决策来源。"""
+    for key in _REAL_SOURCE_KEYS:
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def infer_permission_decisions(hook_events: List[Dict]) -> List[Dict]:
+    """从 hook 事件提升或推断权限决策。
+
+    优先级：
+      1. 事件上已有 decision / permission_decision（真实字段，source 原样保留）；
+      2. 否则：有 PermissionRequest，随后有对应 PostToolUse / PostToolUseFailure
+         → decision=accept, source=inferred_executed；
+      3. 有 PermissionRequest 但会话内未见执行
+         → decision=reject, source=inferred_not_executed。
+
+    推断不得使用官方枚举（user_permanent / config 等）。tool_use_id 优先用
+    PermissionRequest 自带的，没有则取紧邻的前一条同名 PreToolUse。
+    """
+    if not hook_events:
+        return []
+
+    executed_ids: Set[str] = set()
+    for event in hook_events:
+        if hook_event_name(event) in _EXECUTED_EVENTS:
+            tid = event.get("tool_use_id")
+            if tid:
+                executed_ids.add(tid)
+
+    results: List[Dict] = []
+    seen_ids: Set[str] = set()
+
+    def _append(record: Dict) -> None:
+        tid = record.get("tool_use_id") or ""
+        if tid and tid in seen_ids:
+            return
+        if tid:
+            seen_ids.add(tid)
+        results.append(record)
+
+    for event in hook_events:
+        name = hook_event_name(event)
+        if name in ("SessionStart", "SessionEnd"):
+            continue
+        decision = _event_real_decision(event)
+        if not decision:
+            continue
+        source = _event_real_source(event)
+        _append({
+            "tool_use_id": event.get("tool_use_id") or "",
+            "tool_name": event.get("tool_name") or "",
+            "decision": decision,
+            "source": source,
+            "timestamp": event.get("timestamp") or "",
+        })
+
+    for idx, event in enumerate(hook_events):
+        if hook_event_name(event) != "PermissionRequest":
+            continue
+        if _event_real_decision(event):
+            continue
+        tool_name = event.get("tool_name") or ""
+        tool_use_id = event.get("tool_use_id") or ""
+        if not tool_use_id:
+            for prev in reversed(hook_events[:idx]):
+                if hook_event_name(prev) == "PreToolUse" and (
+                    prev.get("tool_name") or ""
+                ) == tool_name:
+                    tool_use_id = prev.get("tool_use_id") or ""
+                    break
+        if tool_use_id and tool_use_id in seen_ids:
+            continue
+
+        executed = bool(tool_use_id and tool_use_id in executed_ids)
+        if not executed:
+            for later in hook_events[idx + 1:]:
+                later_name = hook_event_name(later)
+                if later_name in _EXECUTED_EVENTS:
+                    later_id = later.get("tool_use_id") or ""
+                    if tool_use_id and later_id == tool_use_id:
+                        executed = True
+                        break
+                    if not tool_use_id and (later.get("tool_name") or "") == tool_name:
+                        executed = True
+                        tool_use_id = later_id or tool_use_id
+                        break
+                if later_name in _INFER_SEARCH_STOP:
+                    break
+
+        if executed:
+            decision, source = "accept", "inferred_executed"
+        else:
+            decision, source = "reject", "inferred_not_executed"
+        _append({
+            "tool_use_id": tool_use_id,
+            "tool_name": tool_name,
+            "decision": decision,
+            "source": source,
+            "timestamp": event.get("timestamp") or "",
+        })
+
+    results.sort(key=lambda r: r.get("timestamp") or "")
+    return results
+
+
+def infer_permission_mode_timeline(hook_events: List[Dict]) -> List[Dict]:
+    """权限模式时间线：优先用 collector 写的 PermissionModeChanged，否则边沿检测。
+
+    trigger 只有事件里真有才带上，空就省略，不编造 shift_tab 等官方枚举。
+    首次出现的非空 permission_mode 不算变更。
+    """
+    if not hook_events:
+        return []
+
+    timeline: List[Dict] = []
+    last: Optional[str] = None
+
+    def _add(timestamp: str, frm: str, to: str, trigger: Optional[str] = None) -> None:
+        if not frm or not to or frm == to:
+            return
+        # 同一从/到若紧挨着重复（Changed 事件 + 下一条带新 mode），去重
+        if timeline:
+            prev = timeline[-1]
+            if prev.get("from") == frm and prev.get("to") == to:
+                if trigger and not prev.get("trigger"):
+                    prev["trigger"] = trigger
+                return
+        item = {
+            "timestamp": timestamp or "",
+            "from": frm,
+            "to": to,
+        }
+        if trigger:
+            item["trigger"] = trigger
+        timeline.append(item)
+
+    for event in hook_events:
+        name = hook_event_name(event)
+        if name == "PermissionModeChanged":
+            frm = event.get("from") or event.get("from_mode") or last or ""
+            to = event.get("to") or event.get("to_mode") or event.get("permission_mode") or ""
+            _add(event.get("timestamp") or "", frm, to, event.get("trigger") or None)
+            if to:
+                last = to
+            continue
+        mode = event.get("permission_mode")
+        if not mode:
+            continue
+        if last and mode != last:
+            _add(event.get("timestamp") or "", last, mode, None)
+        last = mode
+    return timeline
+
+
 def apply_hook_events_to_metadata(metadata: SessionMetadata, hook_events: List[Dict]) -> None:
     """从 hook events 提取语义信息，就地丰富 metadata
 
@@ -486,6 +666,9 @@ def apply_hook_events_to_metadata(metadata: SessionMetadata, hook_events: List[D
             metadata.git_branch = metadata.git_state.get("branch", "") or ""
         if metadata.git_dirty is None:
             metadata.git_dirty = metadata.git_state.get("dirty")
+
+    metadata.permission_decisions = infer_permission_decisions(hook_events)
+    metadata.permission_mode_timeline = infer_permission_mode_timeline(hook_events)
 
 
 # ─────────────────────────────────────────────
@@ -986,6 +1169,9 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
             "git_dirty": metadata.git_dirty,
             "git_state": metadata.git_state,
             "git_state_end": metadata.git_state_end,
+            # 权限决策只进 metadata，SFT convert 默认不读这些字段。
+            "permission_decisions": metadata.permission_decisions,
+            "permission_mode_timeline": metadata.permission_mode_timeline,
             "data_quality": data_quality,
         },
     }
