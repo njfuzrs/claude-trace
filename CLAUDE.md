@@ -40,6 +40,7 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 ├── setup_hooks.py      # 自动配置 settings.json 的 hooks
 ├── merger.py           # 双通道数据合并器（代理 + Hooks）
 ├── uploader.py         # 可靠上传管理器（gzip + SHA256 + 重试队列 + 启动补传）
+├── sync.py             # 手动批量补传（uploader 没跑时；URL/token 必填，身份不回退）
 ├── rebuild_trajs.py    # 用当前 builder 重建历史 .traj
 ├── recover_truncated.py # 历史数据修复（复活截断重建 / 超大 traj 无损去重 / 重传）
 ├── filter_trajs.py     # 轨迹过滤器
@@ -109,8 +110,9 @@ pre-commit run --all-files              # 一次跑全部
 - 增量存储：JSONL 首行保存完整 request_body，后续行只保存 new_messages，避免 O(n²) 膨胀
 - 双通道采集：proxy（API 流量）+ hooks（会话事件）通过 session_id 关联
 - 上传 opt-in：默认关闭，无内置端点与凭据。仅当 `TRAJ_PLATFORM_URL` 与 `TRAJ_UPLOAD_TOKEN`
-  同时非空才启用；启用后会话结束时上传 session.traj + raw.jsonl + events.jsonl。
+  同时非空才启用；启用后会话结束时由 `uploader.py` 上传 session.traj + raw.jsonl + events.jsonl。
   `TRAJ_USER_ID` / `TRAJ_DEVICE_ID` 默认留空，不回退到系统用户名与主机名。
+  手动批量补传走根目录 `sync.py`（同一对变量必填，不并进 uploader 的异步队列）。
 - 安全：**只脱三个请求头**（`x-api-key` / `authorization` / `proxy-authorization`），
   **消息体不做内容级过滤** —— 对话里的密钥会明文落盘，内容级 Scrubber 尚未实现。
   代理默认绑定 127.0.0.1。
@@ -178,6 +180,10 @@ python3 merger.py --all
 # 可视化查看轨迹
 python3 viewer.py trajectories/sessions/<session_id>/session.traj
 python3 viewer.py trajectories/sessions/   # 目录索引模式
+
+# 手动批量补传（uploader 没跑时；须 export TRAJ_PLATFORM_URL + TRAJ_UPLOAD_TOKEN）
+python3 sync.py
+python3 sync.py --all
 ```
 
 ## 环境变量
@@ -188,9 +194,10 @@ python3 viewer.py trajectories/sessions/   # 目录索引模式
 | `UPSTREAM` | `https://api.anthropic.com` | 上游 API 地址 |
 | `OUTPUT` | `./trajectories` | 轨迹数据输出目录 |
 | `FORCE_THINKING` | 0 | 非 0 时强制 thinking effort=max |
-| `TRAJ_PLATFORM_URL` | 空 | 上传目标；与 token 两者皆非空才启用上传 |
+| `TRAJ_PLATFORM_URL` | 空 | 上传目标；与 token 两者皆非空才启用上传（uploader 与 sync.py 共用） |
 | `TRAJ_UPLOAD_TOKEN` | 空 | 上传凭据 |
 | `TRAJ_USER_ID` / `TRAJ_DEVICE_ID` | 空 | 身份字段，留空即不上报（不回退到系统用户名/主机名） |
+| `TRAJ_LOCAL_DIR` | 安装器落点，否则 `./trajectories/sessions` | `sync.py` 读取的会话目录 |
 | `TRAJ_CLEANUP_AFTER_UPLOAD` | `false` | 上传成功后是否删本地。**默认保留**，只有显式 `true` 才删 |
 | `TRAJ_BACKFILL_ON_START` | `true` | 启动时补传盘上未上云的会话（上传链路的兜底） |
 
