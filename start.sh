@@ -1,11 +1,17 @@
 #!/bin/bash
-# start.sh — 一键启动 claude-trace（代理 + Hooks 配置 + Claude Code）
+# start.sh — 源码临时启动（采集器 + Hooks + 前台 Claude Code）
+#
+# 给还没装 launchd、只想在仓库里立刻试一下的场景。日常采集请用
+# `curl | bash` 装好的 claude-trace 服务，不要跑这个脚本。
+#
+# 副作用：会杀掉占用 $PORT（默认 4000）的进程。本机如果已经在跑
+# ~/.claude-trace 的二进制采集器，执行它会把正在进行的对话掐断。
 #
 # 用法：
 #   ./start.sh                    # 默认端口 4000
 #   ./start.sh --port 5000        # 自定义端口
-#   ./start.sh --proxy-only       # 仅启动代理，不启动 Claude Code
-#   ./start.sh --force-thinking 10000  # 强制每次请求产生 thinking blocks
+#   ./start.sh --proxy-only       # 仅启动采集器，不启动 Claude Code
+#   ./start.sh --force-thinking 1
 
 set -euo pipefail
 

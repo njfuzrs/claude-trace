@@ -163,7 +163,8 @@ pre-commit run --all-files              # 一次跑全部
 ./switch-channel.sh list            # 列出所有渠道
 ./switch-channel.sh <渠道名>        # 切换渠道（同步更新 token + 代理上游）
 
-# 一键启动（代理 + Claude Code 生命周期绑定，适合临时使用）
+# 一键启动（代理 + Claude Code 生命周期绑定，适合临时使用。
+# 会杀掉占用 4000 的进程，本机已有 launchd 采集时不要跑）
 ./start.sh
 
 # 数据处理管道

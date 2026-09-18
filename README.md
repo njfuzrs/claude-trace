@@ -21,7 +21,7 @@ Claude Code / Codex 轨迹采集工具。默认通过一个统一执行入口同
   - [从源码安装（开发用）](#从源码安装开发用)
   - [升级](#升级)
 - [使用方式](#使用方式)
-  - [方式一：一键启动](#方式一一键启动)
+  - [方式一：源码临时启动](#方式一源码临时启动)
   - [方式二：守护进程模式（推荐日常使用）](#方式二守护进程模式推荐日常使用)
   - [方式三：手动分步启动](#方式三手动分步启动)
   - [方式四：仅统一采集器模式（不配置 Hooks）](#方式四仅统一采集器模式不配置-hooks)
@@ -272,9 +272,11 @@ claude-trace version    # 对一下 version 文件、二进制 --version、sha25
 
 ## 使用方式
 
-### 方式一：一键启动
+日常使用走上面的 [安装](#安装)：`curl | bash` 一次，之后直接开 `claude`。下面三种是源码路径，给开发或临时调试用。
 
-最简单的方式，自动完成所有配置：
+### 方式一：源码临时启动
+
+把采集器和 Claude Code 绑在同一次终端会话里，适合还没装 launchd、只想立刻试一下的时候。
 
 ```bash
 ./start.sh
@@ -283,18 +285,22 @@ claude-trace version    # 对一下 version 文件、二进制 --version、sha25
 它会依次执行：
 1. 检查 aiohttp 依赖
 2. 部署 `collector.py` 到 `~/.claude/hooks/`
-3. 配置 `~/.claude/settings.json` 的 hooks
-4. 后台启动统一采集器（端口 4000）
-5. 前台启动 Claude Code（自动设置 `ANTHROPIC_BASE_URL`）
+3. 调用 `setup_hooks.py` 写入 hooks（**不**改 `ANTHROPIC_BASE_URL`）
+4. **杀掉占用 `$PORT`（默认 4000）的进程**，再后台启动 `python3 trace_agent.py`
+5. 前台启动 Claude Code，只给这一次进程设置 `ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT`
 
-Claude Code 退出后，统一采集器自动停止。
+Claude Code 退出后，这次拉起的采集器也会停。数据写在 `./trajectories/`（可用 `--output` 改），不是 `~/.claude-trace/trajectories/`。
+
+不要在已经用 `curl | bash` / launchd 采集的机器上跑它：第 4 步会把正在跑的二进制采集器杀掉，当前对话跟着断。本机正在采集时请继续用 `claude-trace status`，不要执行 `./start.sh`。
 
 **自定义参数：**
 
 ```bash
-./start.sh --port 5000              # 自定义端口
+./start.sh --port 5000              # 自定义端口（仍会清掉该端口上的进程）
 ./start.sh --output /data/traces    # 自定义输出目录
 ./start.sh --proxy-only             # 只启动统一采集器，不启动 Claude Code
+./start.sh --upstream https://your-api.example.com
+./start.sh --force-thinking 1
 ./start.sh -- -p "hello"            # -- 之后的参数传给 claude
 ```
 
@@ -861,7 +867,7 @@ python3 merger.py --all \
 | `filter_trajs.py` | 轨迹过滤器 |
 | `convert_trajs.py` | 格式转换（.traj → SFT .jsonl） |
 | `combine_trajs.py` | 合并 + shuffle SFT 数据 |
-| `start.sh` | 一键启动脚本 |
+| `start.sh` | 源码临时启动：采集器与 Claude Code 同一次会话。会清掉 `$PORT` 上已有进程，日常采集不要用 |
 | `proxy-daemon.sh` | 自动重启的守护进程脚本 |
 | `dist/install.sh` | 一键安装器。仓库内走本地拷贝；`curl \| bash` 走 GitHub Releases |
 | `dist/claude-trace` | 安装后的统一 CLI 入口，用于 `start/status/restart/logs/uninstall/version` |
