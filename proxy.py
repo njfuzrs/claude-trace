@@ -1581,29 +1581,13 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
 
     is_streaming = request_body.get("stream", False)
 
-    # Force thinking: 将 adaptive thinking 改写为 effort=max，
-    # 提高 thinking blocks 的产生概率（但不保证 100%）。
-    #
-    # ⚠️ 不能改写为 type=enabled + budget_tokens，原因：
-    #   1. Claude Code 按 adaptive 模式管理对话历史，不保证保留 thinking blocks，
-    #      而 enabled 模式要求历史中的 thinking blocks 原样保留，否则 API 返回 400。
-    #      参见 https://github.com/anthropics/claude-code/issues/14264
-    #   2. type=enabled 在 Opus 4.6 上已 deprecated，随时可能被移除。
-    #   3. 每次请求强制消耗 budget_tokens 个 thinking tokens，成本大幅增加。
-    #
-    # 安全方案：改写 thinking.effort 为 "max"（仅 Opus 4.6 支持），
-    # 这是 adaptive 模式内部的参数，不改变 type，不破坏对话历史兼容性。
-    force_thinking: int = request.app.get("force_thinking", 0)
-    body_rewritten = False
-    if force_thinking > 0 and request_body.get("thinking"):
-        original_thinking = request_body["thinking"]
-        if original_thinking.get("type") == "adaptive":
-            request_body["thinking"] = {
-                "type": "adaptive",
-                "effort": "max",
-            }
-            body_rewritten = True
-            logger.debug("thinking 改写: adaptive → adaptive/effort=max")
+    # 采集用解析后的 dict；转发给上游必须用原始 bytes。
+    # 曾经 --force-thinking 会改 thinking 再 json.dumps 整份 body：
+    #   1. effort 不属于 thinking（应在 output_config），新模型直接 400
+    #   2. json.dumps 默认 ensure_ascii=True，tool_use 里的 UTF-8 被改成 \uXXXX
+    #   3. 丢掉 thinking.display 等 Claude Code 新字段
+    # Claude Code 2.1.275+ 因此报 Invalid tool use format。
+    # 所以这里永远不再改写、不再重序列化。见 tests/test_proxy_passthrough.py。
 
     # 2. 会话匹配 + 记录请求
     session = session_manager.match_session(request_body)
@@ -1622,15 +1606,14 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
         upstream_url += f"?{request.query_string}"
 
     # 5. 转发到上游（使用全局复用的 ClientSession）
-    # 如果 thinking 被改写，需要用修改后的 request_body 重新序列化
-    upstream_body = json.dumps(request_body).encode() if body_rewritten else body
+    # 必须用原始 bytes：任何 json.dumps 重序列化都会改变转义/字段，上游可能 400。
     client: aiohttp.ClientSession = request.app["upstream_session"]
     try:
         async with client.request(
             request.method,
             upstream_url,
             headers=headers,
-            data=upstream_body,
+            data=body,
         ) as upstream_resp:
 
             if is_streaming:
@@ -1826,7 +1809,16 @@ async def create_app(
     app["upstream_base"] = upstream_base.rstrip("/")
     app["session_manager"] = SessionManager(session_timeout=session_timeout)
     app["collector"] = DataCollector(output_dir, save_raw=save_raw, events_dir=events_dir)
-    app["force_thinking"] = force_thinking
+    # --force-thinking 已废弃：参数保留以免旧 launchd / 脚本 unrecognized arguments，
+    # 但不再改写请求体。非 0 只打一次警告，方便发现还在传这个开关的配置。
+    app["force_thinking"] = 0
+    if force_thinking:
+        logger.warning(
+            "--force-thinking=%s 已废弃并被忽略：代理不再改写请求体，"
+            "thinking / tool_use 按 Claude Code 原始字节转发。"
+            "请从 launchd plist、channels.json 和启动脚本中去掉该参数。",
+            force_thinking,
+        )
 
     # 应用启动时创建全局 ClientSession（连接池复用）+ 启动上传管理器
     async def on_startup(app):
@@ -1902,9 +1894,8 @@ def parse_args():
     parser.add_argument("--no-save-raw", dest="save_raw", action="store_false", help="不保存原始请求/响应 JSON 文件（默认行为）")
     parser.add_argument(
         "--force-thinking", type=int, default=0, metavar="BUDGET",
-        help="强制提高 thinking blocks 产生概率。设为非 0 值时，将 adaptive thinking 的 effort 改写为 max。"
-             "effort=max 是 Opus 4.6 独有的最高档，比 high 更激进地触发 thinking。"
-             "注意：这不保证 100%% 产生 thinking blocks，但显著提高概率。设为 0 表示不改写（默认）。",
+        help="已废弃，忽略。曾把 adaptive thinking 改写为 effort=max 并重序列化请求体，"
+             "会在 Claude Code 2.1.275+ 触发 Invalid tool use format 400。",
     )
     parser.add_argument("--verbose", action="store_true", help="详细日志输出")
     return parser.parse_args()
@@ -1994,8 +1985,6 @@ async def main():
     logger.info("监听地址: http://%s:%d", args.host, args.port)
     logger.info("上游 API:  %s", args.upstream)
     logger.info("输出目录:  %s", output_dir.resolve())
-    if args.force_thinking:
-        logger.info("强制 thinking: effort=max (adaptive 模式内提升)")
     logger.info("=" * 50)
     logger.info("启动 Claude Code：")
     logger.info("  ANTHROPIC_BASE_URL=http://%s:%d claude", args.host, args.port)

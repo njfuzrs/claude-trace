@@ -83,6 +83,7 @@ pre-commit run --all-files         # 一次跑全部门禁
 | `tests/test_git_state.py` | `git_state.py` 的 porcelain 解析（纯函数） |
 | `tests/test_version_source.py` | `version` 文件与 `pyproject.toml` 必须一致；`--version` 能自报 |
 | `tests/test_install_plan.py` | 安装器分流与 tarball 文件名拼接（不真装） |
+| `tests/test_proxy_passthrough.py` | 代理按原始字节转发 messages，不得改写/重序列化请求体 |
 
 补测试的 PR 一律欢迎。**唯一硬要求**：将来若实现内容级脱敏器（Scrubber），
 没有测试的实现不会被合并 —— 脱敏器是「没测试就等于没有」的那类模块，

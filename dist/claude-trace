@@ -90,7 +90,8 @@ vals = [
 print('\n'.join(vals))
 " "$CONFIG")
         UPSTREAM="$(echo "$_cfg" | sed -n '1p')"
-        FORCE_THINKING="$(echo "$_cfg" | sed -n '2p')"
+        # force_thinking 已废弃：即使 channels.json 里还是 1，也写 0。
+        FORCE_THINKING="0"
         TRAJ_PLATFORM_URL="$(echo "$_cfg" | sed -n '3p')"
         TRAJ_UPLOAD_TOKEN="$(echo "$_cfg" | sed -n '4p')"
         TRAJ_USER_ID="$(echo "$_cfg" | sed -n '5p')"
@@ -309,12 +310,11 @@ print("可用渠道：")
 for key, ch in channels.items():
     upstream = ch.get("upstream", "?")
     name = ch.get("name", key)
-    ft = ch.get("force_thinking", 0)
     token = ch.get("token", "")
     token_preview = token[:12] + "…" if token else "?"
     marker = " ← 当前" if key == active else ""
     print(f"  {key:<12} {name}  ({upstream}){marker}")
-    print(f"             token={token_preview}  force_thinking={ft}")
+    print(f"             token={token_preview}")
 PYEOF
             ;;
         status|s)
@@ -331,20 +331,14 @@ import plistlib
 with open('$PLIST_PATH','rb') as f: d=plistlib.load(f)
 print(d.get('EnvironmentVariables',{}).get('UPSTREAM','?'))
 " 2>/dev/null || echo "?")
-                FT=$(python3 -c "
-import plistlib
-with open('$PLIST_PATH','rb') as f: d=plistlib.load(f)
-print(d.get('EnvironmentVariables',{}).get('FORCE_THINKING','?'))
-" 2>/dev/null || echo "?")
                 echo "  upstream : $UPSTREAM"
-                echo "  force_thinking : $FT"
             fi
             ;;
         *)
             # 切换到指定渠道
             local channel="$subcmd"
 
-            read -r TOKEN UPSTREAM FORCE_THINKING NAME < <(python3 - "$CONFIG" "$channel" <<'PYEOF'
+            read -r TOKEN UPSTREAM NAME < <(python3 - "$CONFIG" "$channel" <<'PYEOF'
 import json, sys
 config = json.load(open(sys.argv[1]))
 key = sys.argv[2]
@@ -353,7 +347,7 @@ if key not in channels:
     print(f"错误：渠道 '{key}' 不存在，可用: {list(channels.keys())}", file=sys.stderr)
     sys.exit(1)
 ch = channels[key]
-print(ch["token"], ch["upstream"], ch.get("force_thinking", 0), ch.get("name", key))
+print(ch["token"], ch["upstream"], ch.get("name", key))
 PYEOF
 )
 
@@ -389,13 +383,14 @@ PYEOF
 
             # 3. 更新 plist 并重启
             if [ -f "$PLIST_PATH" ]; then
-                python3 - "$PLIST_PATH" "$UPSTREAM" "$FORCE_THINKING" <<'PYEOF'
+                python3 - "$PLIST_PATH" "$UPSTREAM" <<'PYEOF'
 import sys, plistlib
-path, upstream, ft = sys.argv[1], sys.argv[2], sys.argv[3]
+path, upstream = sys.argv[1], sys.argv[2]
 with open(path, "rb") as f:
     data = plistlib.load(f)
 data["EnvironmentVariables"]["UPSTREAM"] = upstream
-data["EnvironmentVariables"]["FORCE_THINKING"] = ft
+# 旧 plist 可能残留 FORCE_THINKING=1；代理已忽略该键，写 0 以免误导排查。
+data["EnvironmentVariables"]["FORCE_THINKING"] = "0"
 with open(path, "wb") as f:
     plistlib.dump(data, f)
 print("  ✅ plist 已更新")

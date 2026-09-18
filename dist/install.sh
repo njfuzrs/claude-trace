@@ -12,7 +12,7 @@
 #   TRAJ_UPLOAD_TOKEN     — 上传 Token（留空则禁用上传，默认留空）
 #   TRAJ_USER_ID          — 上传时携带的用户标识（默认留空 = 不上报）
 #   TRAJ_DEVICE_ID        — 上传时携带的设备标识（默认留空 = 不上报）
-#   FORCE_THINKING        — 强制 thinking（默认 0）
+#   FORCE_THINKING        — 已废弃，忽略（默认 0；曾改写请求体导致 400）
 #   RELEASE_BASE          — 下载地址前缀（覆盖默认）
 
 set -euo pipefail
@@ -428,9 +428,9 @@ if [ "$IS_UPGRADE" = false ] || [ ! -f "$INSTALL_DIR/channels.json" ]; then
     UPSTREAM_URL="${UPSTREAM_URL:-https://api.anthropic.com}"
     prompt_input UPSTREAM_URL "上游 API 地址" "$UPSTREAM_URL"
 
-    # Force thinking
-    FORCE_THINKING="${FORCE_THINKING:-0}"
-    prompt_input FORCE_THINKING "强制 thinking (0=关闭, 1=开启)" "$FORCE_THINKING"
+    # Force thinking 已废弃：代理不再改写请求体。
+    # 仍写入 channels.json / plist 为 0，避免旧配置残留 1 误导排查。
+    FORCE_THINKING=0
 
     # ─── 上传配置（默认关闭，opt-in） ───
     # 无内置默认端点与凭据：两者留空即禁用上传，数据只留在本机。
@@ -681,7 +681,8 @@ print('\n'.join(vals))
 " "$INSTALL_DIR/channels.json")
 
 SVC_UPSTREAM="$(echo "$_svc_config" | sed -n '1p')"
-SVC_FORCE_THINKING="$(echo "$_svc_config" | sed -n '2p')"
+# force_thinking 已废弃：即使旧 channels.json 里还是 1，也写 0。
+SVC_FORCE_THINKING="0"
 SVC_PLATFORM_URL="$(echo "$_svc_config" | sed -n '3p')"
 SVC_UPLOAD_TOKEN="$(echo "$_svc_config" | sed -n '4p')"
 SVC_USER_ID="$(echo "$_svc_config" | sed -n '5p')"

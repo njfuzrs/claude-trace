@@ -86,7 +86,7 @@ def parse_args():
         type=int,
         default=0,
         metavar="BUDGET",
-        help="Claude adaptive thinking 改写预算。非 0 时提高 thinking blocks 产生概率。",
+        help="已废弃，忽略。曾改写请求体并触发 Invalid tool use format 400。",
     )
     parser.add_argument(
         "--codex-watch",
@@ -211,7 +211,7 @@ async def main():
         session_timeout=args.session_timeout,
         save_raw=args.save_raw,
         events_dir=Path(args.events_dir).expanduser(),
-        force_thinking=args.force_thinking,
+        force_thinking=args.force_thinking,  # 已废弃，create_app 会忽略
     )
 
     runner = web.AppRunner(app)

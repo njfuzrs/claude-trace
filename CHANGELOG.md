@@ -25,6 +25,7 @@
 
 ### 修正
 
+- **停掉 `--force-thinking` 的请求体改写。** 该开关曾把 `thinking.type=adaptive` 改写成带 `effort=max` 的对象再 `json.dumps` 整份 body 转发。`effort` 不属于 `thinking`（应在 `output_config`），且 `json.dumps` 会改变 UTF-8 / 字段顺序；Claude Code 2.1.275+ 因此收到 `Invalid tool use format` 400。代理现在永远按原始字节转发 messages 请求。CLI / plist / `channels.json` 里的开关保留为废弃 no-op，以免旧 launchd 配置 unrecognized arguments。
 - CI 补装 `pytest-asyncio`（`asyncio_mode = auto` 依赖它，缺了 async 测试在 GitHub 上全红）；`test_远程失败不覆盖已有安装` 在非 macOS 上 skip（`install.sh` 会先以「仅支持 macOS」退出）。
 - README：补升级步骤；`--save-raw` 默认改为 false；数据目录改成 `sessions/{id}/`；会话超时 FAQ 从 5 分钟改为 30 分钟；渠道切换区分安装版 `claude-trace switch` 与源码 `switch-channel.sh`。`./start.sh` 从「最简单的一键启动」改成源码临时入口，并写明会杀掉占用 4000 的进程。
 

@@ -203,7 +203,7 @@ Claude Code
                          └── 记录: session_id / 用户 prompt / 工具调用 / sub-agent
 ```
 
-- **通道 A（HTTP 统一采集器）**：通过 `ANTHROPIC_BASE_URL` 环境变量劫持 API 请求，SSE Tee 模式零延迟转发 + 后台记录
+- **通道 A（HTTP 统一采集器）**：通过 `ANTHROPIC_BASE_URL` 环境变量劫持 API 请求，SSE Tee 模式零延迟转发 + 后台记录。采集可以解析 JSON，但转发给上游用原始字节，不改写 `thinking` / `tools` / `messages`
 - **通道 B（Hooks）**：通过 Claude Code 原生 hooks 机制采集会话事件（session 生命周期、用户 prompt、sub-agent 等）
 - 两个通道通过 `session_id` 自动关联合并
 
@@ -240,7 +240,7 @@ app-server（Codex）。不要为了「用官方监控」做下面这些事：
 | 默认安装 OTel collector | 多一个必依赖进程，和「代理永不中断」抢运维注意力 |
 | 把 `~/.claude/projects` transcript 当主通道 | 格式不稳定、无 exit_code、无 wire 请求、会和代理双写 |
 | 自建 OTLP receiver 把事件转 `.traj` | 重建 Thought/Action/Observation ≈ 再写一个 builder，thinking 还是没有 |
-| 用官方监控替换 `FORCE_THINKING` | OTel 不改写请求 |
+| 用官方监控替换已废弃的 `FORCE_THINKING` | 代理已不再改写请求；OTel 也从来不改 |
 | 为了 MCP 审计去开 `OTEL_LOG_TOOL_DETAILS` 进默认采集 | PostToolUse 已有 tool_input；缺的是决策 source，由 hooks 推断补 |
 
 看板以后可以旁路接 metrics + 脱敏 events。训练数据永远不要用 OTel raw bodies。
@@ -330,7 +330,6 @@ Claude Code 退出后，这次拉起的采集器也会停。数据写在 `./traj
 ./start.sh --output /data/traces    # 自定义输出目录
 ./start.sh --proxy-only             # 只启动统一采集器，不启动 Claude Code
 ./start.sh --upstream https://your-api.example.com
-./start.sh --force-thinking 1
 ./start.sh -- -p "hello"            # -- 之后的参数传给 claude
 ```
 
@@ -399,7 +398,7 @@ UPSTREAM=https://api.anthropic.com nohup ./proxy-daemon.sh > /dev/null 2>&1 &
 | `PORT` | 4000 | 统一采集器监听端口 |
 | `UPSTREAM` | `https://api.anthropic.com` | 上游 API 地址 |
 | `OUTPUT` | `./trajectories` | 轨迹数据输出目录 |
-| `FORCE_THINKING` | 0 | 非 0 时强制 thinking effort=max |
+| `FORCE_THINKING` | 0 | **已废弃，忽略。** 曾改写请求体，会在 Claude Code 2.1.275+ 触发 400 |
 
 **停止守护进程：**
 
@@ -501,7 +500,7 @@ trajectories/sessions/{thread_id}/
 | `--no-save-raw` | - | 显式关闭上面这项（默认行为） |
 | `--version` | - | 打印版本号与构建指纹后退出。打包后的二进制读的是打进包内的 `version` 文件 |
 | `--events-dir` | ~/.claude/trajectory_events | Hooks 事件数据目录 |
-| `--force-thinking` | 0 | 非 0 时将 adaptive thinking 的 effort 改写为 max，提高 thinking blocks 产生概率（仅 Opus 4.6） |
+| `--force-thinking` | 0 | **已废弃，忽略。** 曾改写请求体并重序列化，会在 Claude Code 2.1.275+ 触发 `Invalid tool use format` 400 |
 | `--verbose` | false | 详细日志输出 |
 
 ### Hooks 配置
@@ -578,7 +577,8 @@ claude-trace switch default
 claude-trace switch status
 ```
 
-切换时会同时更新：`ANTHROPIC_AUTH_TOKEN`（token）、统一采集器上游地址（`UPSTREAM`）、`FORCE_THINKING` 参数，并自动重启统一采集器。
+切换时会同时更新：`ANTHROPIC_AUTH_TOKEN`（token）、统一采集器上游地址（`UPSTREAM`），并自动重启统一采集器。
+（`force_thinking` 渠道字段已废弃，切换时会把 plist 里残留的 `FORCE_THINKING` 写成 0。）
 
 **渠道配置文件 `channels.json`**（复制 `channels.json.example` 创建）：
 
@@ -595,7 +595,7 @@ claude-trace switch status
       "name": "备用渠道",
       "token": "sk-xxx",
       "upstream": "https://api.anthropic.com",
-      "force_thinking": 1
+      "force_thinking": 0
     }
   }
 }
@@ -919,7 +919,7 @@ python3 merger.py --all \
 | `codex-daemon.sh` | 自动重启的 Codex watcher 守护进程脚本 |
 | `install-codex-daemon.sh` | 安装/卸载 Codex watcher 的 launchd 自启动服务（macOS） |
 | `switch-channel.sh` | 快速切换 API 渠道（同步更新 token + 统一采集器上游） |
-| `channels.json` | 渠道配置文件，含 token/upstream/force_thinking（已加入 .gitignore） |
+| `channels.json` | 渠道配置文件，含 token/upstream（`force_thinking` 已废弃；已加入 .gitignore） |
 | `channels.json.example` | 渠道配置模板，可提交到 git |
 | `tools/viewer.py` | 轨迹数据 HTML 查看器，将 .traj 转为可视化 HTML |
 | `git_state.py` | 会话起点 git 状态快照采集（`collector.py` 的同目录依赖） |

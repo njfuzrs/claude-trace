@@ -124,6 +124,9 @@ pre-commit run --all-files              # 一次跑全部
   **消息体不做内容级过滤** —— 对话里的密钥会明文落盘，内容级 Scrubber 尚未实现。
   代理默认绑定 127.0.0.1。
 - 代理使用 SSE Tee 模式，零延迟转发 + 后台记录，不影响 Claude Code 正常使用
+- **请求体原样转发**：采集可以 `json.loads` 做会话匹配，但转发给上游必须用客户端原始 bytes。
+  禁止改 `thinking` / `tools` / `messages` 后再 `json.dumps`。`--force-thinking` 已废弃
+  （曾把 `effort=max` 塞进 `thinking` 并重序列化，Claude Code 2.1.275+ 报 400）。
 
 ## 渠道管理
 
@@ -138,7 +141,7 @@ pre-commit run --all-files              # 一次跑全部
 
 切换时会同步更新：
 1. `~/.claude/settings.json` 的 `ANTHROPIC_AUTH_TOKEN` 和 `ANTHROPIC_BASE_URL`（固定指向代理）
-2. launchd plist 的 `UPSTREAM` 和 `FORCE_THINKING`
+2. launchd plist 的 `UPSTREAM`（`FORCE_THINKING` 已废弃，切换时写 0）
 3. 自动重启代理使配置生效
 
 新增渠道只需编辑 `channels.json`，无需修改脚本：
@@ -200,7 +203,7 @@ python3 tools/sync.py --all
 | `PORT` | 4000 | 代理监听端口 |
 | `UPSTREAM` | `https://api.anthropic.com` | 上游 API 地址 |
 | `OUTPUT` | `./trajectories` | 轨迹数据输出目录 |
-| `FORCE_THINKING` | 0 | 非 0 时强制 thinking effort=max |
+| `FORCE_THINKING` | 0 | 已废弃，忽略。曾改写请求体，会在 Claude Code 2.1.275+ 触发 400 |
 | `TRAJ_PLATFORM_URL` | 空 | 上传目标；与 token 两者皆非空才启用上传（uploader 与 tools/sync.py 共用） |
 | `TRAJ_UPLOAD_TOKEN` | 空 | 上传凭据 |
 | `TRAJ_USER_ID` / `TRAJ_DEVICE_ID` | 空 | 身份字段，留空即不上报（不回退到系统用户名/主机名） |

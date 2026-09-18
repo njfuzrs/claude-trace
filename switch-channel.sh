@@ -47,11 +47,10 @@ print("可用渠道：")
 for key, ch in channels.items():
     upstream = ch.get("upstream", "?")
     name = ch.get("name", key)
-    ft = ch.get("force_thinking", 0)
     token = ch.get("token", "")
     token_preview = token[:12] + "…" if token else "?"
     print(f"  {key:<12} {name}  ({upstream})")
-    print(f"             token={token_preview}  force_thinking={ft}")
+    print(f"             token={token_preview}")
 PYEOF
 }
 
@@ -69,13 +68,7 @@ import plistlib
 with open('$PLIST','rb') as f: d=plistlib.load(f)
 print(d.get('EnvironmentVariables',{}).get('UPSTREAM','?'))
 " 2>/dev/null)
-        FT=$(python3 -c "
-import plistlib
-with open('$PLIST','rb') as f: d=plistlib.load(f)
-print(d.get('EnvironmentVariables',{}).get('FORCE_THINKING','?'))
-" 2>/dev/null)
         echo "  upstream : $UPSTREAM"
-        echo "  force_thinking : $FT"
     fi
 
     # 匹配渠道名称
@@ -102,7 +95,7 @@ do_switch() {
     local channel="$1"
 
     # 从配置文件读取渠道参数
-    read -r TOKEN UPSTREAM FORCE_THINKING NAME < <(python3 - "$CONFIG" "$channel" <<'PYEOF'
+    read -r TOKEN UPSTREAM NAME < <(python3 - "$CONFIG" "$channel" <<'PYEOF'
 import json, sys
 
 config = json.load(open(sys.argv[1]))
@@ -112,7 +105,7 @@ if key not in channels:
     print(f"错误：渠道 '{key}' 不存在，可用: {list(channels.keys())}", file=sys.stderr)
     sys.exit(1)
 ch = channels[key]
-print(ch["token"], ch["upstream"], ch.get("force_thinking", 0), ch.get("name", key))
+print(ch["token"], ch["upstream"], ch.get("name", key))
 PYEOF
 )
 
@@ -135,14 +128,15 @@ PYEOF
 
     # 2. 更新 plist
     if [ -f "$PLIST" ]; then
-        python3 - "$PLIST" "$UPSTREAM" "$FORCE_THINKING" <<'PYEOF'
+        python3 - "$PLIST" "$UPSTREAM" <<'PYEOF'
 import sys, plistlib
 
-path, upstream, ft = sys.argv[1], sys.argv[2], sys.argv[3]
+path, upstream = sys.argv[1], sys.argv[2]
 with open(path, "rb") as f:
     data = plistlib.load(f)
 data["EnvironmentVariables"]["UPSTREAM"] = upstream
-data["EnvironmentVariables"]["FORCE_THINKING"] = ft
+# 旧 plist 可能残留 FORCE_THINKING=1；代理已忽略该键，写 0 以免误导排查。
+data["EnvironmentVariables"]["FORCE_THINKING"] = "0"
 with open(path, "wb") as f:
     plistlib.dump(data, f)
 print("  ✅ plist 已更新")
@@ -174,7 +168,7 @@ PYEOF
             echo "  ❌ 代理启动失败，请检查: tail /tmp/claude-trace-proxy.log"
         fi
     else
-        echo "  ⚠️  plist 不存在，执行 UPSTREAM=$UPSTREAM FORCE_THINKING=$FORCE_THINKING ./install-daemon.sh install"
+        echo "  ⚠️  plist 不存在，执行 UPSTREAM=$UPSTREAM ./install-daemon.sh install"
     fi
 
     echo ""

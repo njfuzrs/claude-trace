@@ -28,7 +28,8 @@ WATCH_LOG="/tmp/claude-trace-watch.log"
 PORT="${PORT:-4000}"
 UPSTREAM="${UPSTREAM:-https://api.anthropic.com}"
 OUTPUT="${OUTPUT:-$SCRIPT_DIR/trajectories}"
-FORCE_THINKING="${FORCE_THINKING:-1}"
+# 已废弃。仍写入 plist 以免旧 daemon 脚本读不到键；代理忽略该值。
+FORCE_THINKING="${FORCE_THINKING:-0}"
 TRAJ_PLATFORM_URL="${TRAJ_PLATFORM_URL:-}"
 TRAJ_UPLOAD_TOKEN="${TRAJ_UPLOAD_TOKEN:-}"
 TRAJ_USER_ID="${TRAJ_USER_ID:-}"
@@ -55,7 +56,6 @@ usage() {
     echo "  PORT=$PORT"
     echo "  UPSTREAM=$UPSTREAM"
     echo "  OUTPUT=$OUTPUT"
-    echo "  FORCE_THINKING=$FORCE_THINKING"
     echo "  TRAJ_PLATFORM_URL=$TRAJ_PLATFORM_URL"
     echo "  TRAJ_UPLOAD_TOKEN=${TRAJ_UPLOAD_TOKEN:+***已设置***}"
     exit 1

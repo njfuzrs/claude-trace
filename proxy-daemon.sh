@@ -12,7 +12,6 @@
 PORT="${PORT:-4000}"
 UPSTREAM="${UPSTREAM:-https://api.anthropic.com}"
 OUTPUT="${OUTPUT:-}"
-FORCE_THINKING="${FORCE_THINKING:-1}"
 PID_FILE="/tmp/claude-trace-proxy.pid"
 LOG_FILE="/tmp/claude-trace-proxy.log"
 
@@ -56,7 +55,6 @@ while true; do
         --port "$PORT" \
         --output "$OUTPUT" \
         --upstream "$UPSTREAM" \
-        --force-thinking "$FORCE_THINKING" \
         --verbose >> "$LOG_FILE" 2>&1 &
     CHILD_PID=$!
 
