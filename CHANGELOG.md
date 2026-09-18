@@ -8,6 +8,10 @@
 
 ## [Unreleased]
 
+### 变更
+
+- 离线 CLI（`viewer` / `sync` / `rebuild_trajs` / `recover_truncated` / `filter_trajs` / `convert_trajs` / `combine_trajs` / `migrate_storage`）从仓库根迁到 `tools/`。采集进程入口与 hooks 部署文件仍平铺在根，不改包结构。调用改为 `python3 tools/<脚本>.py`。
+
 ### 修正
 
 - README：补升级步骤；`--save-raw` 默认改为 false；数据目录改成 `sessions/{id}/`；会话超时 FAQ 从 5 分钟改为 30 分钟；渠道切换区分安装版 `claude-trace switch` 与源码 `switch-channel.sh`。`./start.sh` 从「最简单的一键启动」改成源码临时入口，并写明会杀掉占用 4000 的进程。

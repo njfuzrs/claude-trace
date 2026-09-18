@@ -9,21 +9,24 @@
 这不是笔误，是项目约定（见 `CLAUDE.md` 的编码规范）。新增代码请继续用中文注释。
 标识符、日志 key、commit message 的类型前缀用英文，注释与文档正文用中文。
 
-### 2. 扁平脚本结构，不使用包层级
+### 2. 运行时平铺在根，不使用包层级
 
-所有核心文件都在仓库根目录，没有 `src/`、没有 `claude_trace/__init__.py`。
-理由：这些文件相当一部分要能被**单独拷走执行** —— `collector.py` 会被安装器
+运行时模块（`trace_agent.py` / `proxy.py` / `builder.py` / `collector.py` /
+`git_state.py` 等）都在仓库根目录，没有 `src/`、没有 `claude_trace/__init__.py`。
+离线 CLI（查看、过滤、补传、历史修复）在 `tools/`。
+
+理由：运行时文件相当一部分要能被**单独拷走执行** —— `collector.py` 会被安装器
 复制到 `~/.claude/hooks/` 下由 Claude Code 直接调用，`git_state.py` 是它的
-同目录依赖。引入包层级会破坏这个部署方式。
+同目录依赖。把运行时收成标准 Python 包会破坏这个部署方式。
 
-所以请**不要**提交「把项目重构成标准 Python 包」的 PR。
-文件命名沿用 `动词_名词.py` 风格（`filter_trajs.py`、`convert_trajs.py`）。
+所以请**不要**提交「把运行时重构成标准 Python 包」的 PR。
+文件命名沿用 `动词_名词.py` 风格（`tools/filter_trajs.py`、`tools/convert_trajs.py`）。
 
 ### 3. 仅支持 macOS
 
 服务管理依赖 launchd，文件监听依赖 `fswatch`，构建产物是 Darwin 二进制。
 Linux / Windows 支持不在当前范围内。纯 Python 的数据处理部分（`builder.py`、
-`filter_trajs.py` 等）在 Linux 上能跑，CI 的 ubuntu job 也只跑这部分。
+`tools/filter_trajs.py` 等）在 Linux 上能跑，CI 的 ubuntu job 也只跑这部分。
 
 ---
 

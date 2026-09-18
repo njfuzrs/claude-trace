@@ -31,22 +31,25 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 ## 项目结构
 
 ```
-├── migrate_storage.py  # 存储迁移脚本（旧 raw/+traj/ → 新 sessions/）
 ├── proxy.py            # HTTP 代理服务器（单测 / --upload-status 仍可用；生产入口是 trace_agent.py）
 ├── trace_agent.py      # 统一采集入口（Claude 代理 + Codex watcher）
 ├── version_info.py     # 版本号解析：仓库 version 文件 → 打包后的 sys._MEIPASS
 ├── builder.py          # 轨迹构建器，请求/响应对 → .traj 格式
 ├── collector.py        # Hooks 采集脚本，部署到 ~/.claude/hooks/
 ├── setup_hooks.py      # 自动配置 settings.json 的 hooks
-├── merger.py           # 双通道数据合并器（代理 + Hooks）
+├── merger.py           # 双通道数据合并器（代理 + Hooks；运行时 lazy import）
 ├── uploader.py         # 可靠上传管理器（gzip + SHA256 + 重试队列 + 启动补传）
-├── sync.py             # 手动批量补传（uploader 没跑时；URL/token 必填，身份不回退）
-├── rebuild_trajs.py    # 用当前 builder 重建历史 .traj
-├── recover_truncated.py # 历史数据修复（复活截断重建 / 超大 traj 无损去重 / 重传）
-├── filter_trajs.py     # 轨迹过滤器
-├── convert_trajs.py    # 格式转换（.traj → SFT .jsonl）
-├── combine_trajs.py    # 合并 + shuffle SFT 数据
-├── viewer.py           # 轨迹数据 HTML 查看器，将 .traj 转为可视化 HTML
+├── git_state.py        # git 快照；collector.py 的同目录依赖
+├── import_codex.py     # Codex 导入 + rollout watcher
+├── tools/              # 离线 CLI（采集进程从不 import）
+│   ├── viewer.py           # 轨迹数据 HTML 查看器
+│   ├── sync.py             # 手动批量补传（URL/token 必填，身份不回退）
+│   ├── rebuild_trajs.py    # 用当前 builder 重建历史 .traj
+│   ├── recover_truncated.py # 历史数据修复（复活截断 / 超大 traj 去重 / 重传）
+│   ├── filter_trajs.py     # 轨迹过滤器
+│   ├── convert_trajs.py    # 格式转换（.traj → SFT .jsonl）
+│   ├── combine_trajs.py    # 合并 + shuffle SFT 数据
+│   └── migrate_storage.py  # 存储迁移（旧 raw/+traj/ → 新 sessions/）
 ├── start.sh            # 一键启动脚本（代理 + Claude Code 生命周期绑定）
 ├── proxy-daemon.sh     # 守护进程脚本（开发版：python3 trace_agent.py）
 ├── install-daemon.sh   # 安装/卸载 launchd 自启动服务（macOS）。--watch 才装文件监听
@@ -75,7 +78,7 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
   ↓
 合并: merger.py（双通道关联）
   ↓
-后处理: filter_trajs.py → convert_trajs.py → combine_trajs.py → training_data.jsonl
+后处理: tools/filter_trajs.py → tools/convert_trajs.py → tools/combine_trajs.py → training_data.jsonl
 ```
 
 ## 开发工具与门禁
@@ -97,8 +100,8 @@ pre-commit run --all-files              # 一次跑全部
 ## 编码规范
 
 - 所有代码注释必须使用中文
-- 扁平脚本结构，不使用包层级，所有核心文件在项目根目录
-- 文件命名使用 `动词_名词.py` 风格（如 `filter_trajs.py`、`convert_trajs.py`）
+- 运行时模块平铺在仓库根（不引入包层级）；离线 CLI 在 `tools/`
+- 文件命名使用 `动词_名词.py` 风格（如 `tools/filter_trajs.py`、`tools/convert_trajs.py`）
 - 数据交换统一使用 JSON/JSONL 格式
 - 命令行参数使用 argparse，保持风格一致
 - 不要生成零散的文档文件，文档集中在 README.md 和 docs/ 目录
@@ -112,7 +115,7 @@ pre-commit run --all-files              # 一次跑全部
 - 上传 opt-in：默认关闭，无内置端点与凭据。仅当 `TRAJ_PLATFORM_URL` 与 `TRAJ_UPLOAD_TOKEN`
   同时非空才启用；启用后会话结束时由 `uploader.py` 上传 session.traj + raw.jsonl + events.jsonl。
   `TRAJ_USER_ID` / `TRAJ_DEVICE_ID` 默认留空，不回退到系统用户名与主机名。
-  手动批量补传走根目录 `sync.py`（同一对变量必填，不并进 uploader 的异步队列）。
+  手动批量补传走 `tools/sync.py`（同一对变量必填，不并进 uploader 的异步队列）。
 - 安全：**只脱三个请求头**（`x-api-key` / `authorization` / `proxy-authorization`），
   **消息体不做内容级过滤** —— 对话里的密钥会明文落盘，内容级 Scrubber 尚未实现。
   代理默认绑定 127.0.0.1。
@@ -170,20 +173,20 @@ pre-commit run --all-files              # 一次跑全部
 ./start.sh
 
 # 数据处理管道
-python3 filter_trajs.py --input trajectories/sessions/ --output filtered/
-python3 convert_trajs.py --input filtered/ --output sft/ --style xml
-python3 combine_trajs.py --input sft/ --output training_data.jsonl --shuffle
+python3 tools/filter_trajs.py --input trajectories/sessions/ --output filtered/
+python3 tools/convert_trajs.py --input filtered/ --output sft/ --style xml
+python3 tools/combine_trajs.py --input sft/ --output training_data.jsonl --shuffle
 
 # 双通道合并
 python3 merger.py --all
 
 # 可视化查看轨迹
-python3 viewer.py trajectories/sessions/<session_id>/session.traj
-python3 viewer.py trajectories/sessions/   # 目录索引模式
+python3 tools/viewer.py trajectories/sessions/<session_id>/session.traj
+python3 tools/viewer.py trajectories/sessions/   # 目录索引模式
 
 # 手动批量补传（uploader 没跑时；须 export TRAJ_PLATFORM_URL + TRAJ_UPLOAD_TOKEN）
-python3 sync.py
-python3 sync.py --all
+python3 tools/sync.py
+python3 tools/sync.py --all
 ```
 
 ## 环境变量
@@ -194,10 +197,10 @@ python3 sync.py --all
 | `UPSTREAM` | `https://api.anthropic.com` | 上游 API 地址 |
 | `OUTPUT` | `./trajectories` | 轨迹数据输出目录 |
 | `FORCE_THINKING` | 0 | 非 0 时强制 thinking effort=max |
-| `TRAJ_PLATFORM_URL` | 空 | 上传目标；与 token 两者皆非空才启用上传（uploader 与 sync.py 共用） |
+| `TRAJ_PLATFORM_URL` | 空 | 上传目标；与 token 两者皆非空才启用上传（uploader 与 tools/sync.py 共用） |
 | `TRAJ_UPLOAD_TOKEN` | 空 | 上传凭据 |
 | `TRAJ_USER_ID` / `TRAJ_DEVICE_ID` | 空 | 身份字段，留空即不上报（不回退到系统用户名/主机名） |
-| `TRAJ_LOCAL_DIR` | 安装器落点，否则 `./trajectories/sessions` | `sync.py` 读取的会话目录 |
+| `TRAJ_LOCAL_DIR` | 安装器落点，否则 `./trajectories/sessions` | `tools/sync.py` 读取的会话目录 |
 | `TRAJ_CLEANUP_AFTER_UPLOAD` | `false` | 上传成功后是否删本地。**默认保留**，只有显式 `true` 才删 |
 | `TRAJ_BACKFILL_ON_START` | `true` | 启动时补传盘上未上云的会话（上传链路的兜底） |
 

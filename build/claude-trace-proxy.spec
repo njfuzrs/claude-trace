@@ -24,7 +24,7 @@ a = Analysis(
     # 「会话超时后又提问」时才走到，测试期几乎撞不上。
     hiddenimports=[
         'builder', 'uploader', 'proxy', 'import_codex',
-        'merger', 'git_state', 'rebuild_trajs', 'version_info',
+        'merger', 'git_state', 'version_info',
     ],
     binaries=[],
     # version 文件打进包内：没有它，跑着的二进制无法自报是哪一次构建，

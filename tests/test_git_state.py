@@ -5,12 +5,7 @@ _parse_porcelain 是纯函数、无 IO，最容易起步。它决定了轨迹里
 错了下游就会把脏工作区的会话当成干净起点用。
 """
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from git_state import _MAX_DIRTY_FILES, _parse_porcelain  # noqa: E402
+from git_state import _MAX_DIRTY_FILES, _parse_porcelain
 
 
 def test_空输出即干净工作区():

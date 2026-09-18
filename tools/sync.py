@@ -19,9 +19,9 @@ sync.py — 轨迹数据手动批量补传（会话维度）
 该目录不存在时回退到 ./trajectories/sessions。可用 TRAJ_LOCAL_DIR 覆盖。
 
 用法：
-    python3 sync.py                          # 增量同步（只传新文件）
-    python3 sync.py --all                    # 全量同步
-    python3 sync.py --session <session_id>   # 上传单个会话
+    python3 tools/sync.py                          # 增量同步（只传新文件）
+    python3 tools/sync.py --all                    # 全量同步
+    python3 tools/sync.py --session <session_id>   # 上传单个会话
 """
 
 from __future__ import annotations

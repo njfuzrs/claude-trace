@@ -7,12 +7,8 @@
 """
 
 import json
-import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from builder import _traj_step_count, save_trajectory  # noqa: E402
+from builder import _traj_step_count, save_trajectory
 
 
 def _traj(steps: int) -> dict:

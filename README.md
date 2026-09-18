@@ -112,11 +112,11 @@ bash dist/install.sh             # 本地安装模式
 ```bash
 # 打包安装（路径 A）
 ls ~/.claude-trace/trajectories/sessions/
-python3 viewer.py ~/.claude-trace/trajectories/sessions/<id>/session.traj
+python3 tools/viewer.py ~/.claude-trace/trajectories/sessions/<id>/session.traj
 
 # 源码 / 开发守护进程（路径 B，默认 ./trajectories）
 ls ./trajectories/sessions/
-python3 viewer.py ./trajectories/sessions/<id>/session.traj
+python3 tools/viewer.py ./trajectories/sessions/<id>/session.traj
 ```
 
 ---
@@ -137,14 +137,14 @@ python3 viewer.py ./trajectories/sessions/<id>/session.traj
 未启用时日志会打印「上传未配置，数据仅保存在本地」。
 
 采集进程内的自动上传由 `uploader.py` 负责。`uploader` 没跑时（历史积压、
-其它机器上的目录）用根目录 `sync.py` 手动批量，**同一对变量必填**，同样
+其它机器上的目录）用 `tools/sync.py` 手动批量，**同一对变量必填**，同样
 无内置端点。身份字段规则也相同：空则不上报。
 
 ```bash
 export TRAJ_PLATFORM_URL=...     # 必填
 export TRAJ_UPLOAD_TOKEN=...     # 必填
-python3 sync.py                  # 增量
-python3 sync.py --all            # 全量
+python3 tools/sync.py                  # 增量
+python3 tools/sync.py --all            # 全量
 ```
 
 另有两个身份字段，**默认留空即不上报**，不会回退到你的系统用户名或主机名：
@@ -183,7 +183,7 @@ curl -s http://127.0.0.1:4000/_internal/health | python3 -m json.tool
 ```
 
 积压不为 0 且长期不降，说明上传链路有问题 —— 数据还在本地，用
-`recover_truncated.py` 排查修复（见下文「历史数据修复」）。
+`tools/recover_truncated.py` 排查修复（见下文「历史数据修复」）。
 
 服务端协议（自建接收端所需）见 `docs/upload-protocol.md`。
 
@@ -603,7 +603,7 @@ trajectories/
 ~/.claude/trajectory_events/{session_id}.jsonl   # Hooks 原始事件（通道 B，合并前）
 ```
 
-旧布局 `trajectories/raw/` + `trajectories/traj/` 仍能被 `viewer.py` / `filter_trajs.py` 读到，新采集不再往那里写。
+旧布局 `trajectories/raw/` + `trajectories/traj/` 仍能被 `tools/viewer.py` / `tools/filter_trajs.py` 读到，新采集不再往那里写。
 
 Codex 离线导出输出：
 
@@ -743,10 +743,10 @@ trajectories/
 
 ```bash
 # 先看会做什么（不写文件）
-python3 rebuild_trajs.py --dir trajectories/sessions --dry-run
+python3 tools/rebuild_trajs.py --dir trajectories/sessions --dry-run
 
 # 重建（原文件备份为 session.traj.bak）+ 隔离垃圾目录到 _trash/
-python3 rebuild_trajs.py --dir trajectories/sessions --quarantine-garbage
+python3 tools/rebuild_trajs.py --dir trajectories/sessions --quarantine-garbage
 ```
 
 含 sub-agent 子会话的会话会被自动跳过：子会话的 pair 只在导出时合并进
@@ -754,7 +754,7 @@ python3 rebuild_trajs.py --dir trajectories/sessions --quarantine-garbage
 
 ### 历史数据修复：会话复活截断 + 超大 traj
 
-`recover_truncated.py` 修的是两类历史损坏，都可重复运行、可先 `--dry-run`：
+`tools/recover_truncated.py` 修的是两类历史损坏，都可重复运行、可先 `--dry-run`：
 
 **一、会话复活截断。** 早期 `--session-timeout` 默认 300s，用户思考/开会超过
 5 分钟，会话就被判过期清理；再提问时代理新建一个空 Session，`index` 从 1 重来，
@@ -772,13 +772,13 @@ trajectory 步数不变，是无损的。
 ```bash
 S=~/.claude-trace/trajectories/sessions
 
-python3 recover_truncated.py --dir $S scan      # 只报告：哪些坏了、能恢复多少
-python3 recover_truncated.py --dir $S rebuild   # 用 raw.jsonl 重建（备份为 .traj.bak）
-python3 recover_truncated.py --dir $S dedup     # 无损去重超大 traj（备份为 .traj.predup）
-python3 recover_truncated.py --dir $S reupload  # 带 force=true 覆盖云端残缺版本
-python3 recover_truncated.py --dir $S purge     # 清理残留 .gz 和已上云的死队列项
+python3 tools/recover_truncated.py --dir $S scan      # 只报告：哪些坏了、能恢复多少
+python3 tools/recover_truncated.py --dir $S rebuild   # 用 raw.jsonl 重建（备份为 .traj.bak）
+python3 tools/recover_truncated.py --dir $S dedup     # 无损去重超大 traj（备份为 .traj.predup）
+python3 tools/recover_truncated.py --dir $S reupload  # 带 force=true 覆盖云端残缺版本
+python3 tools/recover_truncated.py --dir $S purge     # 清理残留 .gz 和已上云的死队列项
 
-python3 recover_truncated.py --dir $S all       # 一条龙（建议先跑 scan）
+python3 tools/recover_truncated.py --dir $S all       # 一条龙（建议先跑 scan）
 ```
 
 `scan` 报告的「有复活截断指纹」是历史事实，修完也还在（指纹就在 `raw.jsonl` 里）；
@@ -787,7 +787,7 @@ python3 recover_truncated.py --dir $S all       # 一条龙（建议先跑 scan�
 ### 第一步：过滤
 
 ```bash
-python3 filter_trajs.py \
+python3 tools/filter_trajs.py \
     --input trajectories/sessions/ \
     --output filtered/ \
     --min-steps 3 \
@@ -808,7 +808,7 @@ python3 filter_trajs.py \
 ### 第二步：格式转换
 
 ```bash
-python3 convert_trajs.py \
+python3 tools/convert_trajs.py \
     --input filtered/ \
     --output sft/ \
     --style xml
@@ -825,7 +825,7 @@ python3 convert_trajs.py \
 ### 第三步：合并
 
 ```bash
-python3 combine_trajs.py \
+python3 tools/combine_trajs.py \
     --input sft/ \
     --output training_data.jsonl \
     --max-per-session 3 \
@@ -871,14 +871,15 @@ python3 merger.py --all \
 | `builder.py` | 轨迹构建器，将请求/响应对转换为 .traj 格式 |
 | `collector.py` | Hooks 采集脚本，部署到 `~/.claude/hooks/` |
 | `setup_hooks.py` | 自动配置 settings.json 的 hooks |
-| `merger.py` | 双通道数据合并器 |
-| `rebuild_trajs.py` | 用当前 builder 重建历史 .traj，并识别/隔离垃圾会话目录 |
+| `merger.py` | 双通道数据合并器（运行时 lazy import；也可作 CLI） |
 | `uploader.py` | 可靠上传管理器：gzip + SHA256 校验、指数退避重试、持久化队列、启动补传 |
-| `sync.py` | 手动批量补传（uploader 没跑时）。同一对 URL/token 必填，身份不回退系统用户名 |
-| `recover_truncated.py` | 历史数据修复：会话复活截断重建 + 超大 traj 无损去重 + 重新上云 |
-| `filter_trajs.py` | 轨迹过滤器 |
-| `convert_trajs.py` | 格式转换（.traj → SFT .jsonl） |
-| `combine_trajs.py` | 合并 + shuffle SFT 数据 |
+| `tools/sync.py` | 手动批量补传（uploader 没跑时）。同一对 URL/token 必填，身份不回退系统用户名 |
+| `tools/rebuild_trajs.py` | 用当前 builder 重建历史 .traj，并识别/隔离垃圾会话目录 |
+| `tools/recover_truncated.py` | 历史数据修复：会话复活截断重建 + 超大 traj 无损去重 + 重新上云 |
+| `tools/filter_trajs.py` | 轨迹过滤器 |
+| `tools/convert_trajs.py` | 格式转换（.traj → SFT .jsonl） |
+| `tools/combine_trajs.py` | 合并 + shuffle SFT 数据 |
+| `tools/migrate_storage.py` | 旧布局 `raw/`+`traj/` → `sessions/` |
 | `start.sh` | 源码临时启动：采集器与 Claude Code 同一次会话。会清掉 `$PORT` 上已有进程，日常采集不要用 |
 | `proxy-daemon.sh` | 自动重启的守护进程脚本 |
 | `dist/install.sh` | 一键安装器。仓库内走本地拷贝；`curl \| bash` 走 GitHub Releases |
@@ -893,7 +894,7 @@ python3 merger.py --all \
 | `switch-channel.sh` | 快速切换 API 渠道（同步更新 token + 统一采集器上游） |
 | `channels.json` | 渠道配置文件，含 token/upstream/force_thinking（已加入 .gitignore） |
 | `channels.json.example` | 渠道配置模板，可提交到 git |
-| `viewer.py` | 轨迹数据 HTML 查看器，将 .traj 转为可视化 HTML |
+| `tools/viewer.py` | 轨迹数据 HTML 查看器，将 .traj 转为可视化 HTML |
 | `git_state.py` | 会话起点 git 状态快照采集（`collector.py` 的同目录依赖） |
 | `docs/upload-protocol.md` | 自建上传接收端所需的服务端协议 |
 | `tests/` | 测试骨架（请求头脱敏 / session_id 防护 / porcelain 解析 / 安装器分流 / 版本事实源） |
@@ -993,9 +994,9 @@ ls ~/.claude/trajectory_events/
 
 ```bash
 # 可视化查看 .traj（推荐，生成 HTML 在浏览器中查看）
-python3 viewer.py trajectories/sessions/<session_id>/session.traj
-python3 viewer.py trajectories/sessions/              # 目录索引模式
-python3 viewer.py trajectories/sessions/<id>/session.traj -o out.html
+python3 tools/viewer.py trajectories/sessions/<session_id>/session.traj
+python3 tools/viewer.py trajectories/sessions/              # 目录索引模式
+python3 tools/viewer.py trajectories/sessions/<id>/session.traj -o out.html
 
 # 查看增量日志（始终有）
 head -1 trajectories/sessions/<session_id>/raw.jsonl | python3 -m json.tool

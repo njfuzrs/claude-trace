@@ -5,12 +5,7 @@
 用户不会收到任何报错，只会在某天发现 token 明文躺在 raw.jsonl 里。
 """
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from proxy import SENSITIVE_HEADERS, sanitize_headers_for_storage  # noqa: E402
+from proxy import SENSITIVE_HEADERS, sanitize_headers_for_storage
 
 
 def test_长请求头被截断为前10字符加星号():

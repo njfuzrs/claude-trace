@@ -5,9 +5,9 @@ viewer.py — 轨迹数据 HTML 查看器
 将 .traj 文件转换为自包含的 HTML 文件，浏览器打开即可还原完整对话流程。
 
 用法：
-    python viewer.py trajectories/traj/xxx.traj          # 单文件
-    python viewer.py trajectories/traj/                   # 目录索引
-    python viewer.py trajectories/traj/xxx.traj -o out.html
+    python3 tools/viewer.py trajectories/sessions/<id>/session.traj  # 单文件
+    python3 tools/viewer.py trajectories/sessions/                   # 目录索引
+    python3 tools/viewer.py trajectories/sessions/<id>/session.traj -o out.html
 """
 
 import argparse

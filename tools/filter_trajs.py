@@ -3,7 +3,7 @@
 filter_trajs.py — 过滤无效轨迹
 
 用法：
-    python filter_trajs.py --input traj/ --output filtered/ --min-steps 3 --require-end-turn
+    python3 tools/filter_trajs.py --input traj/ --output filtered/ --min-steps 3 --require-end-turn
 """
 
 import argparse

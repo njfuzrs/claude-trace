@@ -11,9 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from version_info import UNKNOWN, resolve_version, version_string  # noqa: E402
+from version_info import UNKNOWN, resolve_version, version_string
 
 ROOT = Path(__file__).resolve().parent.parent
 SEMVER = re.compile(r"^\d+\.\d+\.\d+([.-][0-9A-Za-z._-]+)?$")
