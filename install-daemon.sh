@@ -302,7 +302,7 @@ do_restart() {
 
     if [ -f "$PLIST_PATH" ]; then
         launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
-        echo "✅ 服务已重启（已重新加载 $PLIST_PATH）"
+        echo "✅ 服务已重启（已重新加载 ${PLIST_PATH}）"
     else
         echo "未找到 $PLIST_PATH，执行 install 重建配置..."
         do_install

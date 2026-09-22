@@ -143,6 +143,15 @@ def test_cli重启不是kickstart():
         assert "launchctl bootout" in text and "launchctl bootstrap" in text
 
 
+def test_restart回显不把全角括号粘进变量名():
+    """macOS /bin/bash 3.2 + set -u：`$PLIST_PATH）` 会被当成名为 PLIST_PATH\\xef\\xbc\\x89 的变量。
+    bootstrap 已经跑完，echo 再炸，操作者会以为 restart 失败。必须用 ${PLIST_PATH}。"""
+    for rel in ("install-daemon.sh", "dist/claude-trace"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        assert "$PLIST_PATH）" not in text, rel
+        assert "${PLIST_PATH}" in text, rel
+
+
 def test_watchReload默认不装():
     """生产二进制模式禁止默认装文件监听"""
     text = (ROOT / "install-daemon.sh").read_text(encoding="utf-8")
