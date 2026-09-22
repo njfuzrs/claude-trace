@@ -6,7 +6,9 @@ import_codex.py — 导入 Codex CLI 会话到统一轨迹格式
 1. 主通道：通过 `codex app-server` 的 `thread/list` + `thread/read` 获取官方语义线程结构
 2. 补通道：读取 `~/.codex/sessions/.../rollout-*.jsonl`，补全 system/developer 指令、token 用量、
    旧版本会话的工具调用轨迹，以及原始事件文件
-3. 异常兜底：读取 `state_5.sqlite` / `logs_1.sqlite` 中按 thread_id 过滤的日志，保留异常和索引信息
+3. 异常兜底：读取 `logs_1.sqlite`（及旧版 `state_5.sqlite` 里若还在的 `logs` 表）
+   中按 thread_id 过滤的日志。`state_5` 在 2026-08 已 drop logs，缺表视为没有附件，
+   不把整次导出判失败。
 
 输出目录：
   trajectories/sessions/{thread_id}/
@@ -603,6 +605,14 @@ def _session_artifacts_missing(session_dir: Path) -> bool:
 
 
 def _load_sqlite_rows(db_path: Path, query: str, params: Tuple = ()) -> List[Dict]:
+    """读 sqlite 行。库不存在或查询的表/列已迁走，返回空列表，不把整次导出打失败。
+
+    Codex 在 2026-08 把 `logs` 从表 `state_5.sqlite` 拆到 `logs_1.sqlite` /
+    `logs_2.sqlite`（迁移名 `drop logs`）。旧查询仍打 state_5 会抛
+    `no such table: logs`，watcher 当成导出失败反复重试，日志被刷爆、
+    主通道 thread/read 的结果也被丢掉。缺表对兜底通道是「没有这份附件」，
+    不是「这次导出失败」。
+    """
     if not db_path.exists():
         return []
     conn = sqlite3.connect(str(db_path))
@@ -610,6 +620,12 @@ def _load_sqlite_rows(db_path: Path, query: str, params: Tuple = ()) -> List[Dic
     try:
         cur = conn.execute(query, params)
         return [dict(row) for row in cur.fetchall()]
+    except sqlite3.OperationalError as exc:
+        msg = str(exc).lower()
+        if "no such table" in msg or "no such column" in msg:
+            logger.debug("sqlite 结构已变，跳过 %s: %s", db_path.name, exc)
+            return []
+        raise
     finally:
         conn.close()
 

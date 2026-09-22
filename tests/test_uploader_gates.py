@@ -9,6 +9,7 @@
 """
 
 import json
+from pathlib import Path
 
 from uploader import UploadManager
 
@@ -17,6 +18,7 @@ def _mgr(tmp_path, **kw):
     kw.setdefault("cleanup_after_upload", False)
     kw.setdefault("sessions_dir", tmp_path)
     kw.setdefault("backfill_enabled", False)
+    kw.setdefault("queue_dir", tmp_path)
     return UploadManager(upload_url="http://x/traj", upload_token="tok", **kw)
 
 
@@ -164,12 +166,29 @@ async def test_retriable_failure_blocks_marker(tmp_path, monkeypatch):
 
 def test_backfill_disabled_without_sessions_dir(tmp_path):
     """没给 sessions_dir 就不能开补传（没地方扫）"""
-    m = UploadManager(upload_url="http://x/traj", upload_token="t", backfill_enabled=True)
+    m = UploadManager(
+        upload_url="http://x/traj", upload_token="t",
+        backfill_enabled=True, queue_dir=tmp_path,
+    )
     assert m._backfill_enabled is False
 
 
-def test_cleanup_default_is_keep_local():
+def test_cleanup_default_is_keep_local(tmp_path):
     """构造器默认值保持向后兼容；安全默认由 proxy 侧的环境变量决定"""
-    m = UploadManager(upload_url="http://x/traj", upload_token="t",
-                      cleanup_after_upload=False)
+    m = UploadManager(
+        upload_url="http://x/traj", upload_token="t",
+        cleanup_after_upload=False, queue_dir=tmp_path,
+    )
     assert m._cleanup_after_upload is False
+
+
+def test_mgr_helper_does_not_touch_home_queue(tmp_path):
+    """回归：UploadManager 默认 queue_dir 是 ~/.claude-trace。
+    单测必须显式传入 tmp，否则会覆盖本机真实队列（2026-09-22 已踩）。"""
+    home_q = Path.home() / ".claude-trace" / ".upload_queue.jsonl"
+    before = home_q.read_bytes() if home_q.exists() else None
+    m = _mgr(tmp_path)
+    after = home_q.read_bytes() if home_q.exists() else None
+    assert after == before
+    assert m._queue_dir == tmp_path
+    assert m._queue_file == tmp_path / ".upload_queue.jsonl"
