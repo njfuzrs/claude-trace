@@ -107,7 +107,11 @@ def is_empty_trajectory(session_dir: Path) -> bool:
         return False
     if not isinstance(data, dict):
         return False
-    return not (data.get("trajectory") or [])
+    # user step（S2-1）不算 TAO 步骤：只有用户输入、没有任何模型动作的会话仍是空轨迹
+    return not any(
+        isinstance(s, dict) and s.get("message_type") != "user"
+        for s in (data.get("trajectory") or [])
+    )
 
 
 def infer_tool_source(session_dir: Path) -> str:

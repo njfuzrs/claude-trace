@@ -22,6 +22,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("convert")
 
 
+# message_type=user（S2-1 的用户输入步）三种 style 一律跳过：convert 的 messages
+# 由 system + action/observation 组成，插进 user step 会改变旧夹具输出的 hash。
+# 下面三个 converter 都只认 action / observation 两种 message_type，user 天然落空；
+# 新增 message_type 时必须保持这一点（tests/test_user_steps.py 锁住）。
+
+
 def traj_to_messages_xml(traj: dict) -> List[Dict]:
     """将轨迹转换为 XML 格式的 messages（SWE-agent-LM 默认）"""
     messages: List[Dict] = []

@@ -246,6 +246,166 @@ def _stringify_result_content(content) -> str:
     return json.dumps(content, ensure_ascii=False)
 
 
+# ─────────────────────────────────────────────
+# user step：用户输入 + 指令去噪（S2-1 / L1-F）
+# ─────────────────────────────────────────────
+
+# 整段剔除的注入块：Claude Code 自己塞进 user 消息的上下文，不是用户输入
+_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+# 本地命令（/clear、/model 等）的回显：带 caveat / stdout 的整条消息都不是用户意图
+_LOCAL_CMD_RE = re.compile(
+    r"<(local-command-caveat|local-command-stdout|local-command-stderr)>.*?</\1>", re.S,
+)
+# slash 命令标签：保留用户真正敲的「/name args」，丢掉标签壳
+_CMD_NAME_RE = re.compile(r"<command-name>(.*?)</command-name>", re.S)
+_CMD_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.S)
+_CMD_TAGS_RE = re.compile(r"<(command-name|command-message|command-args)>.*?</\1>", re.S)
+# Claude Code 自己以 user 身份注入的提示，不是用户写的：
+#   compaction 之后的会话摘要；用户离开回来时的 recap 请求（带完整 tools，靠 tools 判不出）
+_INJECTED_PREFIXES = (
+    ("This session is being continued from a previous conversation", "compaction_summary"),
+    ("The user stepped away and is coming back.", "away_recap"),
+)
+
+
+def clean_user_text(text: str) -> tuple:
+    """去掉 system-reminder / 本地命令噪声，返回 (content_clean, noise_kinds)
+
+    去不掉的内容原样保留；content_clean 为空即整条都是噪声。
+    """
+    kinds: List[str] = []
+    clean = text
+    if _REMINDER_RE.search(clean):
+        kinds.append("system_reminder")
+        clean = _REMINDER_RE.sub("", clean)
+    if _LOCAL_CMD_RE.search(clean):
+        kinds.append("local_command")
+        clean = _LOCAL_CMD_RE.sub("", clean)
+    name = _CMD_NAME_RE.search(clean)
+    if name:
+        args = _CMD_ARGS_RE.search(clean)
+        typed = " ".join(
+            s for s in (name.group(1).strip(), args.group(1).strip() if args else "") if s
+        )
+        clean = _CMD_TAGS_RE.sub("", clean)
+        clean = f"{typed}\n{clean}" if clean.strip() else typed
+    clean = clean.strip()
+    for prefix, kind in _INJECTED_PREFIXES:
+        if clean.startswith(prefix):
+            kinds.append(kind)
+            clean = ""
+            break
+    return clean, kinds
+
+
+def _user_message_text(msg: Dict) -> tuple:
+    """把一条 user 消息（已剔除 tool_result）拆成 (原文, 去噪文本, 噪声类型)
+
+    逐 block 去噪：首条消息常见「system-reminder block + 真实 prompt block」并排。
+    """
+    content = msg.get("content")
+    blocks = [{"type": "text", "text": content}] if isinstance(content, str) else (content or [])
+    raw_parts: List[str] = []
+    clean_parts: List[str] = []
+    kinds: List[str] = []
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        btype = b.get("type")
+        if btype == "text":
+            text = b.get("text", "") or ""
+            clean, k = clean_user_text(text)
+            raw_parts.append(text)
+            if clean:
+                clean_parts.append(clean)
+            kinds.extend(x for x in k if x not in kinds)
+        elif btype in ("image", "document"):
+            src = b.get("source", {}) or {}
+            marker = f"[{btype}: {src.get('media_type', 'unknown')}]"
+            raw_parts.append(marker)
+            clean_parts.append(marker)
+    return "\n".join(raw_parts), "\n".join(clean_parts), kinds
+
+
+def _match_hook_prompt(prompts: Sequence[str], start: int, content: str, clean: str) -> int:
+    """在 hook UserPromptSubmit 序列里从 start 往后找第一条能对上的，找不到返回 -1"""
+    for i in range(start, len(prompts)):
+        p = (prompts[i] or "").strip()
+        # clean 可能前面挂着本地命令行（/clear、/model），所以 clean 包含 p 也算
+        if p and (p == clean or p in content or p in clean):
+            return i
+    return -1
+
+
+# ─────────────────────────────────────────────
+# 测试命令启发式（S2-1 / L1-H）
+# ─────────────────────────────────────────────
+
+# 固定 argv0 / 子命令表。未命中一律不标：宁可漏，也不要把
+# `git log --grep test`、`echo pytest` 这类当成测试。
+_TEST_RUNNERS = (
+    ("pytest",),
+    ("py.test",),
+    ("python", "-m", "pytest"),
+    ("npm", "test"),
+    ("npm", "run", "test"),
+    ("npx", "vitest"),
+    ("npx", "jest"),
+    ("cargo", "test"),
+    ("go", "test"),
+    ("make", "test"),
+    ("tox",),
+)
+_CMD_SPLIT_RE = re.compile(r"\|\||&&|;|\||\n")
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_PYTHON_RE = re.compile(r"^python3?(\.\d+)?$")
+
+
+def detect_test_runner(command: str) -> str:
+    """按 argv0 表识别测试命令，返回命中的 runner（如 "pytest"），未命中返回空串
+
+    复合命令（`cd x && pytest`、`pytest | tail`）逐段判断，任一段命中即算。
+    """
+    import shlex
+
+    if not isinstance(command, str) or not command:
+        return ""
+    for segment in _CMD_SPLIT_RE.split(command):
+        try:
+            argv = shlex.split(segment)
+        except ValueError:
+            argv = segment.split()
+        while argv and _ENV_ASSIGN_RE.match(argv[0]):
+            argv = argv[1:]
+        if not argv:
+            continue
+        head = argv[0].rsplit("/", 1)[-1]
+        if _PYTHON_RE.match(head):
+            head = "python"
+        argv = [head] + argv[1:]
+        for pattern in _TEST_RUNNERS:
+            if tuple(argv[:len(pattern)]) == pattern:
+                return " ".join(pattern)
+    return ""
+
+
+# 采集器版本号写进 traj，清洗侧靠它筛「这条 traj 有没有 user step」。
+# 软导入：版本读不到不该让构建失败。
+try:
+    from version_info import resolve_version as _resolve_version
+except Exception:  # pragma: no cover
+    _resolve_version = None
+
+
+def _collector_version() -> str:
+    if _resolve_version is None:
+        return "unknown"
+    try:
+        return _resolve_version()
+    except Exception:
+        return "unknown"
+
+
 def _msg_fingerprint(msg: Dict) -> str:
     """消息内容指纹，用于识别 compaction 导致的历史重放"""
     try:
@@ -801,6 +961,18 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
     seen_result_ids: Set[str] = set()
     last_timestamp = ""
 
+    # user step（S2-1）：hook UserPromptSubmit 按顺序对齐，指针只前进不回退
+    hook_prompts = list(metadata.user_prompts or [])
+    hook_cursor = 0
+    n_user_steps = 0
+    n_user_noise = 0
+    n_user_matched = 0
+    n_user_resent = 0
+    n_user_from_hook = 0
+    emitted_clean: Dict[str, int] = {}
+    last_clean = ""
+    test_runs: List[Dict] = []
+
     for pair in pairs:
         response = pair.response_body or {}
 
@@ -831,6 +1003,12 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
             m for m in source_msgs
             if isinstance(m, dict) and m.get("role") == "user"
         ]
+        pair_user_texts: List[tuple] = []
+        pair_user_entries: List[Dict] = []
+        # 旁路请求（标题生成、离开回来的 recap 等）不带 tools，与主会话同 sid
+        # 落进同一个 raw.jsonl。它们的 user 消息是 Claude Code 自己拼的，不是用户输入，
+        # 不产生 user step，也不能占用 hook prompt 的对齐位。
+        is_side_query = not request_body.get("tools")
         # Fix: 无法定位增量边界时 proxy 会返回完整历史，导致同一批 user 消息
         # 被反复写进 history（实测一个会话里同一个 tool_result 出现几十次，
         # 最坏 0 个 tool_use 对应 570 个 tool_result 块）。
@@ -852,11 +1030,92 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
             trimmed = _strip_tool_results(msg)
             if trimmed is None:
                 continue
-            history.append({
+            entry = {
                 "role": "user",
                 "content": trimmed.get("content", ""),
                 "agent": "primary",
+                "timestamp": pair.timestamp,
+            }
+            if not is_side_query:
+                entry["message_type"] = "user"
+                entry["traj_step"] = len(trajectory)   # 指向下面即将插入的 user step
+                pair_user_texts.append(_user_message_text(trimmed))
+                pair_user_entries.append(entry)
+            history.append(entry)
+
+        # ── user step：本 pair 新增的用户输入，插在本 pair 的 action 之前 ──
+        # 连续多条 user 合并成一条（API 允许连续同 role）。只进 trajectory 和
+        # history 索引，SFT convert 跳过 message_type=user。
+        if pair_user_texts:
+            raw_text = "\n\n".join(t[0] for t in pair_user_texts if t[0])
+            clean_text = "\n\n".join(t[1] for t in pair_user_texts if t[1])
+            kinds: List[str] = []
+            for t in pair_user_texts:
+                kinds.extend(k for k in t[2] if k not in kinds)
+            user_step = {
+                "message_type": "user",
+                "role": "user",
+                "content": raw_text,
+                "content_clean": clean_text,
+                "is_system_noise": not clean_text,
+                "noise_kinds": kinds,
+                "agent": "primary",
+                "timestamp": pair.timestamp,
+                "prompt_id": None,
+                "content_source": "request",
+            }
+            resent = False
+            if clean_text:
+                hit = _match_hook_prompt(hook_prompts, hook_cursor, raw_text, clean_text)
+                if hit >= 0:
+                    # hook 不带 prompt id，这里填 metadata.user_prompts 的下标
+                    user_step["prompt_id"] = hit
+                    hook_cursor = hit + 1
+                    n_user_matched += 1
+                elif hook_prompts:
+                    # 同一句已经出过 user step、hook 里又没有新的一次提交 → 是请求重发
+                    # （重试 / cache_control 位置变化导致增量锚点失配），不是用户又说了一遍
+                    resent = emitted_clean.get(clean_text, 0) > 0
+                else:
+                    # 没有 hook 可对：只把「与上一条完全相同」当重发，真重复的「继续」会漏判一次
+                    resent = clean_text == last_clean
+            else:
+                n_user_noise += 1
+            if resent:
+                n_user_resent += 1
+                # 重发不进 trajectory，history 条目保留原文但不再指向任何 step
+                for h in pair_user_entries:
+                    h["traj_step"] = None
+            else:
+                if clean_text:
+                    emitted_clean[clean_text] = emitted_clean.get(clean_text, 0) + 1
+                    last_clean = clean_text
+                trajectory.append(user_step)
+                n_user_steps += 1
+
+        # 首个主请求之前一条 user step 都没有、hook 里却有 prompt：raw.jsonl 把首条用户
+        # 输入丢了（典型是标题生成请求先落盘占了基线，主请求的增量为空）。
+        # 用 hook 原文补一条，content_source=hook 标明来源，原文 content 就是 hook prompt。
+        if (not is_side_query and n_user_steps == 0 and not pair_user_texts
+                and hook_cursor == 0 and hook_prompts and response):
+            prompt = hook_prompts[0]
+            clean, kinds = clean_user_text(prompt)
+            trajectory.append({
+                "message_type": "user",
+                "role": "user",
+                "content": prompt,
+                "content_clean": clean,
+                "is_system_noise": not clean,
+                "noise_kinds": kinds,
+                "agent": "primary",
+                "timestamp": pair.timestamp,
+                "prompt_id": 0,
+                "content_source": "hook",
             })
+            hook_cursor = 1
+            n_user_steps += 1
+            n_user_matched += 1
+            n_user_from_hook += 1
 
         if not response:
             continue
@@ -896,7 +1155,8 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
         has_tool_use = bool(action_blocks)
 
         # ── history：记录 assistant 消息 ──────────────────
-        history.append({
+        # traj_step 指向本 pair 的首个 action（含 final_answer）；没有 action 则为 None
+        assistant_entry = {
             "role": "assistant",
             "content": content_blocks,
             "message_type": "action" if has_tool_use else "thought",
@@ -910,7 +1170,9 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
             "usage": usage,
             "stop_reason": stop_reason,
             "timestamp": pair.timestamp,
-        })
+            "traj_step": None,
+        }
+        history.append(assistant_entry)
 
         # ── Action / Observation 步骤 ─────────────────────
         for tool_idx, block in enumerate(action_blocks):
@@ -953,7 +1215,14 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
             }
             if is_server_side:
                 action_step["_server_side"] = True
+            if assistant_entry["traj_step"] is None:
+                assistant_entry["traj_step"] = len(trajectory)
             trajectory.append(action_step)
+
+            # 测试命令启发式（L1-H）：只认 shell 工具 + 固定 argv0 表
+            test_runner = ""
+            if lname in _SHELL_TOOLS and isinstance(tool_input, dict):
+                test_runner = detect_test_runner(tool_input.get("command", ""))
 
             # ── Observation ──────────────────────────────
             tool_result = tool_result_index.get(tool_use_id)
@@ -969,7 +1238,7 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
                     n_failed_actions += 1
                 if outcome["exit_code"] is not None:
                     n_exit_codes_known += 1
-                trajectory.append({
+                obs_step = {
                     "message_type": "observation",
                     "role": "user",
                     "content": obs_content,
@@ -979,7 +1248,21 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
                     "exit_code": outcome["exit_code"],
                     "status": outcome["status"],
                     "exit_code_source": outcome["exit_code_source"],
-                })
+                }
+                if test_runner:
+                    obs_step["is_test_command"] = True
+                    test_runs.append({
+                        "tool_use_id": tool_use_id,
+                        "runner": test_runner,
+                        "command_preview": str(tool_input.get("command", ""))[:200],
+                        "exit_code": outcome["exit_code"],
+                        "status": outcome["status"],
+                        "exit_code_source": outcome["exit_code_source"],
+                        "timestamp": pair.timestamp,
+                        "source": "inferred_argv0",
+                    })
+                obs_traj_step = len(trajectory)
+                trajectory.append(obs_step)
                 # history：tool_result 只记录一次（user message 侧已剔除）
                 if tool_use_id in seen_result_ids:
                     n_dup_result_dropped += 1
@@ -991,6 +1274,7 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
                         "message_type": "observation",
                         "agent": "primary",
                         "tool_call_ids": [tool_use_id],
+                        "traj_step": obs_traj_step,
                     })
             elif server_result is not None:
                 obs_content = _stringify_result_content(server_result.get("content"))
@@ -1017,6 +1301,7 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
                         "message_type": "observation",
                         "agent": "primary",
                         "tool_call_ids": [tool_use_id],
+                        "traj_step": len(trajectory) - 1,
                     })
             else:
                 # 全量索引后仍找不到 = 真正的孤儿（会话中断在工具执行途中）
@@ -1041,6 +1326,7 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
         # stop_reason 为空，导致最后一轮纯文本回复不生成 final_answer。
         # 现在放宽到所有非 tool_use 的终止原因。
         if thought and not has_tool_use and stop_reason != "tool_use":
+            assistant_entry["traj_step"] = len(trajectory)
             trajectory.append({
                 "message_type": "action",
                 "role": "assistant",
@@ -1117,6 +1403,13 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
         "exit_codes_known": n_exit_codes_known,
         "failure_rate": round(n_failed_actions / n_tool_actions, 4) if n_tool_actions else 0.0,
         "has_git_state": bool(metadata.git_state),
+        # user step（S2-1）：noise = 整条都是 system-reminder / 本地命令回显；
+        # matched = 能对上 hook UserPromptSubmit 的条数
+        "user_steps": n_user_steps,
+        "user_steps_noise": n_user_noise,
+        "user_steps_prompt_matched": n_user_matched,
+        "user_steps_resent_dropped": n_user_resent,
+        "user_steps_from_hook": n_user_from_hook,
     }
 
     return {
@@ -1172,6 +1465,11 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
             # 权限决策只进 metadata，SFT convert 默认不读这些字段。
             "permission_decisions": metadata.permission_decisions,
             "permission_mode_timeline": metadata.permission_mode_timeline,
+            # 测试命令（L1-H）：按 argv0 表推断，source 固定为 inferred_argv0
+            "test_runs": test_runs,
+            # 清洗侧按这个版本筛「trajectory 里有没有 message_type=user」
+            "collector_ver": _collector_version(),
+            "traj_schema": {"user_steps": True},
             "data_quality": data_quality,
         },
     }

@@ -8,6 +8,27 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-03
+
+### 新增
+
+- traj `trajectory` 新增 `message_type=user` 用户输入步，插在对应 action 之前，带 `content`（原文）、
+  `content_clean`（去掉 system-reminder / 本地命令回显 / compaction 摘要 / 离开回来 recap 后的文本）、
+  `is_system_noise`、`prompt_id`（对上 hook UserPromptSubmit 时为 `metadata.user_prompts` 下标）。
+  不带 tools 的旁路请求（标题生成等）不产生 user step；同一句的请求重发不重复产生。
+  raw.jsonl 丢了首条输入时用 hook 原文补，`content_source=hook`。
+- history 条目补 `traj_step`（指向 trajectory 下标），user 条目补 `message_type` / `timestamp`。
+- traj `metadata.test_runs`：按固定 argv0 表识别的测试命令及其结果，`source=inferred_argv0`；
+  对应 observation 带 `is_test_command=true`。
+- traj `metadata.collector_ver` / `traj_schema`：清洗侧按版本筛「切分还要不要读 raw.jsonl」。
+- `tools/events_coverage.py`：只读统计 hook events 对代理会话的覆盖率。
+
+### 兼容性
+
+- `tools/convert_trajs.py` 三种 style 跳过 user step，旧轨迹 convert 输出不变。
+- `metadata.total_steps` 现在包含 user step；`tools/filter_trajs.py` 的步数阈值与上传侧空轨迹判定
+  不计 user step，口径与旧版一致。
+
 ## [0.3.2] - 2026-10-03
 
 ### 修复

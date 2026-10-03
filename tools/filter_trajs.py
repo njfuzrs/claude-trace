@@ -27,7 +27,8 @@ def load_traj(path: Path) -> dict:
 def passes_filter(traj: dict, args) -> tuple[bool, str]:
     """检查轨迹是否通过过滤条件，返回 (通过, 原因)"""
     meta = traj.get("metadata", {})
-    steps = traj.get("trajectory", [])
+    # user step（S2-1）不计入步骤数，阈值口径与旧轨迹保持一致
+    steps = [s for s in traj.get("trajectory", []) if s.get("message_type") != "user"]
     info = traj.get("info", {})
 
     step_count = len(steps)
@@ -54,7 +55,7 @@ def passes_filter(traj: dict, args) -> tuple[bool, str]:
 
 def compute_quality_metrics(traj: dict) -> dict:
     """P2 #20: 计算单条轨迹的质量指标"""
-    steps = traj.get("trajectory", [])
+    steps = [s for s in traj.get("trajectory", []) if s.get("message_type") != "user"]
     info = traj.get("info", {})
     meta = traj.get("metadata", {})
 
