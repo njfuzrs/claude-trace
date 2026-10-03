@@ -8,6 +8,8 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-04
+
 ### 新增
 
 - traj `metadata.git_state_end` 在工作区脏时带有界 diff：`diff`（`git diff --no-color HEAD` 全文，
