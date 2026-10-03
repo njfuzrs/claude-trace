@@ -646,14 +646,22 @@ trajectories/
 
 ```json
 {
-  "trajectory": [                    // TAO 步骤列表
+  "trajectory": [                    // TAO 步骤列表（按时间排序）
+    {"message_type": "user",         // 用户输入步（0.4.0+），插在对应 action 之前
+     "content": "...",               // 原文（含 system-reminder 等注入，不删）
+     "content_clean": "...",         // 去掉 system-reminder / 本地命令回显 / 注入提示后的文本
+     "is_system_noise": false,       // content_clean 为空 = 整条都是注入，不是用户写的
+     "noise_kinds": ["system_reminder"],
+     "prompt_id": 0,                 // 对上 metadata.user_prompts 的下标；对不上为 null
+     "content_source": "request"},   // request = 来自请求体；hook = raw 丢了首条输入，用 hook 原文补
     {"message_type": "action", "tool_name": "Bash", "tool_input": {...}, ...},
     {"message_type": "observation", "content": "...",
      "exit_code": 1,                 // 数值退出码；无法确定时为 null
      "status": "failure",            // success / failure / rejected
                                      // / interrupted / timeout / invalid_input / unknown
      "exit_code_source": "exit_code_prefix",   // 该结论的依据
-     "is_error": true, ...}
+     "is_error": true,
+     "is_test_command": true, ...}   // 只在命中测试命令表时出现
   ],
   "history": [...],                  // 完整 LLM 对话历史（用于 SFT 训练）
   "info": {                          // 会话统计
@@ -679,6 +687,11 @@ trajectories/
     "git_dirty": true,               // 工作区是否有未提交改动；null = 未采到
     "git_state": {...},              // 起点完整快照（见下）
     "git_state_end": {...},          // 终点完整快照
+    "collector_ver": "0.4.0",        // 采集器版本；清洗侧按它判断 trajectory 里有没有 user step
+    "test_runs": [                   // 测试命令（按 argv0 表推断：pytest / npm test / cargo test / go test ...）
+      {"tool_use_id": "...", "runner": "pytest", "exit_code": 1, "status": "failure",
+       "source": "inferred_argv0", ...}
+    ],
     "permission_decisions": [        // 权限决策（不进 SFT 正文）
       {"tool_use_id": "...", "tool_name": "Bash",
        "decision": "accept", "source": "inferred_executed",

@@ -45,6 +45,7 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 │   ├── viewer.py           # 轨迹数据 HTML 查看器
 │   ├── sync.py             # 手动批量补传（URL/token 必填，身份不回退）
 │   ├── rebuild_trajs.py    # 用当前 builder 重建历史 .traj
+│   ├── events_coverage.py  # hook events 覆盖率（只读，分 main/child/orphan/probe/legacy）
 │   ├── recover_truncated.py # 历史数据修复（复活截断 / 超大 traj 去重 / 重传）
 │   ├── filter_trajs.py     # 轨迹过滤器
 │   ├── convert_trajs.py    # 格式转换（.traj → SFT .jsonl）
@@ -183,6 +184,9 @@ pre-commit run --all-files              # 一次跑全部
 python3 tools/filter_trajs.py --input trajectories/sessions/ --output filtered/
 python3 tools/convert_trajs.py --input filtered/ --output sft/ --style xml
 python3 tools/combine_trajs.py --input sft/ --output training_data.jsonl --shuffle
+
+# hook events 覆盖率（只读）
+python3 tools/events_coverage.py --input ~/.claude-trace/trajectories/sessions --by-month
 
 # 双通道合并
 python3 merger.py --all
