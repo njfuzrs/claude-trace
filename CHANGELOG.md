@@ -8,6 +8,8 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-03
+
 ### 新增
 
 - traj `metadata.permission_decisions`：权限决策结果。Claude Code 2.1.276 没有决策后 hook，
