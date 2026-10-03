@@ -389,9 +389,23 @@ fi
 if [ "$SKIP_SERVICE" != true ]; then
     if launchctl list "$LABEL" &>/dev/null; then
         launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+        # bootout 是异步的：job 收尾期间再 bootstrap 会报 5: Input/output error，
+        # 服务停在未加载状态、KeepAlive 管不到。等 job 真正消失。
+        for _ in $(seq 1 60); do
+            launchctl print "gui/$(id -u)/$LABEL" &>/dev/null || break
+            sleep 0.5
+        done
         info "已停止旧服务"
     fi
     kill $(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null) 2>/dev/null || true
+
+    # 生产二进制模式下不该有源码文件监听：它改的是仓库 .py，重启的却是这里的二进制，
+    # 每次保存都打断一次采集。早期 install-daemon.sh 装过的旧监听在这里一并卸掉（plist 保留，
+    # 想要源码热重载时用 install-daemon.sh install --watch 重新装）。
+    if launchctl list com.claude-trace.watch-reload &>/dev/null; then
+        launchctl bootout "gui/$(id -u)/com.claude-trace.watch-reload" 2>/dev/null || true
+        info "已停用源码文件监听（生产二进制模式不需要）"
+    fi
 fi
 
 mkdir -p "$INSTALL_DIR"
@@ -692,8 +706,12 @@ SVC_BACKFILL="$(echo "$_svc_config" | sed -n '8p')"
 
 mkdir -p "$HOME/Library/LaunchAgents"
 
-# 如果已有服务，先卸载
+# 如果已有服务，先卸载（并等 job 真正消失，理由同上）
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+for _ in $(seq 1 60); do
+    launchctl print "gui/$(id -u)/$LABEL" &>/dev/null || break
+    sleep 0.5
+done
 
 # 生成 plist
 cat > "$PLIST_PATH" <<PLIST
@@ -749,7 +767,19 @@ cat > "$PLIST_PATH" <<PLIST
 </plist>
 PLIST
 
-launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+_bootstrapped=false
+for _ in 1 2 3 4 5; do
+    if launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"; then
+        _bootstrapped=true
+        break
+    fi
+    sleep 1
+done
+if [ "$_bootstrapped" != true ]; then
+    echo "❌ 服务加载失败，代理没有运行，Claude Code 请求会 403。手动执行："
+    echo "   launchctl bootstrap gui/$(id -u) ${PLIST_PATH}"
+    exit 1
+fi
 ok "launchd 统一采集服务已启动"
 
 # ─── 等待统一采集器健康检查 ───

@@ -143,6 +143,84 @@ def test_cli重启不是kickstart():
         assert "launchctl bootout" in text and "launchctl bootstrap" in text
 
 
+def test_bootout之后先等job消失再bootstrap():
+    """bootout 是异步的：采集器收尾最多 15 秒，期间 bootstrap 报 5: Input/output error，
+    job 停在未加载状态，KeepAlive 管不到，服务静默死掉（v0.3.1 watch-reload 触发过）。
+    restart 路径必须等 job 从域里消失，bootstrap 必须有重试且失败时非 0 退出。"""
+    for rel in ("install-daemon.sh", "dist/claude-trace"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        assert "wait_job_gone()" in text, rel
+        assert "bootstrap_job()" in text, rel
+        body = text[text.index("do_restart() {"):]
+        body = body[: body.index("\n}\n")]
+        assert body.index("launchctl bootout") < body.index("wait_job_gone"), rel
+        assert "bootstrap_job" in body, rel
+        assert 'launchctl bootstrap "gui' not in body, rel
+    for rel in ("switch-channel.sh", "dist/install.sh"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        assert 'launchctl print "gui/$(id -u)/$LABEL"' in text, rel
+
+
+def test_所有先bootout再bootstrap的脚本都等job消失():
+    """全仓兜底：新增脚本只要同时出现 bootout 和 bootstrap，就必须带「等 job 消失」，
+    否则同一个 5: Input/output error 会在下一个脚本里复活。"""
+    import subprocess as sp
+    files = sp.run(["git", "ls-files", "*.sh", "dist/claude-trace"],
+                   cwd=ROOT, capture_output=True, text=True, check=True).stdout.split()
+    checked = 0
+    for rel in files:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        if "launchctl bootout" in text and "launchctl bootstrap" in text:
+            checked += 1
+            assert 'launchctl print "gui/$(id -u)/' in text, rel
+    assert checked >= 5
+
+
+def test_守护进程强杀时连孙进程一起杀():
+    """PyInstaller onefile 是引导进程 + python 进程两层，SIGKILL 不转发。
+    只杀 CHILD_PID 会留下占着 4000 端口的孤儿，新实例撞 EADDRINUSE。"""
+    for rel in ("proxy-daemon.sh", "dist/proxy-daemon.sh"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        kill_child = text.index('pkill -KILL -P "$CHILD_PID"')
+        kill_self = text.index('kill -KILL "$CHILD_PID"')
+        assert kill_child < kill_self, rel
+
+
+def test_watchReload在生产二进制模式下不重启():
+    """watch-reload 监听仓库 .py，生产跑的是 ~/.claude-trace 的二进制，重启纯属打断采集。
+    启动时和每次重启前都要核对 plist 是否指向本仓库 proxy-daemon.sh。"""
+    text = (ROOT / "watch-reload.sh").read_text(encoding="utf-8")
+    guard = 'grep -qF "$SCRIPT_DIR/proxy-daemon.sh" "$PROXY_PLIST"'
+    assert text.count(guard) == 2
+    assert text.index(guard) < text.index("while true")
+    loop = text[text.index("while true"):]
+    assert loop.index(guard) < loop.index("install-daemon.sh\" restart")
+    # 安装生产包时卸掉旧监听
+    installer = INSTALLER.read_text(encoding="utf-8")
+    assert 'launchctl bootout "gui/$(id -u)/com.claude-trace.watch-reload"' in installer
+
+
+def test_status区分已安装但未加载():
+    """plist 在、job 不在 = bootstrap 失败后的死状态，KeepAlive 不会救。
+    必须说后果（403、不会自动恢复），不能和「未安装」混在一句里。"""
+    for rel in ("install-daemon.sh", "dist/claude-trace"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        body = text[text.index("do_status() {"):]
+        body = body[: body.index("\n}\n")]
+        assert "未安装或未运行" not in body, rel
+        assert "已安装但服务未加载" in body and "403" in body and "不会自动恢复" in body, rel
+
+
+def test_restart对未加载的服务不重写plist():
+    """job 未加载但 plist 在时，restart 必须直接加载现有 plist，
+    不能走 install —— 那会用当前 shell 环境重写 plist，把 UPSTREAM / 上传配置重置成默认。"""
+    text = (ROOT / "install-daemon.sh").read_text(encoding="utf-8")
+    body = text[text.index("do_restart() {"):]
+    head = body[: body.index("launchctl bootout")]
+    assert head.index('[ -f "$PLIST_PATH" ]') < head.index("do_install")
+    assert "bootstrap_job" in head
+
+
 def test_restart回显不把全角括号粘进变量名():
     """macOS /bin/bash 3.2 + set -u：`$PLIST_PATH）` 会被当成名为 PLIST_PATH\\xef\\xbc\\x89 的变量。
     bootstrap 已经跑完，echo 再炸，操作者会以为 restart 失败。必须用 ${PLIST_PATH}。"""

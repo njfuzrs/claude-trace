@@ -147,6 +147,12 @@ PYEOF
         # 表现为「渠道切了、上游没变」；kickstart 不重读 plist。
         if launchctl list "$LABEL" &>/dev/null; then
             launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+            # bootout 是异步的，job 收尾期间 bootstrap 会报 5: Input/output error，
+            # 服务停在未加载状态、KeepAlive 管不到。等 job 真正消失再加载。
+            for _ in $(seq 1 60); do
+                launchctl print "gui/$(id -u)/$LABEL" &>/dev/null || break
+                sleep 0.5
+            done
         fi
 
         local proxy_pid=""
@@ -161,7 +167,10 @@ PYEOF
             sleep 1
         fi
 
-        launchctl bootstrap "gui/$(id -u)" "$PLIST"
+        for _ in 1 2 3 4 5; do
+            launchctl bootstrap "gui/$(id -u)" "$PLIST" && break
+            sleep 1
+        done
         if launchctl list "$LABEL" &>/dev/null; then
             echo "  ✅ 代理已重启（plist 已重新加载）"
         else
