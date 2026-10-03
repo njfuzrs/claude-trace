@@ -1469,7 +1469,7 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
             "test_runs": test_runs,
             # 清洗侧按这个版本筛「trajectory 里有没有 message_type=user」
             "collector_ver": _collector_version(),
-            "traj_schema": {"user_steps": True},
+            "traj_schema": {"user_steps": True, "git_end_diff": True},
             "data_quality": data_quality,
         },
     }

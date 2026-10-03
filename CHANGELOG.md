@@ -8,6 +8,17 @@
 
 ## [Unreleased]
 
+### 新增
+
+- traj `metadata.git_state_end` 在工作区脏时带有界 diff：`diff`（`git diff --no-color HEAD` 全文，
+  含 staged、不含未跟踪文件内容）与 `diff_bytes`。超过 64 KiB 或 2 秒时 `diff=null`，
+  写 `diff_omitted_reason=too_large|timeout|error` 和 `diff_stat`。起点 `git_state` 不带 diff。
+- `traj_schema` 新增 `git_end_diff=true`。
+
+### 隐私
+
+- diff 是源码原文，会随 session.traj 落盘并在启用上传时离开本机。阈值与理由见 `git_state.py` 顶部。
+
 ## [0.4.0] - 2026-10-03
 
 ### 新增
