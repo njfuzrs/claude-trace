@@ -15,7 +15,7 @@
     远超守护进程 15 秒收尾预算。两个入口统一设为 `SHUTDOWN_TIMEOUT_SEC=3`。
   - 守护进程超时强杀只杀 PyInstaller 引导进程，python 子进程成孤儿占端口。现在先杀子进程。
   - `launchctl bootout` 是异步的，紧跟的 `bootstrap` 报 `5: Input/output error`。
-    restart / install / 切渠道 / 安装器都改为先等 job 从域里消失，`bootstrap` 失败重试，
+    restart / install / 切渠道 / 安装器 / Codex watcher / 文件监听安装都改为先等 job 从域里消失，`bootstrap` 失败重试，
     仍失败则非 0 退出并说明后果。
   - `watch-reload.sh` 在生产二进制模式下也会重启代理（改仓库 .py 根本进不了二进制）。
     现在只在 plist 指向本仓库 `proxy-daemon.sh` 时才工作；安装生产包时卸掉旧监听。

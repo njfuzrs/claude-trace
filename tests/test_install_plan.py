@@ -161,6 +161,21 @@ def test_bootout之后先等job消失再bootstrap():
         assert 'launchctl print "gui/$(id -u)/$LABEL"' in text, rel
 
 
+def test_所有先bootout再bootstrap的脚本都等job消失():
+    """全仓兜底：新增脚本只要同时出现 bootout 和 bootstrap，就必须带「等 job 消失」，
+    否则同一个 5: Input/output error 会在下一个脚本里复活。"""
+    import subprocess as sp
+    files = sp.run(["git", "ls-files", "*.sh", "dist/claude-trace"],
+                   cwd=ROOT, capture_output=True, text=True, check=True).stdout.split()
+    checked = 0
+    for rel in files:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        if "launchctl bootout" in text and "launchctl bootstrap" in text:
+            checked += 1
+            assert 'launchctl print "gui/$(id -u)/' in text, rel
+    assert checked >= 5
+
+
 def test_守护进程强杀时连孙进程一起杀():
     """PyInstaller onefile 是引导进程 + python 进程两层，SIGKILL 不转发。
     只杀 CHILD_PID 会留下占着 4000 端口的孤儿，新实例撞 EADDRINUSE。"""

@@ -38,6 +38,12 @@ do_install() {
     mkdir -p "$OUTPUT"
 
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    # bootout 是异步的：job 收尾期间再 bootstrap 会报 5: Input/output error，
+    # 服务停在未加载状态、KeepAlive 管不到。等 job 真正消失（同 install-daemon.sh）。
+    for _ in $(seq 1 60); do
+        launchctl print "gui/$(id -u)/$LABEL" &>/dev/null || break
+        sleep 0.5
+    done
 
     cat > "$PLIST_PATH" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -86,7 +92,19 @@ do_install() {
 </plist>
 PLIST
 
-    launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+    local ok=false
+    for _ in 1 2 3 4 5; do
+        if launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"; then
+            ok=true
+            break
+        fi
+        sleep 1
+    done
+    if [ "$ok" != true ]; then
+        echo "❌ Codex watcher 服务加载失败，Codex 会话不会被采集。手动执行："
+        echo "   launchctl bootstrap gui/$(id -u) ${PLIST_PATH}"
+        exit 1
+    fi
     echo "✅ Codex watcher 服务已安装并启动"
     echo "   plist: $PLIST_PATH"
     echo "   日志:  $LOG_FILE"

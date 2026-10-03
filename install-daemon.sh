@@ -92,6 +92,7 @@ install_watch() {
 
     # 停止已有的监听服务
     launchctl bootout "gui/$(id -u)/$WATCH_LABEL" 2>/dev/null || true
+    wait_job_gone "$WATCH_LABEL" || true
     rm -rf /tmp/claude-trace-watch.lock
 
     cat > "$WATCH_PLIST_PATH" <<WPLIST
@@ -123,7 +124,10 @@ install_watch() {
 </plist>
 WPLIST
 
-    launchctl bootstrap "gui/$(id -u)" "$WATCH_PLIST_PATH"
+    if ! bootstrap_job "$WATCH_PLIST_PATH"; then
+        echo "⚠️  文件监听服务加载失败（不影响代理本身）：launchctl bootstrap gui/$(id -u) ${WATCH_PLIST_PATH}"
+        return
+    fi
     echo "✅ 文件监听服务已安装（修改 .py 自动重启代理）"
 }
 
