@@ -84,6 +84,15 @@ async def _drain_pending_writes(session: "Session"):
 
 SENSITIVE_HEADERS = {"x-api-key", "authorization", "proxy-authorization"}
 
+# 退出时等在途请求（SSE 长连接）的上限，作为 AppRunner 的 shutdown_timeout 参数。
+# aiohttp 默认 60 秒，且 RequestHandler.shutdown 会把它用两次（先等 handler 自然结束，
+# 再取消并等待），最坏 2×60 秒，远超 proxy-daemon.sh 的 15 秒收尾预算：退出时只要
+# 有一条流在跑，采集器就会被强杀，launchd 侧 bootout 迟迟不完成，随后的 bootstrap
+# 报 5: Input/output error，服务停在未加载状态（v0.3.1 实际发生过）。
+# 会话落盘在 runner.cleanup() 之前就做完了，这里只决定在途流还能多跑几秒。
+# 取 3 秒：最坏 6 秒，给落盘 / 上传队列持久化 / Codex watcher join 留出一半以上余量。
+SHUTDOWN_TIMEOUT_SEC = 3.0
+
 # P0 #5: session_id 只允许字母数字和连字符，防止路径遍历
 _SAFE_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
@@ -1975,7 +1984,8 @@ async def main():
         force_thinking=args.force_thinking,
     )
 
-    runner = web.AppRunner(app)
+    # 理由同 trace_agent.py：aiohttp 默认 60 秒会超出守护进程 15 秒收尾预算
+    runner = web.AppRunner(app, shutdown_timeout=SHUTDOWN_TIMEOUT_SEC)
     await runner.setup()
     site = web.TCPSite(runner, args.host, args.port)
     await site.start()

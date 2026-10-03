@@ -28,6 +28,7 @@ from aiohttp import web
 from builder import save_trajectory
 from import_codex import CodexImporter, CodexRolloutWatcher
 from proxy import (
+    SHUTDOWN_TIMEOUT_SEC,
     DataCollector,
     SessionManager,
     _log_task_exception,
@@ -214,7 +215,10 @@ async def main():
         force_thinking=args.force_thinking,  # 已废弃，create_app 会忽略
     )
 
-    runner = web.AppRunner(app)
+    # shutdown_timeout：退出时等在途请求（SSE 长连接）的上限。aiohttp 默认 60 秒，
+    # 远超 proxy-daemon.sh 的 15 秒收尾预算 —— 只要退出时有一条流在跑，
+    # 采集器就被拖到被强杀，launchd 侧 bootout 也迟迟不完成。
+    runner = web.AppRunner(app, shutdown_timeout=SHUTDOWN_TIMEOUT_SEC)
     await runner.setup()
     site = web.TCPSite(runner, args.host, args.port)
     await site.start()

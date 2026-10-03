@@ -43,6 +43,28 @@ TRAJ_CLEANUP_AFTER_UPLOAD="${TRAJ_CLEANUP_AFTER_UPLOAD:-false}"
 TRAJ_BACKFILL_ON_START="${TRAJ_BACKFILL_ON_START:-true}"
 INSTALL_WATCH=false
 
+# bootout 是异步的：命令返回时 job 可能还在收尾（proxy-daemon.sh 最多等采集器 15 秒，
+# plist ExitTimeOut=25）。这时 bootstrap 会报「5: Input/output error」，job 停在未加载状态，
+# KeepAlive 管不到未加载的 job —— 服务就这样静默死掉，直到有人手动 bootstrap。
+# 所以必须等 job 真正从域里消失，再 bootstrap，且 bootstrap 失败要重试并显式报错。
+wait_job_gone() {
+    local label="$1"
+    for _ in $(seq 1 60); do
+        launchctl print "gui/$(id -u)/$label" &>/dev/null || return 0
+        sleep 0.5
+    done
+    return 1
+}
+
+bootstrap_job() {
+    local plist="$1"
+    for _ in 1 2 3 4 5; do
+        launchctl bootstrap "gui/$(id -u)" "$plist" && return 0
+        sleep 1
+    done
+    return 1
+}
+
 usage() {
     echo "用法: $0 {install [--watch]|uninstall|status|restart}"
     echo ""
@@ -122,6 +144,7 @@ do_install() {
     if launchctl list "$LABEL" &>/dev/null; then
         echo "检测到已有服务，先卸载..."
         launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+        wait_job_gone "$LABEL" || echo "⚠️  旧服务 30 秒内未退出，仍尝试加载"
     fi
 
     # 查找 python3 绝对路径
@@ -186,7 +209,11 @@ do_install() {
 PLIST
 
     # 加载服务
-    launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+    if ! bootstrap_job "$PLIST_PATH"; then
+        echo "❌ 服务加载失败，代理没有运行，Claude Code 请求会 403。手动执行："
+        echo "   launchctl bootstrap gui/$(id -u) ${PLIST_PATH}"
+        exit 1
+    fi
 
     echo "✅ 服务已安装并启动"
     echo "   plist: $PLIST_PATH"
@@ -236,8 +263,12 @@ do_status() {
         launchctl list "$LABEL"
         echo ""
         echo "状态: 运行中"
+    elif [ -f "$PLIST_PATH" ]; then
+        # 已安装但 job 不在 launchd 里：KeepAlive 管不到，不会自己恢复
+        echo "状态: ❌ 已安装但服务未加载 —— 代理没有运行，Claude Code 请求会 403，且不会自动恢复"
+        echo "恢复: $0 restart"
     else
-        echo "状态: 未安装或未运行"
+        echo "状态: 未安装"
     fi
 
     echo ""
@@ -274,6 +305,18 @@ do_status() {
 
 do_restart() {
     if ! launchctl list "$LABEL" &>/dev/null; then
+        # plist 还在、只是 job 没加载（bootstrap 失败留下的状态）：直接加载现有 plist。
+        # 不能走重装 —— 它会用当前 shell 的环境变量重写 plist，
+        # 把 UPSTREAM / 上传配置悄悄重置成默认值。
+        if [ -f "$PLIST_PATH" ]; then
+            echo "服务未加载，加载现有 ${PLIST_PATH} ..."
+            if ! bootstrap_job "$PLIST_PATH"; then
+                echo "❌ 加载失败，代理没有运行，Claude Code 请求会 403。"
+                exit 1
+            fi
+            echo "✅ 服务已加载"
+            return
+        fi
         echo "服务未安装，执行 install..."
         do_install
         return
@@ -285,6 +328,8 @@ do_restart() {
     # 执行 restart，会看到「已重启」但跑的还是旧配置。watch-reload.sh 也走这条路径，
     # 所以源码改动后的自动重启同样吃不到 plist 变更。
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    # 端口释放早于 job 退出（采集器先停监听、再做 15 秒收尾），只等端口不够。
+    wait_job_gone "$LABEL" || echo "⚠️  旧服务 30 秒内未退出，仍尝试加载"
 
     # 等端口释放再拉起，否则新实例撞 EADDRINUSE，被 KeepAlive 反复重启，
     # 表面上服务在跑，实际一直起不来。
@@ -301,7 +346,11 @@ do_restart() {
     fi
 
     if [ -f "$PLIST_PATH" ]; then
-        launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+        if ! bootstrap_job "$PLIST_PATH"; then
+            echo "❌ 重启失败：服务已停但未能重新加载，代理没有运行，Claude Code 请求会 403。手动执行："
+            echo "   launchctl bootstrap gui/$(id -u) ${PLIST_PATH}"
+            exit 1
+        fi
         echo "✅ 服务已重启（已重新加载 ${PLIST_PATH}）"
     else
         echo "未找到 $PLIST_PATH，执行 install 重建配置..."

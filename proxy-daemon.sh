@@ -40,6 +40,8 @@ cleanup() {
         done
         if kill -0 "$CHILD_PID" 2>/dev/null; then
             echo "$(date '+%H:%M:%S') [DAEMON] 采集器 15 秒未退出，强制终止" >> "$LOG_FILE"
+            # 先杀子孙再杀自己：SIGKILL 不会被转发，只杀 CHILD_PID 会留下占着 4000 端口的孙进程
+            pkill -KILL -P "$CHILD_PID" 2>/dev/null
             kill -KILL "$CHILD_PID" 2>/dev/null
         else
             echo "$(date '+%H:%M:%S') [DAEMON] 采集器已优雅退出" >> "$LOG_FILE"

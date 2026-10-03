@@ -41,12 +41,27 @@ log() {
     echo "$(date '+%H:%M:%S') [WATCH] $*" >> "$LOG"
 }
 
+# 守卫：只在「launchd 跑的就是本仓库源码」时才允许自动重启。
+# 生产二进制模式（plist 指向 ~/.claude-trace/proxy-daemon.sh）下，改仓库 .py
+# 根本不会进运行中的二进制，重启只会白白打断采集 —— v0.3.1 时这个监听服务
+# 从 3 月一直挂着，开发 builder.py 每保存一次就重启一次生产代理。
+PROXY_PLIST="$HOME/Library/LaunchAgents/com.claude-trace.proxy.plist"
+if ! grep -qF "$SCRIPT_DIR/proxy-daemon.sh" "$PROXY_PLIST" 2>/dev/null; then
+    log "代理服务不是本仓库源码模式（$PROXY_PLIST 未指向 $SCRIPT_DIR/proxy-daemon.sh），不监听，退出"
+    exit 0
+fi
+
 log "启动文件监听 (pid=$$): ${WATCH_FILES[*]}"
 
 while true; do
     changed=$(fswatch -1 --latency 2 --event Updated "${WATCH_FILES[@]}" 2>/dev/null)
     if [ -n "$changed" ]; then
         filename=$(basename "$changed")
+        # 启动后才装了生产包（plist 被改写）的情况：每次重启前再核一次
+        if ! grep -qF "$SCRIPT_DIR/proxy-daemon.sh" "$PROXY_PLIST" 2>/dev/null; then
+            log "检测到变更: $filename，但代理已切到生产二进制模式，不重启，监听退出"
+            exit 0
+        fi
         log "检测到变更: $filename → 重启代理..."
         if "$SCRIPT_DIR/install-daemon.sh" restart >> "$LOG" 2>&1; then
             log "代理已自动重启 ✓"
