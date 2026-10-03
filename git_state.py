@@ -27,6 +27,17 @@ _GIT_TIMEOUT = 2.0
 # 超过此数量只统计计数，不再保留文件名。
 _MAX_DIRTY_FILES = 50
 
+# 会话终点 diff 全文的体积上限（字节，按 UTF-8 计）。
+# why：diff 会进 session.traj 并随上传离开本机 —— ① traj 体积：一次重构
+# 或 lockfile 变动就能产出几 MB 的 diff，会把单条轨迹撑爆；② 上传带宽；
+# ③ 隐私：diff 里是源码原文，越大泄露面越大。64 KiB 足够覆盖「改了几个
+# 文件」的常规会话，超限只留 diff_stat，下游仍知道动了哪些文件、多少行。
+_MAX_DIFF_BYTES = 64 * 1024
+
+# diff 全文的超时（秒）。与单条 git 命令一致：SessionEnd hook 自身有 5 秒
+# 预算，git_state 采集已占约 2 秒上界，diff 不能再多。
+_DIFF_TIMEOUT = 2.0
+
 
 def _git(args, cwd: str, timeout: float = _GIT_TIMEOUT, strip: bool = True) -> Optional[str]:
     """执行一条只读 git 命令，返回 stdout。失败返回 None。
@@ -183,6 +194,76 @@ def collect_git_state(cwd: str, source: str = "proxy") -> Dict:
     state.setdefault("behind", None)
     state.setdefault("ahead", None)
 
+    return state
+
+
+def _git_bytes(args, cwd: str, timeout: float) -> Optional[bytes]:
+    """执行只读 git 命令，返回原始 stdout 字节；失败或超时返回 None。
+
+    与 _git 分开：diff 需要按字节判体积，且超时要能和「命令失败」区分 ——
+    超时抛 subprocess.TimeoutExpired 由调用方捕获。
+    """
+    proc = subprocess.run(
+        ["git"] + args,
+        cwd=cwd,
+        capture_output=True,
+        timeout=timeout,
+        env={"GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0",
+             "PATH": _default_path(), "HOME": _default_home()},
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def collect_git_diff(cwd: str, state: Dict,
+                     max_bytes: int = _MAX_DIFF_BYTES,
+                     timeout: float = _DIFF_TIMEOUT) -> Dict:
+    """为会话终点快照补有界 diff 字段（只该用于 git_state_end）
+
+    只在 state["dirty"] 为 True 时才跑 `git diff --no-color HEAD`（工作区相对
+    HEAD，含 staged）。干净工作区、dirty 未知、空仓库都不跑，返回 {}。
+
+    注意：`git diff HEAD` 不含未跟踪文件 —— 未跟踪文件名已在 dirty_file_list
+    里，内容不落，避免把随手丢进仓库的大文件/密钥文件整段带走。
+
+    Returns（永不抛异常）：
+      成功：{"diff": <文本>, "diff_bytes": n}
+      超限：{"diff": None, "diff_omitted_reason": "too_large", "diff_bytes": n, "diff_stat": ...}
+      超时：{"diff": None, "diff_omitted_reason": "timeout", "diff_stat": ...}
+      失败：{"diff": None, "diff_omitted_reason": "error"}
+    """
+    if not cwd or not isinstance(state, dict) or state.get("dirty") is not True:
+        return {}
+    if not state.get("head"):
+        # 空仓库没有 HEAD 可比
+        return {}
+    try:
+        try:
+            raw = _git_bytes(["diff", "--no-color", "--no-ext-diff", "HEAD"], cwd, timeout)
+        except subprocess.TimeoutExpired:
+            return {"diff": None, "diff_omitted_reason": "timeout",
+                    "diff_stat": _diff_stat(cwd)}
+        if raw is None:
+            return {"diff": None, "diff_omitted_reason": "error"}
+        if len(raw) > max_bytes:
+            return {"diff": None, "diff_omitted_reason": "too_large",
+                    "diff_bytes": len(raw), "diff_stat": _diff_stat(cwd)}
+        return {"diff": raw.decode("utf-8", errors="replace"), "diff_bytes": len(raw)}
+    except Exception:
+        return {"diff": None, "diff_omitted_reason": "error"}
+
+
+def _diff_stat(cwd: str) -> Optional[str]:
+    """`git diff --stat HEAD`，体积通常很小；失败返回 None。"""
+    return _git(["diff", "--no-color", "--stat", "HEAD"], cwd)
+
+
+def collect_git_state_end(cwd: str, source: str = "proxy") -> Dict:
+    """会话终点快照 = collect_git_state + 有界 diff。起点快照不要用这个。"""
+    state = collect_git_state(cwd, source=source)
+    if state:
+        state.update(collect_git_diff(cwd, state))
     return state
 
 

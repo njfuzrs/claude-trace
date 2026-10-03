@@ -726,6 +726,10 @@ trajectories/
 | `upstream` / `ahead` / `behind` | 上游分支及领先/落后提交数，用于判断 HEAD 是否已推送 |
 | `is_linked_worktree` | 是否为 linked worktree（非主工作树） |
 | `source` | `hook`（SessionStart 时点采集，更准）或 `proxy`（代理侧兜底） |
+| `diff` | **仅 `git_state_end`**，且仅 `dirty=true` 时采：`git diff --no-color HEAD` 全文（含 staged，不含未跟踪文件内容）。超限或超时为 `null` |
+| `diff_bytes` | diff 全文字节数（超时时缺省） |
+| `diff_omitted_reason` | `too_large`（超过 64 KiB）/ `timeout`（超过 2 秒）/ `error`；正常采到时没有该键 |
+| `diff_stat` | 省略全文时附 `git diff --stat HEAD`，下游仍能看到动了哪些文件、多少行 |
 
 `exit_code` 的推导依据（`exit_code_source`）：
 

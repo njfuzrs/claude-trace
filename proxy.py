@@ -34,7 +34,7 @@ from builder import (
     build_trajectory,
     save_trajectory,
 )
-from git_state import coerce_git_state, collect_git_state, flatten_git_state
+from git_state import coerce_git_state, collect_git_state, collect_git_state_end, flatten_git_state
 from uploader import UploadManager
 from version_info import build_fingerprint, resolve_version, version_string
 
@@ -1733,7 +1733,7 @@ async def handle_session_event(request: web.Request) -> web.Response:
             elif pre_removal.cwd:
                 # hook 没送来（旧版 collector 的 end 通知不带 git 状态）：
                 # 代理侧兜底自采。时点比 hook 稍晚但仍在会话结束瞬间，足够用。
-                pre_removal.git_state_end = collect_git_state(pre_removal.cwd)
+                pre_removal.git_state_end = collect_git_state_end(pre_removal.cwd)
         # 原子性地从 active_sessions 中移除，防止 cleanup_expired 竞态
         session = session_manager._remove_session_and_children(session_id)
         if session and not session.is_subagent:

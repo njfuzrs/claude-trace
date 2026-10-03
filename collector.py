@@ -138,6 +138,14 @@ except Exception:  # pragma: no cover - 部署不完整时的兜底
     def flatten_git_state(state: dict) -> dict:  # type: ignore[misc]
         return {}
 
+# 终点 diff 单独软导入：~/.claude/hooks/ 里可能还是旧版 git_state.py
+# （setup_hooks 下次才覆盖），缺这个函数时退化为不带 diff 的终点快照。
+try:
+    from git_state import collect_git_state_end
+except Exception:  # pragma: no cover
+    def collect_git_state_end(cwd: str, source: str = "hook") -> dict:  # type: ignore[misc]
+        return collect_git_state(cwd, source=source)
+
 
 def main():
     # stdin 为空时提前退出
@@ -186,8 +194,9 @@ def main():
     elif event_name == "SessionEnd":
         event["source"] = input_data.get("source")
         # 会话终点的 git 状态：与 SessionStart 的 git_head 一对比即知
-        # 「这次会话有没有产生 commit」「结束时工作区留下多少改动」
-        git_snapshot = collect_git_state(input_data.get("cwd") or "", source="hook")
+        # 「这次会话有没有产生 commit」「结束时工作区留下多少改动」。
+        # 终点额外带有界 diff（S2-2）：工作区脏时留下改动本身，超限只留 stat。
+        git_snapshot = collect_git_state_end(input_data.get("cwd") or "", source="hook")
         if git_snapshot:
             event.update(flatten_git_state(git_snapshot))
             event["git_state"] = git_snapshot
