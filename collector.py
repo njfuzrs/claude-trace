@@ -52,6 +52,25 @@ def notify_proxy(endpoint: str, data: dict):
         pass  # 代理未启动或网络异常，静默忽略
 
 
+# 指令文件超过这个大小就不读，只记 size（CLAUDE.md 正常只有几 KB）
+_INSTRUCTION_HASH_MAX_BYTES = 1024 * 1024
+
+
+def instruction_file_digest(file_path) -> dict:
+    """对 InstructionsLoaded 的指令文件取 sha256 + 字节数，读失败返回空 dict"""
+    if not isinstance(file_path, str) or not file_path:
+        return {}
+    try:
+        path = Path(file_path)
+        size = path.stat().st_size
+        if size > _INSTRUCTION_HASH_MAX_BYTES:
+            return {"content_bytes": size}
+        import hashlib
+        return {"content_bytes": size, "content_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    except OSError:
+        return {}
+
+
 def copy_decision_fields(event, input_data):
     """把 Claude Code 可能带上的决策字段抄到事件上。
 
@@ -278,13 +297,15 @@ def main():
         copy_decision_fields(event, input_data)
 
     elif event_name == "InstructionsLoaded":
-        # P2 fix: 使用 Claude Code 实际传入的字段名，兜底保存完整 input_data
-        event["source"] = input_data.get("source")
-        event["content_length"] = len(str(input_data.get("content", "")))
-        # 保留原始 input 中的其他字段作为兜底
-        for k in ("instructions_path", "instructions_hash", "path", "content"):
+        # Fix: 旧实现读 source / content，官方根本不传这两个字段，
+        # 存量 1022 条全是 source=None、content_length=0。官方字段见 hooks 文档：
+        # file_path / memory_type / load_reason / globs / trigger_file_path / parent_file_path。
+        # 正文不落盘（可能含私有指令），只记 path + sha256 + 字节数。
+        for k in ("file_path", "memory_type", "load_reason", "globs",
+                  "trigger_file_path", "parent_file_path"):
             if k in input_data:
                 event[k] = input_data[k]
+        event.update(instruction_file_digest(input_data.get("file_path")))
 
     elif event_name == "StopFailure":
         event["error"] = input_data.get("error")

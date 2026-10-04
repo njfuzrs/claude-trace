@@ -8,6 +8,26 @@
 
 ## [Unreleased]
 
+### 修复
+
+- `total_cost_usd` 定价纠偏：价目表按 2026-10-04 官方定价页全面更新（Opus 5 / 4.5–4.8 是 $5/$25，
+  不是 $15/$75；Sonnet 5 / 5.5 是 $2/$10；Fable 5 / 5.1 是 $10/$50；Haiku 4.5 是 $1/$5）。
+  cache write 由 0.25× 改为 1.25× input（`usage.cache_creation.ephemeral_1h_input_tokens` 部分按 2×），
+  cache read 按模型自己的读价（Fable 5.1 0.025×、Opus 5.5 0.05×，其余 0.1×）。
+  `[1m]` 长上下文溢价只对 Sonnet 4 / 4.5、Opus 4 / 4.1 生效。本机 52 个 Opus 5.5 会话重建后成本降到原来的 0.60–0.72。
+- collector 的 `InstructionsLoaded` 读错字段（`source` / `content`，官方不传），存量事件全是空值。
+  改记官方字段 `file_path` / `memory_type` / `load_reason` 等，外加文件 sha256 与字节数；正文不落盘。
+
+### 新增
+
+- traj `metadata` 新增 `stop_failures`（StopFailure：轮次因 API 错误结束）、`tool_failures`
+  （PostToolUseFailure，错误只留前 300 字）、`instructions_loaded`（只有 path / hash / 字节数）。
+  `exit_status` 不变，convert 输出不变。
+- `info.data_quality.hook_failure_not_error`：hook 报工具失败、API tool_result 却没标 `is_error` 的次数。
+- `traj_schema` 新增 `hook_failures=true`。
+- `tools/thinking_coverage.py`（只读）：按上游指纹（响应 message id 形状）× 模型统计 thinking 覆盖率，
+  「有块但正文为空」单列、不算 CoT，尾部连续无 CoT 超阈值告警。
+
 ## [0.4.2] - 2026-10-04
 
 ### 新增
