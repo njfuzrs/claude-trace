@@ -68,6 +68,10 @@ class SessionMetadata:
     # decision 的 source 若是推断，必须带 inferred_ 前缀，不得冒充官方枚举。
     permission_decisions: List[Dict] = field(default_factory=list)
     permission_mode_timeline: List[Dict] = field(default_factory=list)
+    # hook 字段提升（L1-E）：同样只进 metadata，SFT convert 不读。
+    stop_failures: List[Dict] = field(default_factory=list)       # StopFailure：轮次因 API 错误结束
+    tool_failures: List[Dict] = field(default_factory=list)       # PostToolUseFailure：工具执行失败
+    instructions_loaded: List[Dict] = field(default_factory=list)  # InstructionsLoaded：只留 path + hash
 
 
 # ─────────────────────────────────────────────
@@ -75,32 +79,49 @@ class SessionMetadata:
 # ─────────────────────────────────────────────
 
 # 模型定价（USD per million tokens）
-# 来源：https://docs.anthropic.com/en/docs/about-claude/pricing
+# 来源：https://platform.claude.com/docs/en/about-claude/pricing
+# last_verified: 2026-10-04（Sonnet 5 的 $2/$10 已转为正式价，9-01 涨价取消）
 #
-# Fix: 原实现只有 claude-opus-4 / sonnet-4 / haiku-4 三条前缀，
-# 导致 claude-opus-5 / claude-sonnet-5 / claude-opus-4-8 等新模型
-# 全部匹配不到，total_cost_usd 恒为 0。
-# 现在按「精确名 → 最长前缀」两级匹配，并覆盖 4.x / 5 全系列。
+# 按「精确名 → 最长前缀」两级匹配。cache_read 是每个模型自己的绝对价：
+# 标准倍率 0.1×，但 Fable 5.1 / Mythos 5.1 是 0.025×、Opus 5.5 是 0.05×，
+# 不能用一个常量打天下（旧实现写死 0.1，在这两个模型上偏高 2～4 倍）。
 _MODEL_PRICING: Dict[str, Dict[str, float]] = {
+    # Fable / Mythos
+    "claude-fable-5-1": {"input": 10.0, "output": 50.0, "cache_read": 0.25},
+    "claude-mythos-5-1": {"input": 10.0, "output": 50.0, "cache_read": 0.25},
+    "claude-fable-5": {"input": 10.0, "output": 50.0, "cache_read": 1.0},
+    "claude-mythos-5": {"input": 10.0, "output": 50.0, "cache_read": 1.0},
     # Opus 系列
-    "claude-opus-5": {"input": 15.0, "output": 75.0},
-    "claude-opus-4": {"input": 15.0, "output": 75.0},
-    "claude-opus-3": {"input": 15.0, "output": 75.0},
+    "claude-opus-5-5": {"input": 4.0, "output": 20.0, "cache_read": 0.20},
+    "claude-opus-5": {"input": 5.0, "output": 25.0, "cache_read": 0.50},
+    "claude-opus-4-8": {"input": 5.0, "output": 25.0, "cache_read": 0.50},
+    "claude-opus-4-7": {"input": 5.0, "output": 25.0, "cache_read": 0.50},
+    "claude-opus-4-6": {"input": 5.0, "output": 25.0, "cache_read": 0.50},
+    "claude-opus-4-5": {"input": 5.0, "output": 25.0, "cache_read": 0.50},
+    "claude-opus-4": {"input": 15.0, "output": 75.0, "cache_read": 1.50},  # 4 / 4.1
+    "claude-opus-3": {"input": 15.0, "output": 75.0, "cache_read": 1.50},
     # Sonnet 系列
-    "claude-sonnet-5": {"input": 3.0, "output": 15.0},
-    "claude-sonnet-4": {"input": 3.0, "output": 15.0},
-    "claude-3-7-sonnet": {"input": 3.0, "output": 15.0},
-    "claude-3-5-sonnet": {"input": 3.0, "output": 15.0},
+    "claude-sonnet-5-5": {"input": 2.0, "output": 10.0, "cache_read": 0.20},
+    "claude-sonnet-5": {"input": 2.0, "output": 10.0, "cache_read": 0.20},
+    "claude-sonnet-4": {"input": 3.0, "output": 15.0, "cache_read": 0.30},  # 4 / 4.5 / 4.6
+    "claude-3-7-sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.30},
+    "claude-3-5-sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.30},
     # Haiku 系列
-    "claude-haiku-4": {"input": 0.80, "output": 4.0},
-    "claude-3-5-haiku": {"input": 0.80, "output": 4.0},
-    # Fable
-    "claude-fable-5": {"input": 3.0, "output": 15.0},
+    "claude-haiku-4": {"input": 1.0, "output": 5.0, "cache_read": 0.10},
+    "claude-3-5-haiku": {"input": 0.80, "output": 4.0, "cache_read": 0.08},
 }
 
-# 长上下文（1M）变体的价格倍率。Anthropic 对超长上下文按溢价计费，
-# 这里用保守倍率估算，避免 [1m] 模型成本被低估。
+# cache write 倍率（相对 input），所有模型相同。
+# usage.cache_creation 里有 ephemeral_1h_input_tokens 时按 1h 档计，其余按 5m 档。
+_CACHE_WRITE_5M = 1.25
+_CACHE_WRITE_1H = 2.0
+
+# 长上下文（[1m]）溢价只对 Opus 4.6 之前的老模型存在；Opus 4.6+ / Sonnet 4.6+ /
+# 5.x 全系 1M 窗口按标准价计费，不能再乘倍率。这里沿用旧的保守倍率。
 _LONG_CONTEXT_MULTIPLIER = 2.0
+_LONG_CONTEXT_PREMIUM_PREFIXES = ("claude-sonnet-4-5", "claude-sonnet-4", "claude-opus-4-1", "claude-opus-4")
+_NO_LONG_CONTEXT_PREMIUM = ("claude-sonnet-4-6", "claude-opus-4-5", "claude-opus-4-6",
+                            "claude-opus-4-7", "claude-opus-4-8")
 
 
 def _normalize_model_name(model: str) -> tuple:
@@ -123,6 +144,12 @@ def _normalize_model_name(model: str) -> tuple:
     return name, is_long
 
 
+def _has_long_context_premium(name: str) -> bool:
+    if name.startswith(_NO_LONG_CONTEXT_PREMIUM):
+        return False
+    return name.startswith(_LONG_CONTEXT_PREMIUM_PREFIXES)
+
+
 def _lookup_pricing(model: str) -> Optional[Dict[str, float]]:
     """按「精确名 → 最长前缀」匹配定价表，未知模型返回 None"""
     name, is_long = _normalize_model_name(model)
@@ -138,7 +165,7 @@ def _lookup_pricing(model: str) -> Optional[Dict[str, float]]:
                 pricing, best_len = p, len(prefix)
     if pricing is None:
         return None
-    if is_long:
+    if is_long and _has_long_context_premium(name):
         return {k: v * _LONG_CONTEXT_MULTIPLIER for k, v in pricing.items()}
     return pricing
 
@@ -146,10 +173,12 @@ def _lookup_pricing(model: str) -> Optional[Dict[str, float]]:
 def _estimate_cost(
     model: str, input_tokens: int, output_tokens: int,
     cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
+    cache_creation_1h_tokens: int = 0,
 ) -> float:
     """根据模型和 token 用量估算成本（USD）
 
-    Anthropic cache_read 是 input 价格的 10%，cache_creation 是 input 价格的 25%。
+    cache_read 按模型自己的读价计（0.1× / 0.05× / 0.025×）；
+    cache_creation 是 5m + 1h 两档之和，其中 1h 档按 2×、其余按 1.25× input 计。
     非 Anthropic 模型（deepseek / qwen 等）无定价表，返回 0。
     """
     pricing = _lookup_pricing(model)
@@ -157,10 +186,16 @@ def _estimate_cost(
         if model:
             logger.debug("模型无定价数据，成本按 0 计: %s", model)
         return 0.0
-    base_cost = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
-    cache_read_cost = cache_read_tokens * pricing["input"] * 0.1 / 1_000_000
-    cache_creation_cost = cache_creation_tokens * pricing["input"] * 0.25 / 1_000_000
-    return base_cost + cache_read_cost + cache_creation_cost
+    cache_1h = min(cache_creation_1h_tokens, cache_creation_tokens)
+    cache_5m = cache_creation_tokens - cache_1h
+    cost = (
+        input_tokens * pricing["input"]
+        + output_tokens * pricing["output"]
+        + cache_read_tokens * pricing["cache_read"]
+        + cache_5m * pricing["input"] * _CACHE_WRITE_5M
+        + cache_1h * pricing["input"] * _CACHE_WRITE_1H
+    )
+    return cost / 1_000_000
 
 
 # ─────────────────────────────────────────────
@@ -917,6 +952,54 @@ def apply_hook_events_to_metadata(metadata: SessionMetadata, hook_events: List[D
 
     metadata.permission_decisions = infer_permission_decisions(hook_events)
     metadata.permission_mode_timeline = infer_permission_mode_timeline(hook_events)
+    metadata.stop_failures = extract_stop_failures(hook_events)
+    metadata.tool_failures = extract_tool_failures(hook_events)
+    metadata.instructions_loaded = extract_instructions_loaded(hook_events)
+
+
+# PostToolUseFailure.error 只留开头，完整错误在 observation 正文里已经有
+_TOOL_FAILURE_ERROR_PREVIEW = 300
+_INSTRUCTION_FIELDS = ("file_path", "memory_type", "load_reason", "content_sha256", "content_bytes")
+
+
+def extract_stop_failures(hook_events: List[Dict]) -> List[Dict]:
+    """StopFailure → [{timestamp, error}]
+
+    exit_status 取自最后一个成功响应的 stop_reason，API 报错的那一轮没有响应，
+    所以「最后一轮 400 / 鉴权失败」的会话会被记成 tool_use 甚至 end_turn。
+    这里不改 exit_status（会改变 convert 的 resolved 判定），只把失败摆出来。
+    """
+    return [
+        {"timestamp": e.get("timestamp", ""), "error": e.get("error") or "unknown"}
+        for e in hook_events if hook_event_name(e) == "StopFailure"
+    ]
+
+
+def extract_tool_failures(hook_events: List[Dict]) -> List[Dict]:
+    """PostToolUseFailure → [{tool_use_id, tool_name, error_preview}]"""
+    out = []
+    for e in hook_events:
+        if hook_event_name(e) != "PostToolUseFailure" or not e.get("tool_use_id"):
+            continue
+        out.append({
+            "tool_use_id": e["tool_use_id"],
+            "tool_name": e.get("tool_name") or "",
+            "error_preview": str(e.get("error") or "")[:_TOOL_FAILURE_ERROR_PREVIEW],
+        })
+    return out
+
+
+def extract_instructions_loaded(hook_events: List[Dict]) -> List[Dict]:
+    """InstructionsLoaded → 只留 path / 类型 / 原因 / hash / 字节数，不留正文
+
+    0.4.2 及以前的 collector 读错字段（source / content），事件里没有 file_path，跳过。
+    """
+    out = []
+    for e in hook_events:
+        if hook_event_name(e) != "InstructionsLoaded" or not e.get("file_path"):
+            continue
+        out.append({k: e[k] for k in _INSTRUCTION_FIELDS if e.get(k) is not None})
+    return out
 
 
 # ─────────────────────────────────────────────
@@ -1023,6 +1106,7 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
     total_output_tokens = 0
     total_cache_read_tokens = 0
     total_cache_creation_tokens = 0
+    total_cache_creation_1h_tokens = 0
     tools_used: Set[str] = set()
     files_edited: Set[str] = set()
     files_read: Set[str] = set()
@@ -1062,6 +1146,8 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
     emitted_clean: Dict[str, int] = {}
     last_clean = ""
     test_runs: List[Dict] = []
+    hook_failed_ids = {f["tool_use_id"] for f in metadata.tool_failures}
+    n_hook_failure_not_error = 0
 
     for pair in pairs:
         response = pair.response_body or {}
@@ -1229,6 +1315,9 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
         total_output_tokens += usage.get("output_tokens", 0)
         total_cache_read_tokens += usage.get("cache_read_input_tokens", 0)
         total_cache_creation_tokens += usage.get("cache_creation_input_tokens", 0)
+        cache_creation = usage.get("cache_creation")
+        if isinstance(cache_creation, dict):
+            total_cache_creation_1h_tokens += cache_creation.get("ephemeral_1h_input_tokens", 0) or 0
 
         # ── 提取 Thought ──────────────────────────────────
         thought_parts = []
@@ -1332,6 +1421,8 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
             if tool_result is not None:
                 obs_content = _stringify_result_content(tool_result.get("content"))
                 obs_is_error = bool(tool_result.get("is_error", False))
+                if tool_use_id in hook_failed_ids and not obs_is_error:
+                    n_hook_failure_not_error += 1
                 # P0：结构化执行结果。「改前失败 / 改后通过」的天然证据，
                 # F2P 判定可直接从轨迹取，不必靠解析文本重新构造。
                 outcome = derive_tool_outcome(tool_name, obs_content, obs_is_error)
@@ -1454,6 +1545,7 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
     metadata.total_cost_usd = _estimate_cost(
         metadata.model, total_input_tokens, total_output_tokens,
         total_cache_read_tokens, total_cache_creation_tokens,
+        total_cache_creation_1h_tokens,
     )
     metadata.tools_used = sorted(tools_used)
     metadata.files_edited = sorted(files_edited)
@@ -1515,6 +1607,9 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
         # 二者之差 = 仍带 _raw_partial、不可重建的 action
         "parse_error_actions": n_parse_errors,
         "parse_error_repaired": n_parse_repaired,
+        # hook 报 PostToolUseFailure、API tool_result 却没标 is_error 的工具调用数。
+        # 非 0 说明 exit_code 推导会把失败当成功，清洗侧要以 tool_failures 为准。
+        "hook_failure_not_error": n_hook_failure_not_error,
     }
 
     return {
@@ -1572,9 +1667,14 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
             "permission_mode_timeline": metadata.permission_mode_timeline,
             # 测试命令（L1-H）：按 argv0 表推断，source 固定为 inferred_argv0
             "test_runs": test_runs,
+            # hook 字段提升（L1-E）
+            "stop_failures": metadata.stop_failures,
+            "tool_failures": metadata.tool_failures,
+            "instructions_loaded": metadata.instructions_loaded,
             # 清洗侧按这个版本筛「trajectory 里有没有 message_type=user」
             "collector_ver": _collector_version(),
-            "traj_schema": {"user_steps": True, "git_end_diff": True, "parse_error_counts": True},
+            "traj_schema": {"user_steps": True, "git_end_diff": True, "parse_error_counts": True,
+                            "hook_failures": True},
             "data_quality": data_quality,
         },
     }

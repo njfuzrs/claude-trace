@@ -46,6 +46,7 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 │   ├── sync.py             # 手动批量补传（URL/token 必填，身份不回退）
 │   ├── rebuild_trajs.py    # 用当前 builder 重建历史 .traj
 │   ├── events_coverage.py  # hook events 覆盖率（只读，分 main/child/orphan/probe/legacy）
+│   ├── thinking_coverage.py # thinking 覆盖率（只读，按上游指纹 × 模型 × 月）
 │   ├── recover_truncated.py # 历史数据修复（复活截断 / 超大 traj 去重 / 重传）
 │   ├── filter_trajs.py     # 轨迹过滤器
 │   ├── convert_trajs.py    # 格式转换（.traj → SFT .jsonl）
@@ -187,6 +188,9 @@ python3 tools/combine_trajs.py --input sft/ --output training_data.jsonl --shuff
 
 # hook events 覆盖率（只读）
 python3 tools/events_coverage.py --input ~/.claude-trace/trajectories/sessions --by-month
+
+# thinking 覆盖率（只读；某上游连续 20 个合格会话无 CoT 时退出码 1）
+python3 tools/thinking_coverage.py --input ~/.claude-trace/trajectories/sessions --by upstream,model
 
 # 双通道合并
 python3 merger.py --all

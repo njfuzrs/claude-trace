@@ -221,7 +221,8 @@ def test_history带traj_step和timestamp():
 def test_元数据带collector_ver():
     meta = _session()["metadata"]
     assert meta["collector_ver"]
-    assert meta["traj_schema"] == {"user_steps": True, "git_end_diff": True, "parse_error_counts": True}
+    assert meta["traj_schema"] == {"user_steps": True, "git_end_diff": True, "parse_error_counts": True,
+                                   "hook_failures": True}
 
 
 # ── test_runs ───────────────────────────────────────
