@@ -8,6 +8,23 @@
 
 ## [Unreleased]
 
+### 新增
+
+- transcript 补洞（S4）：最终导出（SessionEnd / 超时清理 / 复活重建）时读 Claude Code 本地 transcript
+  （Stop hook 的 `transcript_path`，找不到再按 sid 搜 `~/.claude/projects/*/`），只补 raw 缺的东西：
+  - raw 最后一个能对上的轮次之后的尾部 assistant 轮（按 `message.id`，其次 `tool_use_id` 对齐）；
+  - SSE 被打断（`is_partial`）、transcript 里同一条消息完整的轮次。
+  raw 已有的轮次一律不动；中间缺口只计数不插入；完全对不上锚点时不补。
+  补出来的 step / history 带 `_source: "transcript"`（thinking 无 signature，下游可按需过滤）。
+  `metadata.transcript_fill` 只在真补过时出现；hook 没测到权限模式变更时，`permission_mode_timeline`
+  用 transcript 的（条目带 `source: "transcript"`）。补洞失败只打日志，不影响导出。
+  `TRAJ_TRANSCRIPT_FILL=false` 可关闭。
+- tool_use 输入以 transcript 的 `wireToolInputs` 为准（Claude Code 会改写 `message.content` 里的 input）。
+- `tools/rebuild_trajs.py --from-transcript [--claude-dir]`：离线补洞；缺 raw.jsonl 的会话只用 transcript 抢救。
+- `traj_schema` 新增 `transcript_fill=true`。
+
+完整会话（raw 不缺轮）开着补洞，traj 与关闭时一致，SFT convert 输出不变。
+
 ## [0.4.3] - 2026-10-04
 
 ### 修复

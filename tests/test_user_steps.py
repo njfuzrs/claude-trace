@@ -222,7 +222,7 @@ def test_元数据带collector_ver():
     meta = _session()["metadata"]
     assert meta["collector_ver"]
     assert meta["traj_schema"] == {"user_steps": True, "git_end_diff": True, "parse_error_counts": True,
-                                   "hook_failures": True}
+                                   "hook_failures": True, "transcript_fill": True}
 
 
 # ── test_runs ───────────────────────────────────────

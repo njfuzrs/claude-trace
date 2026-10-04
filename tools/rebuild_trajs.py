@@ -22,6 +22,10 @@ tool_result 重复膨胀、新模型成本为 0 等，全部可以通过重跑 b
 
     # 只统计垃圾目录，不重建
     python3 tools/rebuild_trajs.py --dir trajectories/sessions --scan-only
+
+    # 用 Claude Code 本地 transcript 补 raw 缺的尾部轮次（raw 优先，只补 raw 没有的）；
+    # 缺 raw.jsonl 的会话也会尝试只用 transcript 抢救
+    python3 tools/rebuild_trajs.py --dir trajectories/sessions --from-transcript
 """
 
 import argparse
@@ -42,6 +46,7 @@ from builder import (  # noqa: E402
     save_trajectory,
 )
 from merger import _adapt_raw_pair, load_raw_pairs_from_jsonl  # noqa: E402
+from transcript import fill_pairs_from_transcript  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger("rebuild")
@@ -153,7 +158,9 @@ def _old_traj_api_calls(traj: Dict) -> int:
 
 
 def rebuild_one(session_dir: Path, dry_run: bool = False,
-                backup: bool = True, force: bool = False) -> Optional[Dict]:
+                backup: bool = True, force: bool = False,
+                from_transcript: bool = False,
+                claude_dir: Optional[Path] = None) -> Optional[Dict]:
     """重建单个会话的 session.traj，返回旧/新统计对比
 
     重要限制：sub-agent 子会话的 pair 只存在于代理进程内存中，导出时被合并进
@@ -164,12 +171,16 @@ def rebuild_one(session_dir: Path, dry_run: bool = False,
     session_id = session_dir.name
     raw_path = session_dir / "raw.jsonl"
 
-    try:
-        raw_pairs = load_raw_pairs_from_jsonl(raw_path)
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning("%s raw.jsonl 解析失败: %s", session_id[:8], e)
-        return None
-    if not raw_pairs:
+    raw_pairs = []
+    if raw_path.exists():
+        try:
+            raw_pairs = load_raw_pairs_from_jsonl(raw_path)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("%s raw.jsonl 解析失败: %s", session_id[:8], e)
+            if not from_transcript:
+                return None
+    # 没有 raw 时只有 --from-transcript 的抢救路径能继续
+    if not raw_pairs and not from_transcript:
         return None
 
     hook_events = load_hook_events(session_dir / "events.jsonl")
@@ -210,7 +221,19 @@ def rebuild_one(session_dir: Path, dry_run: bool = False,
 
     # 构建 metadata：原 traj 的 metadata 里可能有 hooks 之外的信息（如 model），
     # 优先沿用；hook events 再做一轮补全。
-    model = raw_pairs[0].model if raw_pairs else ""
+    adapted = [_adapt_raw_pair(p, i + 1) for i, p in enumerate(raw_pairs)]
+    fill_report = None
+    fill_timeline: List[Dict] = []
+    if from_transcript:
+        # raw 完全缺失才允许无锚点整段导入；有 raw 时只补尾部
+        adapted, fill_report, fill_timeline = fill_pairs_from_transcript(
+            session_id, adapted, hook_events, claude_dir=claude_dir,
+            allow_anchorless=not raw_pairs,
+        )
+    if not adapted:
+        return None
+
+    model = adapted[0].model
     if not model and old_stats:
         try:
             model = (json.loads(traj_path.read_text()).get("metadata") or {}).get("model", "")
@@ -219,12 +242,15 @@ def rebuild_one(session_dir: Path, dry_run: bool = False,
 
     metadata = SessionMetadata(
         session_id=session_id,
-        start_time=raw_pairs[0].timestamp if raw_pairs else "",
+        start_time=adapted[0].timestamp,
         model=model,
     )
     apply_hook_events_to_metadata(metadata, hook_events)
+    if fill_report:
+        metadata.transcript_fill = fill_report
+    if fill_timeline and not metadata.permission_mode_timeline:
+        metadata.permission_mode_timeline = fill_timeline
 
-    adapted = [_adapt_raw_pair(p, i + 1) for i, p in enumerate(raw_pairs)]
     traj = build_trajectory(session_id, adapted, metadata)
 
     new_meta = traj["metadata"]
@@ -245,7 +271,8 @@ def rebuild_one(session_dir: Path, dry_run: bool = False,
                 shutil.copy2(traj_path, bak)
         save_trajectory(traj_path, traj)
 
-    return {"session_id": session_id, "old": old_stats, "new": new_stats}
+    return {"session_id": session_id, "old": old_stats, "new": new_stats,
+            "transcript_filled": (fill_report or {}).get("filled_pairs", 0)}
 
 
 def main():
@@ -263,6 +290,10 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="只处理前 N 个会话（0=全部）")
     parser.add_argument("--force", action="store_true",
                         help="强制重建含 sub-agent 子会话的会话（会丢失子会话数据，不建议）")
+    parser.add_argument("--from-transcript", action="store_true",
+                        help="用 ~/.claude/projects 下的 transcript 补 raw 缺的轮次；缺 raw 的会话也尝试抢救")
+    parser.add_argument("--claude-dir", default=None,
+                        help="Claude 配置目录（默认 $CLAUDE_CONFIG_DIR 或 ~/.claude）")
     args = parser.parse_args()
 
     root = Path(args.dir).expanduser().resolve()
@@ -288,13 +319,14 @@ def main():
         if kind == "garbage":
             garbage_dirs.append(d)
             continue
-        if kind == "no_raw":
+        if kind == "no_raw" and not args.from_transcript:
             continue
         if args.scan_only:
             continue
 
         result = rebuild_one(d, dry_run=args.dry_run, backup=not args.no_backup,
-                             force=args.force)
+                             force=args.force, from_transcript=args.from_transcript,
+                             claude_dir=Path(args.claude_dir) if args.claude_dir else None)
         if result is None:
             counts["failed"] += 1
             continue
@@ -305,6 +337,11 @@ def main():
             )
             continue
         counts["rebuilt"] += 1
+        if result.get("transcript_filled"):
+            counts["transcript_filled_sessions"] = counts.get("transcript_filled_sessions", 0) + 1
+            counts["transcript_filled_pairs"] = (
+                counts.get("transcript_filled_pairs", 0) + result["transcript_filled"]
+            )
 
         old, new = result["old"], result["new"]
         if old:
@@ -350,6 +387,9 @@ def main():
     if not args.scan_only:
         print(f"  重建成功       : {counts['rebuilt']}")
         print(f"  重建失败       : {counts['failed']}")
+        if args.from_transcript:
+            print(f"  transcript 补洞 : {counts.get('transcript_filled_sessions', 0)} 个会话 / "
+                  f"{counts.get('transcript_filled_pairs', 0)} 轮")
         skipped = counts.get("skipped_subagent", 0)
         if skipped:
             print(f"  跳过(含子会话)  : {skipped}"
