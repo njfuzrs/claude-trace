@@ -8,6 +8,8 @@
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-04
+
 ### 新增
 
 - traj `info.data_quality` 新增 `parse_error_actions`（tool_use 输入 JSON 截断的 action 数）与
