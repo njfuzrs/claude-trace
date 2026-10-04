@@ -8,6 +8,8 @@
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-10-04
+
 ### 新增
 
 - transcript 补洞（S4）：最终导出（SessionEnd / 超时清理 / 复活重建）时读 Claude Code 本地 transcript
