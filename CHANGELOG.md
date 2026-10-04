@@ -8,6 +8,17 @@
 
 ## [Unreleased]
 
+### 新增
+
+- traj `info.data_quality` 新增 `parse_error_actions`（tool_use 输入 JSON 截断的 action 数）与
+  `parse_error_repaired`（其中被修复的）。差值 = 仍带 `_raw_partial`、不可重建的调用。
+- 截断输入的有限修复：只补齐末尾未闭合的 `}` / `]`，且必须 `json.loads` round-trip、结果含工具
+  `input_schema.required` 的全部键才算修好（修好的留 `_parse_repaired=true`）。截在字符串 / 数字 /
+  字面量中间、或拿不到 tools schema 时一律不修。按本机历史 raw 实测，89 处截断全部截在大字段中途，
+  修复数为 0 —— 这一版的价值是让截断可见，不是修好它们。
+- `traj_schema` 新增 `parse_error_counts=true`。
+- `raw.jsonl` 与 SSE 转发路径不变：修复只发生在 builder 导出 traj 时。
+
 ## [0.4.1] - 2026-10-04
 
 ### 新增

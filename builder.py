@@ -195,6 +195,94 @@ def _extract_file_path(tool_input) -> str:
 
 
 # ─────────────────────────────────────────────
+# 截断 tool_use 输入的有限修复（S2-3）
+# ─────────────────────────────────────────────
+
+_JSON_CLOSERS = {"{": "}", "[": "]"}
+
+
+def repair_truncated_json(partial: str) -> Optional[Dict]:
+    """尝试修复 SSE 中断导致的截断 tool_use JSON，失败返回 None
+
+    只做一类机械动作：在末尾补齐未闭合的 `}` / `]`。截断落在字符串内部、
+    键冒号之后、逗号之后等情况一律判失败 —— 补字符串引号等于伪造一个被截短
+    的值（Write 的 content 半截也能 round-trip），不能算修好。
+    成功的判据是补齐后能 json.loads 且结果是 dict。
+    """
+    if not isinstance(partial, str):
+        return None
+    text = partial.rstrip()
+    if not text:
+        return None
+    stack: List[str] = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in _JSON_CLOSERS:
+            stack.append(_JSON_CLOSERS[ch])
+        elif ch in "}]":
+            if not stack or stack.pop() != ch:
+                return None
+    if in_string or not stack:
+        return None
+    # 截断点必须落在一个完整值之后：数字可能被截短（123 → 12），字面量可能
+    # 只剩半截，这两种补括号后仍能 round-trip，但值是错的，不算修好
+    if not (text[-1] in '"}]' or text.endswith(("true", "false", "null"))):
+        return None
+    try:
+        repaired = json.loads(text + "".join(reversed(stack)))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return repaired if isinstance(repaired, dict) else None
+
+
+def tool_required_keys(request_body: Dict) -> Dict[str, Set[str]]:
+    """从请求体的 tools 声明里取每个工具的 input_schema.required"""
+    out: Dict[str, Set[str]] = {}
+    for t in (request_body or {}).get("tools") or []:
+        if isinstance(t, dict) and t.get("name"):
+            req = (t.get("input_schema") or {}).get("required") or []
+            out[t["name"]] = {k for k in req if isinstance(k, str)}
+    return out
+
+
+def repair_tool_input(tool_input, required: Optional[Set[str]] = None):
+    """对带 `_parse_error` 标记的 tool_input 尝试修复
+
+    返回 (input, status)：status 为 "" 表示无解析错误，"repaired" 表示已修复
+    （去掉 `_parse_error` / `_raw_partial`，留 `_parse_repaired=True`），
+    "unrepaired" 表示修不了、原样保留 `_raw_partial`。
+
+    语法 round-trip 不够：截断通常发生在大字段（Write.content、Edit.new_string）
+    写到一半，补括号后只剩前面的短键。所以还要求工具声明的 required 键全在；
+    拿不到 schema（required 为 None）时一律不修，宁可漏修不可伪造完整调用。
+    """
+    if not isinstance(tool_input, dict):
+        return tool_input, ""
+    if tool_input.get("_parse_repaired"):
+        return tool_input, "repaired"
+    if not tool_input.get("_parse_error"):
+        return tool_input, ""
+    if required is None:
+        return tool_input, "unrepaired"
+    repaired = repair_truncated_json(tool_input.get("_raw_partial", ""))
+    if repaired is None or not required.issubset(repaired):
+        return tool_input, "unrepaired"
+    repaired["_parse_repaired"] = True
+    return repaired, "repaired"
+
+
+# ─────────────────────────────────────────────
 # 内容提取辅助
 # ─────────────────────────────────────────────
 
@@ -949,6 +1037,8 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
     n_error_responses = 0
     n_failed_actions = 0       # 非 success 的工具执行数
     n_exit_codes_known = 0     # 拿到确定数值退出码的工具执行数
+    n_parse_errors = 0         # tool_use 输入 JSON 截断的 action 数（含已修复）
+    n_parse_repaired = 0       # 其中补齐括号后 round-trip 成功的
 
     # 全局索引：一次扫描，避免 O(n*m) 且不遗漏
     tool_result_index = build_tool_result_index(pairs)
@@ -1121,6 +1211,17 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
             continue
 
         content_blocks = [b for b in response.get("content", []) or [] if isinstance(b, dict)]
+        # 截断 tool_use 输入：先修再用，history 的 tool_calls 与 action step 看到同一份
+        required_keys = tool_required_keys(request_body) if request_body else {}
+        for i, b in enumerate(content_blocks):
+            if b.get("type") not in ("tool_use", "server_tool_use"):
+                continue
+            fixed, status = repair_tool_input(b.get("input"), required_keys.get(b.get("name", "")))
+            if status:
+                n_parse_errors += 1
+                if status == "repaired":
+                    n_parse_repaired += 1
+                    content_blocks[i] = {**b, "input": fixed}
         stop_reason = response.get("stop_reason", "") or ""
         usage = response.get("usage", {}) or {}
 
@@ -1410,6 +1511,10 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
         "user_steps_prompt_matched": n_user_matched,
         "user_steps_resent_dropped": n_user_resent,
         "user_steps_from_hook": n_user_from_hook,
+        # tool_use 输入截断（S2-3）：actions 含已修复，repaired 只算补括号成功的；
+        # 二者之差 = 仍带 _raw_partial、不可重建的 action
+        "parse_error_actions": n_parse_errors,
+        "parse_error_repaired": n_parse_repaired,
     }
 
     return {
@@ -1469,7 +1574,7 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
             "test_runs": test_runs,
             # 清洗侧按这个版本筛「trajectory 里有没有 message_type=user」
             "collector_ver": _collector_version(),
-            "traj_schema": {"user_steps": True, "git_end_diff": True},
+            "traj_schema": {"user_steps": True, "git_end_diff": True, "parse_error_counts": True},
             "data_quality": data_quality,
         },
     }
