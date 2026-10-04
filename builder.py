@@ -72,6 +72,8 @@ class SessionMetadata:
     stop_failures: List[Dict] = field(default_factory=list)       # StopFailure：轮次因 API 错误结束
     tool_failures: List[Dict] = field(default_factory=list)       # PostToolUseFailure：工具执行失败
     instructions_loaded: List[Dict] = field(default_factory=list)  # InstructionsLoaded：只留 path + hash
+    # transcript 补洞报告（S4）：只有真补了东西才非空，完整会话的 traj 不出现这个键
+    transcript_fill: Optional[Dict] = None
 
 
 # ─────────────────────────────────────────────
@@ -1184,7 +1186,8 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
         # 旁路请求（标题生成、离开回来的 recap 等）不带 tools，与主会话同 sid
         # 落进同一个 raw.jsonl。它们的 user 消息是 Claude Code 自己拼的，不是用户输入，
         # 不产生 user step，也不能占用 hook prompt 的对齐位。
-        is_side_query = not request_body.get("tools")
+        # transcript 补洞合成的 pair 没有请求体，但它本身就是主会话的一轮（S4）
+        is_side_query = not request_body.get("tools") and not getattr(pair, "from_transcript", False)
         # Fix: 无法定位增量边界时 proxy 会返回完整历史，导致同一批 user 消息
         # 被反复写进 history（实测一个会话里同一个 tool_result 出现几十次，
         # 最坏 0 个 tool_use 对应 570 个 tool_result 块）。
@@ -1362,6 +1365,10 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
             "timestamp": pair.timestamp,
             "traj_step": None,
         }
+        from_transcript = bool(getattr(pair, "from_transcript", False))
+        if from_transcript:
+            # 补洞轮次：thinking 无 signature、usage 是 Claude Code 记的，下游按需过滤
+            assistant_entry["_source"] = "transcript"
         history.append(assistant_entry)
 
         # ── Action / Observation 步骤 ─────────────────────
@@ -1405,6 +1412,8 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
             }
             if is_server_side:
                 action_step["_server_side"] = True
+            if from_transcript:
+                action_step["_source"] = "transcript"
             if assistant_entry["traj_step"] is None:
                 assistant_entry["traj_step"] = len(trajectory)
             trajectory.append(action_step)
@@ -1528,6 +1537,7 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
                 "agent": "primary",
                 "timestamp": pair.timestamp,
                 "stop_reason": stop_reason,
+                **({"_source": "transcript"} if from_transcript else {}),
             })
 
     # ── system prompt 插到 history 头部 ────────────────────
@@ -1674,8 +1684,10 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
             # 清洗侧按这个版本筛「trajectory 里有没有 message_type=user」
             "collector_ver": _collector_version(),
             "traj_schema": {"user_steps": True, "git_end_diff": True, "parse_error_counts": True,
-                            "hook_failures": True},
+                            "hook_failures": True, "transcript_fill": True},
             "data_quality": data_quality,
+            # 只在真补过时出现，完整会话的 traj 键集合不变
+            **({"transcript_fill": metadata.transcript_fill} if metadata.transcript_fill else {}),
         },
     }
 

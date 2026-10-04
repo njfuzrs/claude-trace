@@ -811,6 +811,9 @@ class DataCollector:
         self.save_raw = save_raw  # P2 #18: 控制是否保存原始 JSON 文件到 raw/ 子目录
         self.events_dir = events_dir or (Path.home() / ".claude" / "trajectory_events")
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        # transcript 补洞（S4）：最终导出时用 Claude Code 本地 transcript 补 raw 缺的尾部轮次。
+        # raw 优先，transcript 只补 raw 没有的；补洞失败只打日志。设 false 可关。
+        self.transcript_fill = os.environ.get("TRAJ_TRANSCRIPT_FILL", "true").strip().lower() != "false"
 
         # 可靠上传管理器（替代原有的 fire-and-forget 上传）
         upload_url = os.environ.get("TRAJ_PLATFORM_URL", "").strip()
@@ -977,6 +980,7 @@ class DataCollector:
         # 与 RequestResponsePair 结构兼容但不同名（builder 只按属性取值）。
         pairs_snapshot: Sequence[Any],
         children_snapshot: Optional[List[tuple]] = None,
+        fill_from_transcript: bool = False,
     ) -> tuple:
         """构建 traj 数据，合并子会话数据，读取 hook events 丰富 metadata。
 
@@ -988,6 +992,7 @@ class DataCollector:
             pairs_snapshot: 主会话 pairs 的快照
             children_snapshot: 子会话快照列表，每项为 (child_id, child_model, child_start_time, child_pairs_snapshot)
                                如果为 None 则不合并子会话
+            fill_from_transcript: 最终导出时为 True，按 transcript 补 raw 缺的尾部轮次
 
         Returns:
             (traj_path, traj_dict) 或在异常时返回 (None, None)
@@ -1006,9 +1011,9 @@ class DataCollector:
 
             # 从 hook events JSONL 读取语义事件，丰富 metadata
             events_file = self.events_dir / f"{session.id}.jsonl"
+            hook_events: List[Dict] = []
             if events_file.exists():
                 try:
-                    hook_events = []
                     for line in events_file.read_text().splitlines():
                         if line.strip():
                             try:
@@ -1018,6 +1023,11 @@ class DataCollector:
                     apply_hook_events_to_metadata(metadata, hook_events)
                 except Exception as e:
                     logger.debug("读取 hook events 失败: %s", e)
+
+            if fill_from_transcript and self.transcript_fill:
+                pairs_snapshot = self._fill_from_transcript(
+                    session.id, pairs_snapshot, hook_events, children_snapshot, metadata,
+                )
 
             # 构建主会话轨迹
             traj = build_trajectory(session.id, pairs_snapshot, metadata)
@@ -1075,6 +1085,39 @@ class DataCollector:
             return None, None
 
     @staticmethod
+    def _fill_from_transcript(
+        session_id: str,
+        pairs_snapshot: Sequence[Any],
+        hook_events: List[Dict],
+        children_snapshot: Optional[List[tuple]],
+        metadata: SessionMetadata,
+    ) -> Sequence[Any]:
+        """transcript 补洞：失败只打日志，返回原 pairs，绝不影响导出"""
+        try:
+            from transcript import fill_pairs_from_transcript
+
+            # 子会话的响应 id 也算「raw 已有」，避免同一条消息被补进主轨迹
+            child_ids = [
+                (p.response_body or {}).get("id")
+                for _, _, _, cpairs, _ in (children_snapshot or [])
+                for p in cpairs
+                if isinstance(getattr(p, "response_body", None), dict)
+            ]
+            filled, report, timeline = fill_pairs_from_transcript(
+                session_id, pairs_snapshot, hook_events,
+                extra_known_ids=[i for i in child_ids if isinstance(i, str) and i],
+            )
+            if report:
+                metadata.transcript_fill = report
+            # hook 边沿没检测到变更时，才用 transcript 的权限模式时间线
+            if timeline and not metadata.permission_mode_timeline:
+                metadata.permission_mode_timeline = timeline
+            return filled
+        except Exception as e:
+            logger.warning("transcript 补洞失败（不影响导出）%s: %s", session_id[:8], e)
+            return pairs_snapshot
+
+    @staticmethod
     def _snapshot_children(session: Session) -> Optional[List[tuple]]:
         """在事件循环线程中创建子会话的不可变快照（线程安全）
 
@@ -1090,6 +1133,7 @@ class DataCollector:
 
     def _rebuild_traj_from_raw(
         self, session: Session, children_snapshot: Optional[List[tuple]] = None,
+        fill_from_transcript: bool = False,
     ) -> tuple:
         """从 raw.jsonl 重建完整轨迹（复活会话的最终导出用）
 
@@ -1116,7 +1160,9 @@ class DataCollector:
             return None, None
 
         # 走与常规导出相同的构建路径，metadata / 子会话合并逻辑完全一致
-        return self._build_traj_data(session, adapted, children_snapshot)
+        return self._build_traj_data(
+            session, adapted, children_snapshot, fill_from_transcript=fill_from_transcript,
+        )
 
     def export_session(self, session: Session):
         """导出会话的 .traj 文件（同步版本，用于优雅退出等非 async 上下文）
@@ -1175,7 +1221,10 @@ class DataCollector:
         traj_path = None
         if is_final and session.revived:
             traj_path, traj = await loop.run_in_executor(
-                None, self._rebuild_traj_from_raw, session, children_snapshot,
+                None, functools.partial(
+                    self._rebuild_traj_from_raw, session, children_snapshot,
+                    fill_from_transcript=True,
+                ),
             )
             if traj is None:
                 logger.warning(
@@ -1183,7 +1232,16 @@ class DataCollector:
                 )
 
         if traj is None:
-            traj_path, traj = self._build_traj_data(session, pairs_snapshot, children_snapshot)
+            if is_final and self.transcript_fill:
+                # 最终导出带 transcript 补洞：要读 jsonl，放线程池，不卡事件循环
+                traj_path, traj = await loop.run_in_executor(
+                    None, functools.partial(
+                        self._build_traj_data, session, pairs_snapshot, children_snapshot,
+                        fill_from_transcript=True,
+                    ),
+                )
+            else:
+                traj_path, traj = self._build_traj_data(session, pairs_snapshot, children_snapshot)
 
         if traj_path and traj:
             try:
