@@ -85,6 +85,11 @@ async def _drain_pending_writes(session: "Session"):
 
 SENSITIVE_HEADERS = {"x-api-key", "authorization", "proxy-authorization"}
 
+# 上游请求不设超时（见 on_startup 注释）。模块级常量便于测试断言。
+UPSTREAM_TIMEOUT = aiohttp.ClientTimeout(
+    total=None, connect=None, sock_connect=None, sock_read=None,
+)
+
 # 退出时等在途请求（SSE 长连接）的上限，作为 AppRunner 的 shutdown_timeout 参数。
 # aiohttp 默认 60 秒，且 RequestHandler.shutdown 会把它用两次（先等 handler 自然结束，
 # 再取消并等待），最坏 2×60 秒，远超 proxy-daemon.sh 的 15 秒收尾预算：退出时只要
@@ -1901,8 +1906,13 @@ async def create_app(
 
     # 应用启动时创建全局 ClientSession（连接池复用）+ 启动上传管理器
     async def on_startup(app):
+        # 不设任何超时：代理是透明转发层，何时放弃由客户端决定（Claude Code 有
+        # API_TIMEOUT_MS 和自己的重试）。曾是 total=300/sock_read=300，会把仍在
+        # 正常流式传输、或上游排队稍久的请求在第 5 分钟掐断成 504/502，客户端只
+        # 看到 "Upstream timeout"，定位不到是代理所为。
+        # 注意必须显式传全 None 的 ClientTimeout：aiohttp 的默认值是 total=300。
         app["upstream_session"] = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=300, sock_read=300),
+            timeout=UPSTREAM_TIMEOUT,
         )
         collector = app["collector"]
         if collector._uploader:

@@ -1006,6 +1006,18 @@ curl http://127.0.0.1:4000/_internal/health
 1. 将 settings.json 中的 `ANTHROPIC_BASE_URL` 改为 `http://127.0.0.1:4000`
 2. 将统一采集器的 `--upstream` 设为原来的地址
 
+### Claude Code 报 504 Upstream timeout / 502 Upstream connection error
+
+统一采集器对上游请求**不设任何超时**（自 0.4.6 起），何时放弃、要不要重试完全由
+Claude Code 决定（`API_TIMEOUT_MS`）。所以：
+
+- 0.4.6 及以后看到 `504 Upstream timeout` 或 `502 ... Timeout on reading data from socket`，
+  是**上游**（`--upstream` 指向的服务）断开或长时间无响应，不是采集器掐的。
+  查 `/tmp/claude-trace-proxy.log` 里同一时刻的 `[ERROR]` 行，看请求开始到报错的时长。
+- 0.4.5 及以前，采集器有 `total=300, sock_read=300` 的硬超时：上游排队或流式响应超过
+  5 分钟就被掐成 504/502，Claude Code 重试后从头再等。表现为「某个任务每轮都卡、
+  反复 retry、最后 Request timed out」，日志里报错时间恰好在请求开始后 300 秒。升级即可。
+
 ### 统一采集器启动报端口占用
 
 ```bash
