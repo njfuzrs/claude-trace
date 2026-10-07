@@ -8,6 +8,8 @@
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-10-07
+
 ### 修复
 
 - 代理不再对上游请求设任何超时。原先 `ClientTimeout(total=300, sock_read=300)` 会把
