@@ -196,3 +196,35 @@ def test_废弃的force_thinking参数仍可解析():
         assert args.upload_status is True
     finally:
         sys.argv = argv
+
+
+@pytest.mark.asyncio
+async def test_消息体密钥落盘脱敏但上游收到原文(output_dir, monkeypatch):
+    """scrub 只作用于落盘副本：上游 bytes 不变，raw.jsonl / session.traj 不含明文。"""
+    import asyncio
+
+    monkeypatch.delenv("TRAJ_SCRUB_SECRETS", raising=False)
+    secret = "sk-" + "ant-api03-" + "Q1w2E3r4T5y6U7i8O9p0" * 3
+    raw = (
+        '{"model":"claude-opus-5","max_tokens":100,"stream":false,'
+        '"messages":[{"role":"user","content":"我的 key 是 ' + secret + '"}]}'
+    ).encode("utf-8")
+    got, _, status = await _run_proxy_against_upstream(
+        output_dir, force_thinking=0, raw_body=raw,
+    )
+    assert status == 200
+    assert got == raw and secret.encode() in got
+
+    # 落盘在线程池里异步完成，稍等片刻
+    files = []
+    for _ in range(50):
+        files = [p for p in output_dir.rglob("*") if p.is_file() and p.suffix in (".jsonl", ".traj")]
+        if any(p.name == "raw.jsonl" for p in files):
+            break
+        await asyncio.sleep(0.05)
+    assert any(p.name == "raw.jsonl" for p in files), "raw.jsonl 未落盘"
+    for p in files:
+        text = p.read_text()
+        assert secret not in text, f"{p.name} 含明文密钥"
+    raw_text = next(p for p in files if p.name == "raw.jsonl").read_text()
+    assert secret[:8] + "***" in raw_text

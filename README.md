@@ -104,8 +104,9 @@ bash dist/install.sh             # 本地安装模式
 
 **不采集**：你的 API Key 值（三个请求头会被截断脱敏，见[安全说明](#安全说明请如实理解脱敏范围)）。
 
-⚠️ 反过来说：**除了那三个请求头，消息体不做内容级过滤**。你在对话里粘贴过什么，
-轨迹里就有什么。在私有代码库上使用前请先明确这一点。
+消息体里的常见密钥形态（`sk-…`、`ghp_…`、`AKIA…`、私钥等）默认在落盘前做头尾保留脱敏，
+`TRAJ_SCRUB_SECRETS=false` 可关闭。⚠️ 但这只是基于规则的兜底：没有固定格式的敏感内容
+仍会原样记录。在私有代码库上使用前请先明确这一点。
 
 想知道究竟落了什么盘，直接看：
 
@@ -160,6 +161,7 @@ python3 tools/sync.py --all            # 全量
 | --- | --- | --- |
 | `TRAJ_CLEANUP_AFTER_UPLOAD` | `false` | 上传成功后是否删除本地数据。**默认保留** —— 只有显式设为 `true` 才删。曾经默认 `true`，结果「上传成功」的判断一旦有偏差，数据就没了第二份 |
 | `TRAJ_BACKFILL_ON_START` | `true` | 启动时扫描并补传盘上未上云的会话。这是上传链路的兜底，不建议关 |
+| `TRAJ_SCRUB_SECRETS` | `true` | 消息体密钥脱敏（保留头尾、抹掉中间）。设为 `false` 关闭。hook 由 Claude Code 拉起、读不到 plist，要连 hook 一起关需在 `~/.claude/settings.json` 的 `env` 里也设置 |
 
 自检当前是否处于「只存本地」状态：
 
@@ -753,9 +755,15 @@ trajectories/
 - **已脱敏**：请求头中的 `x-api-key`、`authorization`、`proxy-authorization`
   三个字段，落盘时截断为前 10 字符 + `***`（实现见 `proxy.py` 的
   `SENSITIVE_HEADERS` / `sanitize_headers_for_storage`）。
-- 🔴 **未脱敏**：**消息体不做任何内容级过滤**。轨迹会原样记录完整对话，
-  因此如果你在对话里粘贴过 token、私钥、`.env` 内容或数据库连接串，
-  它们会**明文落盘**在 `raw.jsonl` / `session.traj` 里。
+- **已脱敏（默认开启）**：消息体里的常见密钥形态在落盘前保留头尾、抹掉中间
+  （如 `sk-ant-a***wxyz`）。覆盖 `sk-` 系列（Anthropic / OpenAI / 中转站）、GitHub / GitLab token、
+  AWS Access Key ID、Google API key、Slack、Stripe、HuggingFace、JWT、`Bearer xxx`、
+  连接串密码、`API_KEY=` / `"secret": "..."` 这类键值，以及 PEM 私钥正文（整段抹掉）。
+  作用于 `raw.jsonl`、`raw/*.json`、`session.traj`、`events.jsonl` 和 Codex 导出文件；
+  **转发给上游的请求不受影响**。实现见 `scrub.py`，测试在 `tests/test_scrub.py`。
+  `TRAJ_SCRUB_SECRETS=false` 可关闭（hook 侧需同时在 `~/.claude/settings.json` 的 `env` 里设置）。
+- ⚠️ **只认识上面这些形态**：没有固定前缀的随机串、写在自然语言里的密码等仍会原样落盘。
+  启用前产生的历史数据也不会被回溯处理。
 - 分享或上传轨迹前请自查：
 
   ```bash
@@ -764,8 +772,7 @@ trajectories/
     ./trajectories/sessions/ 2>/dev/null
   ```
 
-- 内容级脱敏器（Scrubber）在路线图上，尚未实现。在它落地之前，
-  **请把轨迹目录当作与源码同等敏感的数据来对待。**
+- **请仍把轨迹目录当作与源码同等敏感的数据来对待。**
 - 统一采集器默认绑定 `127.0.0.1`，不暴露到局域网。
 
 ---
@@ -940,6 +947,7 @@ python3 merger.py --all \
 | `channels.json.example` | 渠道配置模板，可提交到 git |
 | `tools/viewer.py` | 轨迹数据 HTML 查看器，将 .traj 转为可视化 HTML |
 | `git_state.py` | 会话起点 git 状态快照采集（`collector.py` 的同目录依赖） |
+| `scrub.py` | 消息体密钥脱敏，落盘前统一调用（同为 `collector.py` 的同目录依赖） |
 | `docs/upload-protocol.md` | 自建上传接收端所需的服务端协议 |
 | `tests/` | 测试骨架（请求头脱敏 / session_id 防护 / porcelain 解析 / 安装器分流 / 版本事实源） |
 

@@ -376,6 +376,7 @@ WRAPPER
 
     cp "$REPO_DIR/collector.py"          "$STAGING/payload/collector.py"
     cp "$REPO_DIR/git_state.py"          "$STAGING/payload/git_state.py"
+    cp "$REPO_DIR/scrub.py"              "$STAGING/payload/scrub.py"
     cp "$REPO_DIR/channels.json.example" "$STAGING/payload/channels.json.example"
     cp "$REPO_DIR/dist/claude-trace"     "$STAGING/payload/claude-trace"
     cp "$REPO_DIR/dist/proxy-daemon.sh"  "$STAGING/payload/proxy-daemon.sh"
@@ -564,6 +565,15 @@ else
     warn "git_state.py 缺失，git 状态采集将不可用"
 fi
 
+# scrub.py 同为 collector.py 的同目录依赖（hook 事件落盘前的密钥脱敏）。
+# 缺失时 hook 侧不脱敏，但代理复制 events 到会话目录时仍会补一遍。
+if [ -f "$INSTALL_DIR/scrub.py" ]; then
+    cp "$INSTALL_DIR/scrub.py" "$(dirname "$COLLECTOR_DEST")/scrub.py"
+    ok "scrub.py → $(dirname "$COLLECTOR_DEST")/scrub.py"
+else
+    warn "scrub.py 缺失，hook 事件将在代理侧补做脱敏"
+fi
+
 # ─── 配置 settings.json ───
 
 echo ""
@@ -748,6 +758,8 @@ cat > "$PLIST_PATH" <<PLIST
         <string>${SVC_CLEANUP}</string>
         <key>TRAJ_BACKFILL_ON_START</key>
         <string>${SVC_BACKFILL}</string>
+        <key>TRAJ_SCRUB_SECRETS</key>
+        <string>${TRAJ_SCRUB_SECRETS:-true}</string>
         <key>PATH</key>
         <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>

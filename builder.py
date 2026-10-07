@@ -23,6 +23,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
 
+from scrub import maybe_scrub
+
 logger = logging.getLogger("builder")
 
 
@@ -1753,7 +1755,8 @@ def save_trajectory(traj_path: Path, traj: Dict, allow_shrink: bool = True):
 
     tmp_path = traj_path.with_suffix(traj_path.suffix + ".tmp")
     try:
-        tmp_path.write_text(json.dumps(traj, ensure_ascii=False, indent=2))
+        # 所有 traj 写入（proxy / merger / rebuild / codex）都走这里，统一脱敏
+        tmp_path.write_text(json.dumps(maybe_scrub(traj), ensure_ascii=False, indent=2))
         tmp_path.replace(traj_path)
     except Exception:
         tmp_path.unlink(missing_ok=True)

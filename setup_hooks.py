@@ -50,7 +50,7 @@ HOOK_EVENTS = [
 COLLECTOR_PATH = Path.home() / ".claude" / "hooks" / "collector.py"
 
 # collector.py 在 hooks 目录下运行时需要的同目录依赖
-HOOK_DEPS = ["git_state.py"]
+HOOK_DEPS = ["git_state.py", "scrub.py"]
 
 
 def build_hooks_config(collector_path: Path) -> dict:

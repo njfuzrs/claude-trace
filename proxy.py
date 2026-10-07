@@ -34,6 +34,7 @@ from builder import (
     build_trajectory,
     save_trajectory,
 )
+from scrub import maybe_scrub, maybe_scrub_jsonl_line
 from git_state import coerce_git_state, collect_git_state, collect_git_state_end, flatten_git_state
 from uploader import UploadManager
 from version_info import build_fingerprint, resolve_version, version_string
@@ -1277,14 +1278,22 @@ class DataCollector:
         session_id 现在优先来自请求体 metadata（见 _extract_session_id_from_request），
         与 hooks 写出的 events 文件名一致，因此正常路径直接命中。
         """
-        import shutil
         src = self.events_dir / f"{session_id}.jsonl"
         if not src.exists():
             logger.debug("hook events 不存在，跳过复制: %s", session_id[:8])
             return
         dst = self._session_dir(session_id) / "events.jsonl"
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
+        # 逐行再过一遍脱敏：~/.claude/hooks/ 里可能还是没接脱敏的旧版 collector
+        tmp = dst.with_suffix(dst.suffix + ".tmp")
+        try:
+            with src.open(errors="replace") as fin, tmp.open("w") as fout:
+                for line in fin:
+                    fout.write(maybe_scrub_jsonl_line(line))
+            tmp.replace(dst)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
 
     def _write_pair_files(self, session: Session, pair: RequestResponsePair,
                           pairs_snapshot: List[RequestResponsePair],
@@ -1322,8 +1331,9 @@ class DataCollector:
                 "body": pair.response_body,
             }
 
-            req_file.write_text(json.dumps(req_data, ensure_ascii=False, indent=2))
-            resp_file.write_text(json.dumps(resp_data, ensure_ascii=False, indent=2))
+            # 消息体密钥脱敏只作用于落盘副本（TRAJ_SCRUB_SECRETS，默认开）
+            req_file.write_text(json.dumps(maybe_scrub(req_data), ensure_ascii=False, indent=2))
+            resp_file.write_text(json.dumps(maybe_scrub(resp_data), ensure_ascii=False, indent=2))
 
         # 追加写入 raw JSONL（始终执行，不受 save_raw 控制）
         jsonl_path = self._session_dir(session.id) / "raw.jsonl"
@@ -1429,8 +1439,10 @@ class DataCollector:
             # 落盘重放标记，重建轨迹（merger / tools/rebuild_trajs）时同样需要去重
             "is_full_replay": pair.is_full_replay,
         }
+        # 落盘前脱敏：record 由新建 dict 组成，maybe_scrub 返回新对象，
+        # 不会改到内存里用于增量哈希的 request_body
         with open(jsonl_path, "a") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.write(json.dumps(maybe_scrub(record), ensure_ascii=False) + "\n")
 
     @staticmethod
     def _extract_incremental_messages(
