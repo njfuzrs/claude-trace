@@ -8,6 +8,13 @@
 
 ## [Unreleased]
 
+### 修复
+
+- 代理不再对上游请求设任何超时。原先 `ClientTimeout(total=300, sock_read=300)` 会把
+  正常流式传输超过 5 分钟、或上游排队超过 5 分钟没回首字节的请求掐断，客户端只看到
+  `504 Upstream timeout` / `502 ... Timeout on reading data from socket`，并触发重试从头再来；
+  用户无从知道是采集代理所为。超时与重试现在完全交给客户端（Claude Code 的 `API_TIMEOUT_MS`）。
+
 ## [0.4.5] - 2026-10-07
 
 ### 新增
