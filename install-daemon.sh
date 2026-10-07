@@ -41,6 +41,8 @@ TRAJ_DEVICE_ID="${TRAJ_DEVICE_ID:-}"
 TRAJ_CLEANUP_AFTER_UPLOAD="${TRAJ_CLEANUP_AFTER_UPLOAD:-false}"
 # 启动补传：扫描盘上未上传的会话并补齐，上传链路的兜底
 TRAJ_BACKFILL_ON_START="${TRAJ_BACKFILL_ON_START:-true}"
+# 消息体密钥脱敏：默认开启，设为 false 关闭
+TRAJ_SCRUB_SECRETS="${TRAJ_SCRUB_SECRETS:-true}"
 INSTALL_WATCH=false
 
 # bootout 是异步的：命令返回时 job 可能还在收尾（proxy-daemon.sh 最多等采集器 15 秒，
@@ -193,6 +195,8 @@ do_install() {
         <string>${TRAJ_CLEANUP_AFTER_UPLOAD}</string>
         <key>TRAJ_BACKFILL_ON_START</key>
         <string>${TRAJ_BACKFILL_ON_START}</string>
+        <key>TRAJ_SCRUB_SECRETS</key>
+        <string>${TRAJ_SCRUB_SECRETS}</string>
         <key>PATH</key>
         <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>

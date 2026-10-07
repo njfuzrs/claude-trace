@@ -8,6 +8,14 @@
 
 ## [Unreleased]
 
+### 新增
+
+- 消息体密钥脱敏（`scrub.py`），**默认开启**：落盘前把常见密钥形态保留头尾、抹掉中间
+  （`sk-` 系列、GitHub / GitLab、AWS、Google、Slack、Stripe、HuggingFace、JWT、Bearer、
+  连接串密码、`KEY=` 键值、PEM 私钥）。覆盖 `raw.jsonl` / `raw/*.json` / `session.traj` /
+  `events.jsonl` / Codex 导出；转发给上游的请求体不变。`TRAJ_SCRUB_SECRETS=false` 关闭。
+  已有历史数据不回溯处理。
+
 ## [0.4.4] - 2026-10-04
 
 ### 新增

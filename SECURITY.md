@@ -52,10 +52,16 @@ claude-trace 是一个**采集工具**。它的全部价值来自记录完整交
   三个字段，落盘时截断为前 10 字符 + `***`。
   实现见 `proxy.py` 的 `SENSITIVE_HEADERS` 与 `sanitize_headers_for_storage()`，
   对应测试在 `tests/test_sanitize.py`。
-- 🔴 **未脱敏**：**消息体不做任何内容级过滤**。你在对话里粘贴过的 token、私钥、
-  `.env` 内容、数据库连接串，都会**明文落盘**在 `raw.jsonl` / `session.traj` 中。
-- 内容级脱敏器（Scrubber）尚未实现，在路线图上。**在它落地之前，
-  请把轨迹目录当作与源码同等敏感的数据。**
+- **已脱敏（默认开启）**：消息体里的常见密钥形态在落盘前保留头尾、抹掉中间
+  （如 `sk-ant-a***wxyz`）。覆盖 `sk-` 系列（Anthropic / OpenAI / 中转站）、GitHub / GitLab token、
+  AWS Access Key ID、Google API key、Slack、Stripe、HuggingFace、JWT、`Bearer xxx`、
+  连接串密码、`API_KEY=` / `"secret": "..."` 这类键值，以及 PEM 私钥正文（整段抹掉）。
+  作用于 `raw.jsonl`、`raw/*.json`、`session.traj`、`events.jsonl` 和 Codex 导出文件；
+  **转发给上游的请求不受影响**。实现见 `scrub.py`，测试在 `tests/test_scrub.py`。
+  `TRAJ_SCRUB_SECRETS=false` 可关闭（hook 侧需同时在 `~/.claude/settings.json` 的 `env` 里设置）。
+- ⚠️ **只认识上面这些形态**：没有固定前缀的随机串、写在自然语言里的密码等仍会原样落盘。
+  启用前产生的历史数据也不会被回溯处理。
+- **请仍把轨迹目录当作与源码同等敏感的数据。**
 
 ### 上传默认关闭
 
@@ -75,8 +81,9 @@ claude-trace 是一个**在你本机上做 HTTP 中间人、并把流经的数�
 所以下面这些**不算漏洞**：
 
 - **它记录了完整对话内容** —— 这是它的功能，不是泄露。
-- **消息体里的密钥没被脱敏** —— 已在上面如实声明，属于已知现状（Scrubber 未实现），
-  不需要重复上报「我发现 .env 内容进了 traj」。但如果你发现**请求头脱敏**被绕过，请上报。
+- **规则之外的敏感内容没被脱敏** —— 已在上面如实声明，Scrubber 只认识固定形态，
+  不需要重复上报「我发现 .env 里某个无前缀的值进了 traj」。但如果你发现**请求头脱敏**被绕过，
+  或 `scrub.py` 已覆盖的形态仍明文落盘，请上报。
 - **配置了上传后数据发到了你填的服务器** —— 那是你填的端点。
 - **`channels.json` 里有你的明文 API token** —— 该文件在 `.gitignore` 中，
   信任边界在本机文件系统权限那一侧。

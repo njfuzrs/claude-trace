@@ -166,6 +166,15 @@ except Exception:  # pragma: no cover
         return collect_git_state(cwd, source=source)
 
 
+# 消息体密钥脱敏（scrub.py，与 git_state.py 一样同目录部署）。
+# 导入失败时不脱敏 —— 代理侧复制 events 到会话目录时还会再过一遍，hook 不能因此崩溃。
+try:
+    from scrub import maybe_scrub
+except Exception:  # pragma: no cover - 部署不完整时的兜底
+    def maybe_scrub(obj):  # type: ignore[misc]
+        return obj
+
+
 def main():
     # stdin 为空时提前退出
     raw_input = sys.stdin.read()
@@ -333,7 +342,7 @@ def main():
     with open(events_file, "a") as f:
         if mode_changed:
             f.write(json.dumps(mode_changed, ensure_ascii=False) + "\n")
-        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        f.write(json.dumps(maybe_scrub(event), ensure_ascii=False) + "\n")
     if current_mode:
         write_last_permission_mode(session_id, current_mode)
     if event_name == "SessionEnd":

@@ -104,6 +104,8 @@ if [ "${1:-}" = "--package" ] || [ "${2:-}" = "--package" ]; then
     cp "$ROOT/collector.py"                   "$STAGING/claude-trace/collector.py"
     # git_state.py：collector.py 的同目录依赖，必须随包发布
     cp "$ROOT/git_state.py"                   "$STAGING/claude-trace/git_state.py"
+    # scrub.py：collector.py 的同目录依赖（消息体密钥脱敏）
+    cp "$ROOT/scrub.py"                       "$STAGING/claude-trace/scrub.py"
     cp "$ROOT/channels.json.example"          "$STAGING/claude-trace/channels.json.example"
     cp "$ROOT/dist/claude-trace"              "$STAGING/claude-trace/claude-trace"
     cp "$ROOT/dist/proxy-daemon.sh"           "$STAGING/claude-trace/proxy-daemon.sh"

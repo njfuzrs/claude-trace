@@ -23,7 +23,6 @@ import argparse
 import json
 import logging
 import re
-import shutil
 import sqlite3
 import subprocess
 import time
@@ -32,6 +31,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from builder import save_trajectory
+from scrub import maybe_scrub, maybe_scrub_jsonl_line
 
 logging.basicConfig(
     level=logging.INFO,
@@ -541,12 +541,17 @@ def _has_semantic_action_items(thread: Dict) -> bool:
 
 def _write_json(path: Path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=_json_default))
+    # default 先序列化再脱敏：sqlite 行里可能有非 JSON 原生类型
+    data = json.loads(json.dumps(data, ensure_ascii=False, default=_json_default))
+    path.write_text(json.dumps(maybe_scrub(data), ensure_ascii=False, indent=2))
 
 
 def _write_jsonl(path: Path, rows: Iterable[Dict]):
     path.parent.mkdir(parents=True, exist_ok=True)
-    content = "".join(json.dumps(row, ensure_ascii=False, default=_json_default) + "\n" for row in rows)
+    content = "".join(
+        maybe_scrub_jsonl_line(json.dumps(row, ensure_ascii=False, default=_json_default) + "\n")
+        for row in rows
+    )
     path.write_text(content)
 
 
@@ -1128,7 +1133,10 @@ class CodexImporter:
 
         rollout_output_path = session_dir / "rollout.jsonl"
         if rollout_path and rollout_path.exists():
-            shutil.copy2(rollout_path, session_dir / "rollout.jsonl")
+            # 逐行脱敏复制，替代 copy2
+            with rollout_path.open(errors="replace") as fin, rollout_output_path.open("w") as fout:
+                for line in fin:
+                    fout.write(maybe_scrub_jsonl_line(line))
         elif not rollout_output_path.exists():
             rollout_output_path.write_text("")
 

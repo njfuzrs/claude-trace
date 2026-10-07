@@ -40,6 +40,7 @@ tail -20 /tmp/claude-trace-proxy.log  # 查看日志
 ├── merger.py           # 双通道数据合并器（代理 + Hooks；运行时 lazy import）
 ├── uploader.py         # 可靠上传管理器（gzip + SHA256 + 重试队列 + 启动补传）
 ├── git_state.py        # git 快照；collector.py 的同目录依赖
+├── scrub.py            # 消息体密钥脱敏（落盘前调用）；同为 collector.py 的同目录依赖
 ├── import_codex.py     # Codex 导入 + rollout watcher
 ├── tools/              # 离线 CLI（采集进程从不 import）
 │   ├── viewer.py           # 轨迹数据 HTML 查看器
@@ -122,9 +123,10 @@ pre-commit run --all-files              # 一次跑全部
   同时非空才启用；启用后会话结束时由 `uploader.py` 上传 session.traj + raw.jsonl + events.jsonl。
   `TRAJ_USER_ID` / `TRAJ_DEVICE_ID` 默认留空，不回退到系统用户名与主机名。
   手动批量补传走 `tools/sync.py`（同一对变量必填，不并进 uploader 的异步队列）。
-- 安全：**只脱三个请求头**（`x-api-key` / `authorization` / `proxy-authorization`），
-  **消息体不做内容级过滤** —— 对话里的密钥会明文落盘，内容级 Scrubber 尚未实现。
-  代理默认绑定 127.0.0.1。
+- 安全：请求头脱三个（`x-api-key` / `authorization` / `proxy-authorization`）；
+  消息体由 `scrub.py` 按规则脱敏（保留头尾去中间，`TRAJ_SCRUB_SECRETS` 默认开）。
+  脱敏只作用于落盘副本：新增落盘点必须走 `maybe_scrub` / `maybe_scrub_jsonl_line`，
+  且不得就地修改内存对象（增量哈希依赖原值）。代理默认绑定 127.0.0.1。
 - 代理使用 SSE Tee 模式，零延迟转发 + 后台记录，不影响 Claude Code 正常使用
 - **请求体原样转发**：采集可以 `json.loads` 做会话匹配，但转发给上游必须用客户端原始 bytes。
   禁止改 `thinking` / `tools` / `messages` 后再 `json.dumps`。`--force-thinking` 已废弃
@@ -218,6 +220,7 @@ python3 tools/sync.py --all
 | `TRAJ_LOCAL_DIR` | 安装器落点，否则 `./trajectories/sessions` | `tools/sync.py` 读取的会话目录 |
 | `TRAJ_CLEANUP_AFTER_UPLOAD` | `false` | 上传成功后是否删本地。**默认保留**，只有显式 `true` 才删 |
 | `TRAJ_BACKFILL_ON_START` | `true` | 启动时补传盘上未上云的会话（上传链路的兜底） |
+| `TRAJ_SCRUB_SECRETS` | `true` | 消息体密钥脱敏，`false` 关闭（hook 侧需在 settings.json 的 env 里另设） |
 
 ## 上传链路的三条铁律
 
