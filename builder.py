@@ -1123,6 +1123,8 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
     n_dup_user_dropped = 0
     n_dup_result_dropped = 0
     n_error_responses = 0
+    n_thinking_requested = 0   # 请求开了 thinking 的成功轮次
+    n_thinking_returned = 0    # 其中响应带 thinking / redacted_thinking block 的
     n_failed_actions = 0       # 非 success 的工具执行数
     n_exit_codes_known = 0     # 拿到确定数值退出码的工具执行数
     n_parse_errors = 0         # tool_use 输入 JSON 截断的 action 数（含已修复）
@@ -1167,8 +1169,21 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
             last_timestamp = pair.timestamp
         if getattr(pair, "is_partial", False):
             n_partial_pairs += 1
-        if isinstance(response.get("error"), dict) or "error" in response:
+        is_error_response = isinstance(response.get("error"), dict) or "error" in response
+        if is_error_response:
             n_error_responses += 1
+        # thinking 覆盖：请求开了 thinking 的成功轮次里，响应有没有 thinking block。
+        # 上游（中转网关）剥掉 thinking 时采集端拿不到任何东西，只能在这里显式标出来，
+        # 否则 has_thinking=False 看不出是「没开」还是「被剥」。
+        if response and not is_error_response and not getattr(pair, "is_partial", False):
+            thinking_cfg = (pair.request_body or {}).get("thinking")
+            if isinstance(thinking_cfg, dict) and thinking_cfg.get("type") not in (None, "disabled"):
+                n_thinking_requested += 1
+                if any(
+                    isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking")
+                    for b in response.get("content") or []
+                ):
+                    n_thinking_returned += 1
 
         # ── history：记录 user 侧消息 ──────────────────────
         # 首个带完整 messages 的 pair 作为基线，其余用增量 new_messages。
@@ -1299,6 +1314,10 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
             n_user_from_hook += 1
 
         if not response:
+            continue
+        # 上游错误响应（429 / 403 / 5xx / SSE error 事件）没有 assistant 内容，
+        # 只计数，不往 history 里塞空的 assistant 消息
+        if "error" in response and not response.get("content"):
             continue
 
         content_blocks = [b for b in response.get("content", []) or [] if isinstance(b, dict)]
@@ -1598,6 +1617,10 @@ def build_trajectory(_session_id: str, pairs: Sequence[Any], metadata: SessionMe
         "orphan_rate": round(n_orphan / n_tool_actions, 4) if n_tool_actions else 0.0,
         "partial_pairs": n_partial_pairs,
         "error_responses": n_error_responses,
+        # thinking_requested > 0 且 thinking_returned == 0：上游剥掉了 thinking，
+        # 这条轨迹不能进 thinking-SFT（见 tools/thinking_coverage.py）
+        "thinking_requested": n_thinking_requested,
+        "thinking_returned": n_thinking_returned,
         "duplicate_user_messages_dropped": n_dup_user_dropped,
         "duplicate_tool_results_dropped": n_dup_result_dropped,
         "has_system_prompt": bool(system_text),

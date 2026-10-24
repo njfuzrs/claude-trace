@@ -128,3 +128,57 @@ async def test_subagent_not_revived(collector):
     pair = collector.record_request(s, _req(2), {})
     assert s.revived is False
     assert pair.index == 1
+
+
+@pytest.mark.asyncio
+async def test_revival_keeps_original_start_time(collector):
+    """复活会话的 start_time 必须是复活前首轮的时间，不是复活时刻"""
+    sid = "sess-start"
+    s1 = P.Session(id=sid, model="claude-opus-4-6")
+    pair = collector.record_request(s1, _req(2), {})
+    await collector.record_response_async(s1, pair, _resp())
+    first_ts = pair.timestamp
+
+    s2 = P.Session(id=sid, model="claude-opus-4-6", start_time="2099-01-01T00:00:00")
+    collector.record_request(s2, _req(4), {})
+    assert s2.start_time == first_ts
+
+
+@pytest.mark.asyncio
+async def test_revival_invalidates_upload_marker(collector):
+    """复活后旧 .uploaded 必须作废，否则启动补传会跳过复活后的新增轮次"""
+    sid = "sess-marker"
+    s1 = P.Session(id=sid, model="claude-opus-4-6")
+    pair = collector.record_request(s1, _req(2), {})
+    await collector.record_response_async(s1, pair, _resp())
+    d = collector.sessions_dir / sid
+    (d / ".uploaded").write_text('{"files": {}}')
+
+    s2 = P.Session(id=sid, model="claude-opus-4-6")
+    collector.record_request(s2, _req(4), {})
+    assert not (d / ".uploaded").exists()
+    assert (d / ".uploaded.prev").exists(), "旧标记应改名保留以便对账"
+
+
+@pytest.mark.asyncio
+async def test_revival_turn_export_includes_new_rounds(collector):
+    """★复活后 turn 结束（stop）的导出必须带上复活后的新轮次，不能停在旧版本"""
+    sid = "sess-turn"
+    s1 = P.Session(id=sid, model="claude-opus-4-6")
+    for _ in range(4):
+        pair = collector.record_request(s1, _req(2), {})
+        await collector.record_response_async(s1, pair, _resp())
+    traj_path = collector.sessions_dir / sid / "session.traj"
+    before = len(json.loads(traj_path.read_text())["trajectory"])
+
+    s2 = P.Session(id=sid, model="claude-opus-4-6")
+    for n in (6, 8):
+        pair = collector.record_request(s2, _req(n), {})
+        await collector.record_response_async(s2, pair, _resp())
+    # 增量写跳过复活会话，traj 仍是旧版（不被短轨迹冲掉）
+    assert len(json.loads(traj_path.read_text())["trajectory"]) == before
+
+    await collector.export_session_async(s2, is_final=False)
+    traj = json.loads(traj_path.read_text())
+    assert len(traj["trajectory"]) > before, "turn 导出应从 raw.jsonl 重建出包含新轮次的完整轨迹"
+    assert traj["metadata"]["total_api_calls"] == 6
