@@ -8,6 +8,24 @@
 
 ## [Unreleased]
 
+### 修复
+
+- 上游错误响应（429 / 403 / 5xx）不再被记成空的 partial。流式请求遇到非 2xx 时，代理原先
+  把 JSON 错误体当 SSE 重组，找不到 `message_stop` 就判为流中断，错误类型丢失 —— 实测
+  1014 条 partial 里 1004 条其实是 429，`partial_pairs` 虚高、`error_responses` 恒为 0。
+  现在错误响应原样转发（保留 `retry-after` 等响应头），完整错误体落盘并计入 `error_responses`；
+  SSE 中途的 `error` 事件同样记录。非流式成功响应也不再被误判为 partial。
+- 会话复活后 traj 不再长期落后于 `raw.jsonl`：turn 结束（stop）的导出改为从 `raw.jsonl`
+  重建，复活会话的逐轮增量写不再尝试用短轨迹覆盖（也不再每轮刷「拒绝收缩」告警）。
+- 会话复活时作废旧的 `.uploaded`（改名为 `.uploaded.prev` 保留对账），复活后的新增轮次
+  即使没走到最终导出，也能由启动补传兜底上云。
+- 复活会话的 `metadata.start_time` 取 `raw.jsonl` 首条记录时间，不再是复活时刻。
+
+### 新增
+
+- `data_quality.thinking_requested` / `thinking_returned`：请求开了 thinking 的成功轮次数，
+  及其中响应真正带 thinking block 的轮次数。前者大于 0 而后者为 0 说明上游剥掉了 thinking。
+
 ## [0.4.6] - 2026-10-07
 
 ### 修复

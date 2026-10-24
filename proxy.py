@@ -801,6 +801,11 @@ def reassemble_sse_response(raw_data: bytes) -> Dict:
         elif event_type == "message_stop":
             has_message_stop = True
 
+        elif event_type == "error":
+            # 流中途的错误事件（overloaded_error 等）：HTTP 已是 200，
+            # 错误只出现在 SSE 里。存下来供 builder 计入 error_responses
+            message["error"] = event.get("error", {})
+
     message["content"] = content_blocks
     message["_complete"] = has_message_stop  # 标记 SSE 流是否完整
     return message
@@ -877,6 +882,32 @@ class DataCollector:
             logger.debug("统计 raw.jsonl 行数失败 %s: %s", session_id[:8], e)
             return 0
 
+    def _first_raw_timestamp(self, session_id: str) -> str:
+        """读 raw.jsonl 首条记录的时间戳（只读第一行）"""
+        raw_path = self.sessions_dir / session_id / "raw.jsonl"
+        try:
+            with raw_path.open("r", errors="replace") as f:
+                for line in f:
+                    if line.strip():
+                        return str(json.loads(line).get("timestamp") or "")
+        except (OSError, json.JSONDecodeError) as e:
+            logger.debug("读取 raw.jsonl 首条时间戳失败 %s: %s", session_id[:8], e)
+        return ""
+
+    def _invalidate_upload_marker(self, session_id: str):
+        """复活时作废 .uploaded，让启动补传按盘上现状兜底
+
+        改名而不是删除：保留上一次上传的 sha256 记录，便于事后对账。
+        """
+        marker = self.sessions_dir / session_id / ".uploaded"
+        if not marker.exists():
+            return
+        try:
+            marker.replace(marker.with_name(".uploaded.prev"))
+            logger.info("会话复活，作废旧上传标记: %s", session_id[:8])
+        except OSError as e:
+            logger.warning("作废上传标记失败 %s: %s", session_id[:8], e)
+
     def record_request(
         self,
         session: Session,
@@ -904,6 +935,16 @@ class DataCollector:
             if prior > 0:
                 session.revived = True
                 session.prior_pair_count = prior
+                # 会话起点是复活前的第一轮，不是复活这一刻。
+                # 老实现沿用新 Session 的 datetime.now()，实测 6ee7ef99 07:27 开始，
+                # metadata.start_time 却写成 13:20（复活时刻），时长与排序全错。
+                first_ts = self._first_raw_timestamp(session.id)
+                if first_ts:
+                    session.start_time = first_ts
+                # 盘上的 .uploaded 只对应复活前那一版。不作废的话，复活后若没走到
+                # 最终导出（代理被杀、机器休眠），启动补传会因标记存在而跳过，
+                # 新增轮次永远上不了云。
+                self._invalidate_upload_marker(session.id)
                 # 复活后的首个请求带着完整历史，但内存里没有 prev_hashes 做基线，
                 # 所以 new_messages 就是整段历史。不打 replay 标记的话 builder 会
                 # 把复活前已记录过的 user 消息又写一遍进 history。
@@ -1225,11 +1266,13 @@ class DataCollector:
         # 所以最终导出改为从盘上重建，拿回整条轨迹。
         traj = None
         traj_path = None
-        if is_final and session.revived:
+        # turn 结束（stop）也走重建：否则复活后到最终导出之间 traj 一直停在
+        # 复活前的版本（实测 210a7966 落后 raw.jsonl 27 轮）。
+        if session.revived:
             traj_path, traj = await loop.run_in_executor(
                 None, functools.partial(
                     self._rebuild_traj_from_raw, session, children_snapshot,
-                    fill_from_transcript=True,
+                    fill_from_transcript=is_final,
                 ),
             )
             if traj is None:
@@ -1344,14 +1387,14 @@ class DataCollector:
         jsonl_path = self._session_dir(session.id) / "raw.jsonl"
         self._append_raw_jsonl(jsonl_path, pair, session.persisted_tool_result_ids)
 
-        # 增量重建 .traj 文件 — 子会话跳过（它们在父会话导出时合并）
-        if not session.is_subagent:
+        # 增量重建 .traj 文件 — 子会话跳过（它们在父会话导出时合并）。
+        # 复活会话也跳过：内存快照只含复活后那一段，建出来的 traj 要么被收缩闸门
+        # 挡下（每轮一条 WARNING），要么在步数超过旧版时把复活前的历史整段冲掉。
+        # 复活会话的 traj 改由 turn 结束（stop）和最终导出从 raw.jsonl 重建。
+        if not session.is_subagent and not session.revived:
             traj_path, traj = self._build_traj_data(session, pairs_snapshot, children_snapshot)
             if traj_path and traj:
-                # allow_shrink=False：复活会话的内存快照只含复活后那一段，
-                # 每轮增量写都会试图用短轨迹覆盖盘上的完整版本。
-                # 闸门挡住之后，完整轨迹在最终导出时由 raw.jsonl 重建。
-                save_trajectory(traj_path, traj, allow_shrink=not session.revived)
+                save_trajectory(traj_path, traj)
 
     @staticmethod
     def _collect_missing_tool_results(
@@ -1542,6 +1585,15 @@ async def handle_streaming(
     避免 finally 中重复调用导致的不确定行为。
     """
 
+    # 上游非 2xx（429 限流 / 403 / 502 等）返回的是一段 JSON 错误体，不是 SSE。
+    # 老实现照样当 SSE 重组：找不到 message_stop → 记成 content=[] 的 partial，
+    # 错误类型丢失。实测 1014 条 partial 里 1004 条其实是 429，
+    # partial_pairs 和 error_responses 因此全错。
+    # 这里原样转发（保留 retry-after 等响应头，Claude Code 靠它退避），
+    # 并把错误体完整落盘。
+    if upstream_resp.status >= 400:
+        return await _forward_error_response(upstream_resp, session, pair, collector)
+
     response = web.StreamResponse(
         status=upstream_resp.status,
         headers={
@@ -1592,6 +1644,52 @@ async def handle_streaming(
     session._pending_write_tasks.append(t)
 
     return response
+
+
+def _parse_error_body(status: int, resp_body: bytes) -> Dict:
+    """把上游错误响应体解析成可落盘的 dict
+
+    正常形状是 {"type": "error", "error": {"type": "rate_limit_error", ...}}。
+    网关自己吐的 502 常是 HTML 或纯文本，此时包成同样的 error 结构，
+    保证 builder 按 response["error"] 计数时口径一致。
+    """
+    try:
+        data = json.loads(resp_body) if resp_body else {}
+    except json.JSONDecodeError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if not isinstance(data.get("error"), dict):
+        data["error"] = {
+            "type": f"http_{status}",
+            "message": resp_body.decode("utf-8", errors="replace")[:2000],
+        }
+    data["_http_status"] = status
+    # 错误体是完整收到的，不是流中断 —— 不能算 partial
+    data["_complete"] = True
+    return data
+
+
+async def _forward_error_response(
+    upstream_resp: aiohttp.ClientResponse,
+    session: Session,
+    pair: RequestResponsePair,
+    collector: DataCollector,
+) -> web.Response:
+    """原样转发上游错误响应，并落盘完整错误体"""
+    resp_body = await upstream_resp.read()
+    response_json = _parse_error_body(upstream_resp.status, resp_body)
+    pairs_snapshot = list(session.pairs)
+    t = asyncio.create_task(
+        collector.record_response_async(session, pair, response_json, pairs_snapshot)
+    )
+    t.add_done_callback(_log_task_exception)
+    session._pending_write_tasks.append(t)
+    return web.Response(
+        status=upstream_resp.status,
+        headers=_filter_response_headers(upstream_resp.headers),
+        body=resp_body,
+    )
 
 
 def _is_messages_request(method: str, path: str, request_body: Dict) -> bool:
@@ -1704,10 +1802,18 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                 return await handle_streaming(request, upstream_resp, session, pair, collector)
             else:
                 resp_body = await upstream_resp.read()
-                try:
-                    response_json = json.loads(resp_body)
-                except json.JSONDecodeError:
-                    response_json = {"_raw": resp_body.decode("utf-8", errors="replace")}
+                response_json: Any
+                if upstream_resp.status >= 400:
+                    response_json = _parse_error_body(upstream_resp.status, resp_body)
+                else:
+                    try:
+                        response_json = json.loads(resp_body)
+                    except json.JSONDecodeError:
+                        response_json = {"_raw": resp_body.decode("utf-8", errors="replace")}
+                    # 非流式响应是一次性读完的，没有 message_stop 事件可依，
+                    # 不打这个标记就会被 record_response_async 误判成 partial
+                    if isinstance(response_json, dict):
+                        response_json.setdefault("_complete", True)
 
                 # P0 #4 fix: 在 create_task 之前创建 snapshot，确保快照时机正确
                 pairs_snapshot = list(session.pairs)
