@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import signal
+import socket
 import sys
 import uuid
 from dataclasses import dataclass, field
@@ -85,10 +86,68 @@ async def _drain_pending_writes(session: "Session"):
 
 SENSITIVE_HEADERS = {"x-api-key", "authorization", "proxy-authorization"}
 
-# 上游请求不设超时（见 on_startup 注释）。模块级常量便于测试断言。
+# 上游请求的读阶段不设超时（见 on_startup 注释），只限建连阶段。模块级常量便于测试断言。
+# connect / sock_connect 只覆盖「拿连接 + TCP/TLS 握手」，不影响已建立的长流：
+# 网络切换后新连接若握手卡住，30 秒内报 502，而不是让 Claude Code 等满 API_TIMEOUT_MS。
+UPSTREAM_CONNECT_TIMEOUT_SEC = 30
 UPSTREAM_TIMEOUT = aiohttp.ClientTimeout(
-    total=None, connect=None, sock_connect=None, sock_read=None,
+    total=None, connect=UPSTREAM_CONNECT_TIMEOUT_SEC,
+    sock_connect=UPSTREAM_CONNECT_TIMEOUT_SEC, sock_read=None,
 )
+
+# 上游连接的 TCP keepalive 探测参数（秒 / 次）。
+# 读阶段不设超时的代价：换 Wi-Fi / 开关 VPN / 合盖睡眠后，对端已消失但本机 socket
+# 仍显示 ESTABLISHED，读操作会永远阻塞，这条连接永远不释放。0.4.7 实际发生过：
+# 进程跑了 8 天，挂着 100+ 条绑在旧网卡地址上的「僵尸」连接，恰好占满 aiohttp
+# 默认 limit=100 的连接池，之后所有新请求都在池里排队，60 秒一个字节都收不到。
+# 开 keepalive 后内核会探测空闲 socket：约 IDLE + INTVL×CNT = 120 秒判死并报错，
+# 连接被释放；正常推流（哪怕上游思考很久，TCP 层仍有 ACK）不受影响。
+UPSTREAM_KEEPALIVE_IDLE_SEC = 60
+UPSTREAM_KEEPALIVE_INTVL_SEC = 10
+UPSTREAM_KEEPALIVE_CNT = 6
+
+
+def _enable_tcp_keepalive(sock: socket.socket) -> None:
+    """给上游 socket 开 TCP keepalive，平台不支持的选项静默跳过"""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    # Linux 用 TCP_KEEPIDLE，macOS 用 TCP_KEEPALIVE 表示同一个「空闲多久开始探测」
+    idle_opt = getattr(socket, "TCP_KEEPIDLE", None) or getattr(socket, "TCP_KEEPALIVE", None)
+    for opt, value in (
+        (idle_opt, UPSTREAM_KEEPALIVE_IDLE_SEC),
+        (getattr(socket, "TCP_KEEPINTVL", None), UPSTREAM_KEEPALIVE_INTVL_SEC),
+        (getattr(socket, "TCP_KEEPCNT", None), UPSTREAM_KEEPALIVE_CNT),
+    ):
+        if opt is None:
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+        except OSError as e:
+            logger.debug("设置 TCP keepalive 选项 %s 失败: %s", opt, e)
+
+
+def _upstream_socket_factory(addr_info) -> socket.socket:
+    """aiohttp TCPConnector 的 socket_factory：建 socket 时就带上 keepalive"""
+    family, type_, proto, _, _ = addr_info
+    sock = socket.socket(family=family, type=type_, proto=proto)
+    try:
+        _enable_tcp_keepalive(sock)
+    except OSError as e:
+        logger.debug("开启 TCP keepalive 失败: %s", e)
+    return sock
+
+
+def _make_upstream_connector() -> aiohttp.TCPConnector:
+    """上游连接池
+
+    - limit=0：不设全局上限。代理是透明转发层，并发度由客户端决定；默认 100 的上限
+      一旦被僵尸连接占满，新请求就在池里无限排队，表现为「代理卡死」。
+    - socket_factory：开 TCP keepalive，让死连接能被内核发现并释放（见上方常量注释）。
+    """
+    return aiohttp.TCPConnector(
+        limit=0,
+        limit_per_host=0,
+        socket_factory=_upstream_socket_factory,
+    )
 
 # 退出时等在途请求（SSE 长连接）的上限，作为 AppRunner 的 shutdown_timeout 参数。
 # aiohttp 默认 60 秒，且 RequestHandler.shutdown 会把它用两次（先等 handler 自然结束，
@@ -1933,6 +1992,14 @@ async def handle_session_event(request: web.Request) -> web.Response:
     return web.Response(status=200, text="ok")
 
 
+def _upstream_connections_in_use(app: web.Application) -> int:
+    """读取上游连接池里已借出的连接数；拿不到（未启动 / aiohttp 内部变化）返回 -1"""
+    session = app.get("upstream_session")
+    connector = getattr(session, "connector", None)
+    acquired = getattr(connector, "_acquired", None)
+    return len(acquired) if acquired is not None else -1
+
+
 async def handle_health(request: web.Request) -> web.Response:
     """健康检查端点，供 start.sh 等外部脚本探测代理是否就绪
 
@@ -1950,6 +2017,8 @@ async def handle_health(request: web.Request) -> web.Response:
         "build": build_fingerprint() or ("source" if not getattr(sys, "frozen", False) else ""),
         "active_sessions": len(session_manager.active_sessions),
         "pending_sessions": len(session_manager._pending_sessions),
+        # 正在占用的上游连接数：持续涨而 active_sessions 不涨，说明有连接挂在死 socket 上
+        "upstream_connections_in_use": _upstream_connections_in_use(request.app),
     }
 
     uploader = collector._uploader
@@ -2012,13 +2081,15 @@ async def create_app(
 
     # 应用启动时创建全局 ClientSession（连接池复用）+ 启动上传管理器
     async def on_startup(app):
-        # 不设任何超时：代理是透明转发层，何时放弃由客户端决定（Claude Code 有
+        # 读阶段不设超时：代理是透明转发层，何时放弃由客户端决定（Claude Code 有
         # API_TIMEOUT_MS 和自己的重试）。曾是 total=300/sock_read=300，会把仍在
         # 正常流式传输、或上游排队稍久的请求在第 5 分钟掐断成 504/502，客户端只
         # 看到 "Upstream timeout"，定位不到是代理所为。
-        # 注意必须显式传全 None 的 ClientTimeout：aiohttp 的默认值是 total=300。
+        # 注意必须显式传 total=None 的 ClientTimeout：aiohttp 的默认值是 total=300。
+        # 死连接的回收交给 TCP keepalive + 无上限连接池（见 _make_upstream_connector）。
         app["upstream_session"] = aiohttp.ClientSession(
             timeout=UPSTREAM_TIMEOUT,
+            connector=_make_upstream_connector(),
         )
         collector = app["collector"]
         if collector._uploader:
